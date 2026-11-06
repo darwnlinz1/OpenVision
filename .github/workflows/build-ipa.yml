@@ -20,8 +20,14 @@ jobs:
 
       - name: Ensure configuration files
         run: |
-          cp -n Config.xcconfig.example Config.xcconfig
-          cp -n OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+          if [ ! -f Config.xcconfig ]; then
+            cp Config.xcconfig.example Config.xcconfig
+          fi
+          if [ ! -f OpenVision/Config/Config.swift ]; then
+            cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+          fi
+          echo "Configuration files verified:"
+          cat Config.xcconfig
 
       - name: Cache Swift packages
         uses: actions/cache@v6
