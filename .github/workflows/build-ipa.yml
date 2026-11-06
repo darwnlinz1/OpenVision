@@ -18,6 +18,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Ensure configuration files
+        run: |
+          cp -n Config.xcconfig.example Config.xcconfig
+          cp -n OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+
       - name: Cache Swift packages
         uses: actions/cache@v6
         with:
