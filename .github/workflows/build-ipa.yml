@@ -3,39 +3,55 @@ name: Build Unsigned IPA
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ipa-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
 jobs:
   build:
-    runs-on: macos-14
+    name: Build OpenVision IPA
+    runs-on: macos-26
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Setup XcodeGen
-        run: brew install xcodegen
+      - name: Cache Swift packages
+        uses: actions/cache@v6
+        with:
+          path: .spm
+          key: spm-${{ runner.os }}-${{ hashFiles('OpenVision.xcodeproj/project.pbxproj', 'project.yml') }}
+          restore-keys: spm-${{ runner.os }}-
 
-      - name: Generate Xcode Project
-        run: xcodegen generate
-
-      - name: Build OpenVision App
+      - name: Build OpenVision Release App
         run: |
+          set -o pipefail
           xcodebuild build \
             -project OpenVision.xcodeproj \
             -scheme OpenVision \
-            -destination "generic/platform=iOS" \
+            -destination 'generic/platform=iOS' \
             -configuration Release \
-            CODE_SIGN_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
+            -clonedSourcePackagesDirPath .spm \
+            -derivedDataPath DerivedData \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
-            BUILD_DIR="build"
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM=
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -r build/Release-iphoneos/OpenVision.app Payload/
-          zip -r OpenVision.ipa Payload
+          APP_PATH=$(find DerivedData/Build/Products -name "OpenVision.app" -type d | head -n 1)
+          echo "Found app at: $APP_PATH"
+          cp -r "$APP_PATH" Payload/
+          zip -r -y OpenVision.ipa Payload
 
       - name: Upload IPA Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenVision-unsigned
           path: OpenVision.ipa
