@@ -160,6 +160,7 @@ final class VoiceCommandService: ObservableObject {
     /// so the wait after it can be short: Silero has already absorbed ~0.75s of hysteresis, and
     /// speech resuming cancels this via `onSpeechStart`.
     private func handleSpeechEnded() {
+        guard !isBargeInPaused else { return }
         // Only the command-capture states commit a turn; idle/processing ignore end-of-speech.
         guard state == .listening || state == .conversationMode else { return }
         guard hasSpokenThisTurn, !currentTranscription.isEmpty else { return }
@@ -485,7 +486,7 @@ final class VoiceCommandService: ObservableObject {
     /// Start conversation timeout (auto-exit after silence)
     private func startConversationTimeout() {
         conversationTimeoutTimer?.invalidate()
-        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
+        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: Constants.Voice.conversationTimeout, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.handleConversationTimeout()
             }
@@ -540,6 +541,12 @@ final class VoiceCommandService: ObservableObject {
             }
 
         case .listening, .conversationMode:
+            // When barge-in is paused (e.g. TTS is currently playing), ignore microphone recognition
+            // to prevent echo from speaker triggering a spurious command or interrupting playback
+            if isBargeInPaused {
+                return
+            }
+
             // Strip wake word from transcription (like xmeta does)
             var command = transcription
             for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
@@ -748,6 +755,11 @@ final class VoiceCommandService: ObservableObject {
 
     /// Handle command complete
     private func handleCommandComplete(_ text: String) {
+        guard !isBargeInPaused else {
+            print("[VoiceCommand] Ignoring handleCommandComplete because barge-in is paused (TTS active)")
+            return
+        }
+
         // Remove wake word from beginning
         var command = text
         let wakeWordLower = wakeWord.lowercased()
@@ -818,6 +830,7 @@ final class VoiceCommandService: ObservableObject {
 
     /// Handle silence timeout
     private func handleSilenceTimeout() {
+        guard !isBargeInPaused else { return }
         guard state == .listening || state == .conversationMode else { return }
 
         // Covers the no-VAD fallback path; idempotent, so it's a no-op when VAD already marked it.
