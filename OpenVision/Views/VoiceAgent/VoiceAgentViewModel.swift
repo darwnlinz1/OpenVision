@@ -742,7 +742,11 @@ final class VoiceAgentViewModel: ObservableObject {
                 // In local live video mode replies must flow even if the session timer lapsed
                 // while the user was silently looking around.
                 guard self.isSessionActive || self.isLiveVideoMode else { return }
-                self.aiTranscript = message
+
+                // Parse dual-channel format (SPOKEN: and DISPLAY:)
+                let (spoken, display) = self.parseDualChannelResponse(message)
+                self.aiTranscript = display
+
                 // Reply text is final. For non-streaming backends this is also the first output
                 // we ever saw, and markFirstToken is first-wins, so it stays accurate either way.
                 MetricsCollector.shared.markFirstToken()
@@ -750,9 +754,9 @@ final class VoiceAgentViewModel: ObservableObject {
                 if self.ttsStreaming {
                     // A streamed utterance is open (local model + Apple TTS pipelining):
                     // flush the unspoken tail and close the session.
-                    self.feedStreamingSpeech(message, isFinal: true)
+                    self.feedStreamingSpeech(spoken, isFinal: true)
                 } else {
-                    self.speakResponse(message)
+                    self.speakResponse(spoken)
                 }
             }
             backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -839,9 +843,14 @@ final class VoiceAgentViewModel: ObservableObject {
             }
         }
 
-        // Gemini Live callbacks (for Gemini Live mode, not hybrid)
+        // Gemini Live callbacks (for Gemini Live / REST solver mode)
         GeminiLiveService.shared.onOutputTranscription = { [weak self] (text: String) in
-            self?.aiTranscript = text
+            guard let self else { return }
+            let (spoken, display) = self.parseDualChannelResponse(text)
+            self.aiTranscript = display
+            if !spoken.isEmpty && !self.ttsService.isSpeaking {
+                self.speakResponse(spoken)
+            }
         }
 
         GeminiLiveService.shared.onTurnComplete = { [weak self] in
@@ -855,6 +864,51 @@ final class VoiceAgentViewModel: ObservableObject {
             // History: persist this Gemini Live exchange (transcript only, no frames).
             self.recordLiveTurn()
         }
+    }
+
+    /// Parse Gemini Solver Dual-Channel Response (SPOKEN: and DISPLAY:)
+    private func parseDualChannelResponse(_ text: String) -> (spoken: String, display: String) {
+        let hasSpoken = text.contains("SPOKEN:")
+        let hasDisplay = text.contains("DISPLAY:")
+
+        if !hasSpoken && !hasDisplay {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (trimmed, trimmed)
+        }
+
+        var spoken = ""
+        var display = ""
+
+        if hasSpoken && hasDisplay {
+            if let spokenRange = text.range(of: "SPOKEN:"),
+               let displayRange = text.range(of: "DISPLAY:") {
+                if spokenRange.upperBound <= displayRange.lowerBound {
+                    spoken = String(text[spokenRange.upperBound..<displayRange.lowerBound])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    display = String(text[displayRange.upperBound...])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    display = String(text[displayRange.upperBound..<spokenRange.lowerBound])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    spoken = String(text[spokenRange.upperBound...])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        } else if hasSpoken {
+            if let spokenRange = text.range(of: "SPOKEN:") {
+                spoken = String(text[spokenRange.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                display = spoken
+            }
+        } else {
+            if let displayRange = text.range(of: "DISPLAY:") {
+                display = String(text[displayRange.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                spoken = display
+            }
+        }
+
+        return (spoken.isEmpty ? text : spoken, display.isEmpty ? text : display)
     }
 
     /// Start listening for wake word
@@ -997,12 +1051,14 @@ final class VoiceAgentViewModel: ObservableObject {
         agentState = .thinking
 
         // Check if this is a vision-related command
-        // Keywords for "take a photo" - capture and send to OpenClaw
+        // Keywords for "take a photo" - capture and send to active backend (supports Vietnamese & English)
         let photoKeywords = ["take a photo", "take a picture", "take photo", "take picture",
                             "capture a photo", "capture photo", "snap a photo", "snap a picture",
                             "what do you see", "what are you looking at", "look at this",
                             "what's in front of me", "describe what you see", "what is this",
-                            "what am i looking at", "can you see"]
+                            "what am i looking at", "can you see",
+                            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "xem bài này",
+                            "đọc bài này", "bài này làm sao", "nhìn cái này", "tính cái này", "bài toán"]
 
         let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
 
@@ -1919,33 +1975,31 @@ final class VoiceAgentViewModel: ObservableObject {
         var imageData: Data?
         var startedStreamingForPhoto = false
 
-        // Start streaming if glasses are registered but not streaming. `startStreaming()` only
-        // returns after `session.start()` completes (isStreaming is already true here), so the
-        // old "poll up to 3s for isStreaming" loop + fixed 500ms sleep were dead weight that just
-        // kept the LED on longer. freshLiveFrame() below already waits for the first real frame,
-        // so drop the artificial delay entirely.
+        // Start streaming if glasses are registered but not streaming (required by Meta SDK to capture)
         if glassesManager.isRegistered && !glassesManager.isStreaming {
             print("[VoiceAgent] Starting glasses camera stream for photo...")
             await glassesManager.startStreaming()
             startedStreamingForPhoto = true
         }
 
-        // Capture straight from the live video stream. The glasses' one-shot photo API
-        // (session.capturePhoto) doesn't reliably deliver on this model/SDK — it times out
-        // after 5s — whereas a live frame is available immediately. freshLiveFrame() ensures
-        // the stream is running, waits for a fresh frame, and restarts a stalled stream.
-        imageData = await freshLiveFrame()
+        // 1. Try static photo from glasses first (max native sensor quality up to 12MP)
+        imageData = await capturePhotoFromGlasses()
+
+        // 2. Fall back to fresh live video frame if static capture fails or times out
+        if imageData == nil {
+            NSLog("[OV] Static photo capture returned nil; falling back to fresh live frame")
+            imageData = await freshLiveFrame()
+        }
 
         NSLog("[OV] captureAndSendPhoto result: %@ (streaming=%@, registered=%@)",
               imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes",
               glassesManager.isStreaming ? "yes" : "no",
               glassesManager.isRegistered ? "yes" : "no")
 
-        // "Click and go": now that we have the photo, turn the glasses camera off immediately —
-        // before the (multi-second) model inference — so the LED doesn't stay on. Repeat photo
-        // commands restart the camera reliably via freshLiveFrame(). Skip in live video mode.
-        if imageData != nil && glassesManager.isStreaming && !isLiveVideoMode {
-            NSLog("[OV] photo captured — stopping camera (click and go)")
+        // Visor "Click & Go": Stop streaming immediately after photo acquisition
+        // to free Bluetooth bandwidth and prevent Ray-Ban 20s watchdog disconnect during inference
+        if glassesManager.isStreaming && !isLiveVideoMode {
+            NSLog("[OV] photo acquired — stopping camera immediately (click and go)")
             await glassesManager.stopStreaming()
         }
 
@@ -1983,8 +2037,8 @@ final class VoiceAgentViewModel: ObservableObject {
         NSLog("[OV] capturePhotoFromGlasses: requesting capture (streaming=%@)", glassesManager.isStreaming ? "yes" : "no")
         await glassesManager.capturePhoto()
 
-        // Wait for photo data to appear (poll for up to 5 seconds)
-        for _ in 0..<50 {
+        // Wait for photo data to appear (poll for up to 12 seconds / 120 iterations of 100ms)
+        for _ in 0..<120 {
             if let photoData = glassesManager.lastPhotoData {
                 glassesManager.lastPhotoData = nil
                 NSLog("[OV] Photo captured: %d bytes", photoData.count)
@@ -1993,7 +2047,7 @@ final class VoiceAgentViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
-        NSLog("[OV] Photo capture TIMED OUT after 5s")
+        NSLog("[OV] Photo capture TIMED OUT after 12s")
         return nil
     }
 
