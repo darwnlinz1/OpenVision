@@ -234,8 +234,11 @@ final class GeminiLiveService: ObservableObject {
                 let (spoken, display) = Self.parseDualChannel(rawText)
 
                 // Dispatch to callbacks
-                onOutputTranscription?(spoken)
-                agentMessageCallback?(rawText)
+                if let agentMessage = agentMessageCallback {
+                    agentMessage(rawText)
+                } else {
+                    onOutputTranscription?(spoken)
+                }
                 onTextReceived?(rawText)
                 onTurnComplete?()
                 return
@@ -284,49 +287,58 @@ final class GeminiLiveService: ObservableObject {
     }
 
     // MARK: - Dual Channel Response Parser
-
+ 
     static func parseDualChannel(_ text: String) -> (spoken: String, display: String) {
-        let hasSpoken = text.contains("SPOKEN:")
-        let hasDisplay = text.contains("DISPLAY:")
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = cleanText.lowercased()
 
-        if !hasSpoken && !hasDisplay {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (trimmed, trimmed)
+        let spokenIdx = lower.range(of: "spoken")
+        let displayIdx = lower.range(of: "display")
+
+        if let sRange = spokenIdx, let dRange = displayIdx {
+            var spokenPart = ""
+            var displayPart = ""
+            if sRange.lowerBound < dRange.lowerBound {
+                spokenPart = String(cleanText[sRange.upperBound..<dRange.lowerBound])
+                displayPart = String(cleanText[dRange.upperBound...])
+            } else {
+                displayPart = String(cleanText[dRange.upperBound..<sRange.lowerBound])
+                spokenPart = String(cleanText[sRange.upperBound...])
+            }
+
+            let s = cleanChannelText(spokenPart)
+            let d = cleanChannelText(displayPart)
+            return (s.isEmpty ? cleanText : s, d.isEmpty ? cleanText : d)
         }
 
-        var spoken = ""
-        var display = ""
-
-        if hasSpoken && hasDisplay {
-            if let spokenRange = text.range(of: "SPOKEN:"),
-               let displayRange = text.range(of: "DISPLAY:") {
-                if spokenRange.upperBound <= displayRange.lowerBound {
-                    spoken = String(text[spokenRange.upperBound..<displayRange.lowerBound])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    display = String(text[displayRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                } else {
-                    display = String(text[displayRange.upperBound..<spokenRange.lowerBound])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    spoken = String(text[spokenRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
-        } else if hasSpoken {
-            if let spokenRange = text.range(of: "SPOKEN:") {
-                spoken = String(text[spokenRange.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                display = spoken
-            }
-        } else {
-            if let displayRange = text.range(of: "DISPLAY:") {
-                display = String(text[displayRange.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                spoken = display
-            }
+        if let sRange = spokenIdx {
+            let s = cleanChannelText(String(cleanText[sRange.upperBound...]))
+            return (s.isEmpty ? cleanText : s, cleanText)
         }
 
-        return (spoken.isEmpty ? text : spoken, display.isEmpty ? text : display)
+        if let dRange = displayIdx {
+            let d = cleanChannelText(String(cleanText[dRange.upperBound...]))
+            return (d.isEmpty ? cleanText : d, d.isEmpty ? cleanText : d)
+        }
+
+        return (cleanText, cleanText)
+    }
+
+    private static func cleanChannelText(_ text: String) -> String {
+        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let first = s.first, ":*#-_ \t\r\n".contains(first) {
+            s.removeFirst()
+        }
+        if let lastLineRange = s.range(of: "\n", options: .backwards) {
+            let lastLine = s[lastLineRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if lastLine.hasPrefix("#") || lastLine.hasPrefix("*") {
+                s = String(s[..<lastLineRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        while let last = s.last, "*# \t\r\n".contains(last) {
+            s.removeLast()
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - System Prompt
@@ -339,7 +351,7 @@ final class GeminiLiveService: ObservableObject {
         When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
 
         SPOKEN:
-        Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker (under 250 characters). State the final answer directly without filler. NEVER use LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, power, subscripts). NEVER use Markdown formatting (no asterisks, hashes, backticks) in this section. If the problem or question is in Vietnamese, speak in natural Vietnamese.
+        Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker (under 250 characters). State the final answer directly without filler. NEVER use LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, power, subscripts). NEVER use Markdown formatting (no asterisks, hashes, backticks) in this section. If the problem or question is in Vietnamese, speak in natural, grammatically correct Vietnamese with full tone marks and diacritics (tiếng Việt có dấu đầy đủ, chuẩn xác).
 
         DISPLAY:
         Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ inline, $$...$$ block display) for all formulas. Provide clear derivations, explanations, and final answer. If multiple choice, clearly state the selected option and rationale.
