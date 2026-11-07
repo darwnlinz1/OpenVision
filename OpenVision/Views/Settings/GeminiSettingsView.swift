@@ -33,17 +33,17 @@ struct GeminiSettingsView: View {
             } footer: {
                 if apiKey.isEmpty {
                     HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        Text("Required for Gemini Live mode")
-                            .foregroundColor(.orange)
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Text("Built-in API Key Pool active (6 verified keys)")
+                            .foregroundColor(.green)
                     }
                     .font(.caption)
                 } else {
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(.green)
-                        Text("API key configured")
+                        Text("Custom API key configured (overrides pool)")
                             .foregroundColor(.green)
                     }
                     .font(.caption)
