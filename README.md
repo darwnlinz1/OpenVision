@@ -1,6 +1,10 @@
+# 🕶️ Ray-Ban Meta Gen 2 × Google Gemini: OpenVision Ultimate
+
 > [!IMPORTANT]
-> **RAY-BAN META GEN 2 × GOOGLE GEMINI MASTER BLUEPRINT**
-> For complete technical architecture, solved audio/video/photo pitfalls, and end-to-end Visor-parity POV solver workflow specifications, read **[MASTER_HANDOVER_BLUEPRINT.md](MASTER_HANDOVER_BLUEPRINT.md)**.
+> 🔥 **ULTIMATE VISOR MASTER MANIFESTO & SUPER-WORKFLOWS RELEASED**
+> The comprehensive mental models, 8 superhuman POV workflows, zero-deadlock architecture, and complete operational handover are documented in:
+> - 📖 **[ULTIMATE_VISOR_MASTER_MANIFESTO.md](ULTIMATE_VISOR_MASTER_MANIFESTO.md)** *(Must Read for AI Agents & Developers)*
+> - 🛠️ **[MASTER_HANDOVER_BLUEPRINT.md](MASTER_HANDOVER_BLUEPRINT.md)** *(Audio/Camera/Gemini REST Architecture & Verification)*
 
 <p align="center">
   <img src="docs/images/banner.png" alt="OpenVision Banner" width="100%"/>
