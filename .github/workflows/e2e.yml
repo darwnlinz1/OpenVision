@@ -1,0 +1,80 @@
+name: E2E (Blueprint)
+
+# End-to-end checks from MASTER_HANDOVER_BLUEPRINT.md.
+#   1. blueprint-guard  — seconds, on Linux: source-level guards for the 7 "fatal pitfalls"
+#                         and project integrity (scripts/blueprint/verify_blueprint.py).
+#   2. simulator-e2e    — the Blueprint XCTest suites on an iOS 18+ iPhone simulator: the real
+#                         GeminiLiveService (streaming, retries, history) against a scripted
+#                         endpoint, the real TTS, and the real photo library.
+#   3. live Gemini      — opt-in (workflow_dispatch → live_gemini): the same app code against the
+#                         real Gemini API, to catch prompt/model drift. Uses API quota.
+# Hardware-only checks (glasses shutter, temple speaker, volume HUD) are the manual protocol in
+# docs/testing/E2E_TEST_PLAN.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      live_gemini:
+        description: "Also run the live Gemini smoke test (calls the real API)"
+        type: boolean
+        default: false
+      full_suite:
+        description: "Run every OpenVisionTests suite, not only the Blueprint ones"
+        type: boolean
+        default: false
+
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with ci.yml / build-ipa.yml.
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  blueprint-guard:
+    name: Blueprint guard (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify blueprint invariants
+        run: python3 scripts/blueprint/verify_blueprint.py
+
+  simulator-e2e:
+    name: Blueprint E2E (iOS simulator)
+    needs: blueprint-guard
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Swift packages
+        uses: actions/cache@v6
+        with:
+          path: .spm
+          key: spm-${{ runner.os }}-${{ hashFiles('OpenVision.xcodeproj/project.pbxproj', 'project.yml') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Show toolchain and simulators
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Build and run the E2E suites
+        env:
+          SUITE: ${{ inputs.full_suite && 'all' || 'blueprint' }}
+          XCBEAUTIFY_ARGS: --renderer github-actions
+          TEST_RUNNER_OPENVISION_LIVE_GEMINI: ${{ inputs.live_gemini && '1' || '' }}
+        run: scripts/e2e/run-simulator-tests.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-xcresult
+          path: build/E2E.xcresult
+          if-no-files-found: ignore

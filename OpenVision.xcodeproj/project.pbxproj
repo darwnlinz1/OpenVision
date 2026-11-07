@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		F7171F39C05F14F095CA441A /* BlueprintSolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27298ECDFB6BF4F7743FB3AC /* BlueprintSolverTests.swift */; };
+		EB6BEF2BD2B4FC7E24248FDE /* BlueprintGeminiE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA8C2E880C1F79EB7B2A3794 /* BlueprintGeminiE2ETests.swift */; };
+		F5908580D9F4B16DB68B7155 /* BlueprintPhotoLibraryE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE24101A60E8448DFB9A1A45 /* BlueprintPhotoLibraryE2ETests.swift */; };
+		B8F54CEF6FDC8F15D3CB16DA /* GeminiLiveSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19633968CAA41539464CF0AC /* GeminiLiveSmokeTests.swift */; };
 		08440F1603742AB28B2B4815 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 8F8A2A9D74F79603F186C7B4 /* Tokenizers */; };
 		0CD9B9D7D0854411C0A04148 /* AIBackendProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A900F00D2451513A29BC4C6F /* AIBackendProtocol.swift */; };
 		0D8C225C70FFE36DD531EBB3 /* InfluxMetricsSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1C42DAF5F3F6F1D6E183B1D /* InfluxMetricsSink.swift */; };
@@ -140,6 +144,10 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		27298ECDFB6BF4F7743FB3AC /* BlueprintSolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintSolverTests.swift; sourceTree = "<group>"; };
+		FA8C2E880C1F79EB7B2A3794 /* BlueprintGeminiE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintGeminiE2ETests.swift; sourceTree = "<group>"; };
+		FE24101A60E8448DFB9A1A45 /* BlueprintPhotoLibraryE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintPhotoLibraryE2ETests.swift; sourceTree = "<group>"; };
+		19633968CAA41539464CF0AC /* GeminiLiveSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeminiLiveSmokeTests.swift; sourceTree = "<group>"; };
 		01CC70E5327BD07B920833FC /* GlassCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassCard.swift; sourceTree = "<group>"; };
 		06B8E5499FB1BA51EF6F1741 /* SessionRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionRecorder.swift; sourceTree = "<group>"; };
 		09CF2D46A856380011EEC513 /* OVExceptionCatcher.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OVExceptionCatcher.m; sourceTree = "<group>"; };
@@ -666,6 +674,10 @@
 		FA1346C9AC741922A0BF6928 /* OpenVisionTests */ = {
 			isa = PBXGroup;
 			children = (
+				27298ECDFB6BF4F7743FB3AC /* BlueprintSolverTests.swift */,
+				FA8C2E880C1F79EB7B2A3794 /* BlueprintGeminiE2ETests.swift */,
+				FE24101A60E8448DFB9A1A45 /* BlueprintPhotoLibraryE2ETests.swift */,
+				19633968CAA41539464CF0AC /* GeminiLiveSmokeTests.swift */,
 				39552315579536D518404FED /* DocumentChunkingTests.swift */,
 				B88E1A3CDAF6C7B3D7DF36FE /* FrameChangeTests.swift */,
 				3A5609ACD2D7FE78F322E775 /* GrokTests.swift */,
@@ -842,6 +854,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F7171F39C05F14F095CA441A /* BlueprintSolverTests.swift in Sources */,
+				EB6BEF2BD2B4FC7E24248FDE /* BlueprintGeminiE2ETests.swift in Sources */,
+				F5908580D9F4B16DB68B7155 /* BlueprintPhotoLibraryE2ETests.swift in Sources */,
+				B8F54CEF6FDC8F15D3CB16DA /* GeminiLiveSmokeTests.swift in Sources */,
 				E9628B20FB4654FBBFC61EF9 /* DocumentChunkingTests.swift in Sources */,
 				9A7811CF026E8DF74F74C2A2 /* FrameChangeTests.swift in Sources */,
 				41DD47E61F53A95E861466C1 /* GrokTests.swift in Sources */,

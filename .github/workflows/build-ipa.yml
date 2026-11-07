@@ -29,6 +29,10 @@ jobs:
           echo "Configuration files verified:"
           cat Config.xcconfig
 
+      - name: Blueprint guard
+        # Blueprint §3 invariants, before spending a long build on a regression.
+        run: python3 scripts/blueprint/verify_blueprint.py
+
       - name: Cache Swift packages
         uses: actions/cache@v6
         with:
@@ -60,6 +64,9 @@ jobs:
           echo "Found app at: $APP_PATH"
           cp -r "$APP_PATH" Payload/
           zip -r -y OpenVision.ipa Payload
+
+      - name: Verify IPA contents (Blueprint checklist test 6)
+        run: scripts/blueprint/verify_ipa_symbols.sh OpenVision.ipa
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v7

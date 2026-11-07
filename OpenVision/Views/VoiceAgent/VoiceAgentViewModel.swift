@@ -137,6 +137,9 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
     /// Full-resolution bytes of the newest asset we loaded, keyed by its local identifier.
     private var cache: (assetID: String, created: Date, data: Data)?
     private var prefetchTask: Task<Void, Never>?
+    /// A load already running (usually the prefetch), so a question asked meanwhile joins it
+    /// instead of decoding the same photo twice.
+    private var inFlight: (assetID: String, task: Task<Data?, Never>)?
 
     private override init() {
         super.init()
@@ -180,13 +183,23 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
             return cached.data
         }
 
-        NSLog("[RecentPhotoScanner] Found asset created at: %@", newest.created.description)
-        guard let data = await Self.loadFullResolution(assetID: newest.id) else {
+        let load: Task<Data?, Never>
+        if let running = inFlight, running.assetID == newest.id {
+            load = running.task
+        } else {
+            NSLog("[RecentPhotoScanner] Found asset created at: %@", newest.created.description)
+            let assetID = newest.id
+            load = Task.detached(priority: .userInitiated) { await Self.loadFullResolution(assetID: assetID) }
+            inFlight = (assetID: assetID, task: load)
+        }
+        let loaded = await load.value
+        if inFlight?.assetID == newest.id { inFlight = nil }
+        guard let data = loaded else {
             NSLog("[RecentPhotoScanner] Could not load image data for newest asset")
             return nil
         }
         NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
-        cache = (newest.id, newest.created, data)
+        cache = (assetID: newest.id, created: newest.created, data: data)
         lastScannedPhotoData = data
         lastScannedTimestamp = Date()
         return data
@@ -208,7 +221,7 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
 
     /// Newest image asset created at/after `cutoff` — (localIdentifier, creationDate).
     private nonisolated static func newestImageAsset(since cutoff: Date) async -> (id: String, created: Date)? {
-        await withCheckedContinuation { continuation in
+        await withCheckedContinuation { (continuation: CheckedContinuation<(id: String, created: Date)?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let fetchOptions = PHFetchOptions()
                 fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
@@ -217,7 +230,7 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
                 fetchOptions.fetchLimit = 1
                 let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
                 if let asset = assets.firstObject {
-                    continuation.resume(returning: (asset.localIdentifier, asset.creationDate ?? Date()))
+                    continuation.resume(returning: (id: asset.localIdentifier, created: asset.creationDate ?? Date()))
                 } else {
                     continuation.resume(returning: nil)
                 }
@@ -229,7 +242,7 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
     /// JPEG originals pass through byte-for-byte; HEIC/other formats are re-encoded once to a
     /// high-quality JPEG at full size, so every backend can read it.
     private nonisolated static func loadFullResolution(assetID: String) async -> Data? {
-        await withCheckedContinuation { continuation in
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
                 guard let asset = assets.firstObject else {

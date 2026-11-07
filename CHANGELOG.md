@@ -5,6 +5,24 @@ All notable changes to OpenVision will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Free-form, bilingual solver flow (Gemini)** — after a temple-shutter photo, say "Ok Vision" and anything, in Vietnamese or English. The words reach Gemini verbatim (no fixed phrase list, no rewriting an unrelated question into "solve the image"); the answer comes back in the language you asked in, the photo is used only when relevant, and the model itself asks for a photo when you ask about something it cannot see
+- **Full-resolution glasses photos** — the Camera Roll scanner sends the original 12 MP photo (upright JPEGs byte-for-byte; HEIC / EXIF-rotated images re-encoded once at full size), loads it off the main thread and prefetches it the moment Meta View syncs it; Gemini reads it at `MEDIA_RESOLUTION_HIGH`
+- **Streaming, timeout-proof Gemini requests** — answers stream over SSE and the glasses start speaking at the first SPOKEN sentence; retries are chosen per failure (429, revoked key, 5xx, dropped connection) under one 120 s deadline; follow-ups on the same photo don't re-upload it
+- The speech voice follows the answer's language and prefers an installed enhanced/premium voice
+
+### Fixed
+- Photos permission was never requested, so the temple-shutter workflow silently found no photo on a fresh install; Limited access is now reported
+- One revoked key in the pool failed the whole turn instead of rotating
+- `maxOutputTokens` 2048 could leave hard problems with an empty answer; only the first response part was read
+- English answers were read in the Vietnamese voice on a Vietnamese iPhone ("true", "structure" counted as Vietnamese)
+- A failed turn was silent on the glasses; it is now spoken
+
+### Added
+- End-to-end test suite for MASTER_HANDOVER_BLUEPRINT.md: static guard (`make blueprint-check`), simulator XCTest suites (`make e2e`), opt-in live Gemini smoke test, IPA symbol check, `E2E (Blueprint)` workflow, and the test plan in `docs/testing/E2E_TEST_PLAN.md`
+
 ## [2.14.0] - 2026-10-02
 
 ### Added

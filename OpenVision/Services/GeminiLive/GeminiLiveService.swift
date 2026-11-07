@@ -249,7 +249,7 @@ final class GeminiLiveService: ObservableObject {
                 await backoff(attempt: attempt)
 
             case .network(let message, let partial):
-                if !partial.isEmpty {
+                if !Self.parseDualChannel(partial).spoken.isEmpty {
                     // The connection dropped mid-answer: keep what arrived rather than make the
                     // wearer wait for a full retry (the spoken part streams first anyway).
                     NSLog("[GeminiLive] Stream dropped after %d chars (%@) — using partial answer", partial.count, message)
@@ -571,10 +571,11 @@ final class GeminiLiveService: ObservableObject {
         keyCooldowns[key] = Date().addingTimeInterval(max(1, seconds))
     }
 
-    /// Forget rotation position and cooldowns (tests, or a fresh start).
-    func resetKeyRotationState() {
+    /// Forget rotation position, key cooldowns and learned model capabilities (tests, fresh start).
+    func resetNetworkState() {
         currentKeyIndex = 0
         keyCooldowns.removeAll()
+        mediaResolutionSupported = true
     }
 
     // MARK: - Dual Channel Response Parser (Visor line-anchored regex)
