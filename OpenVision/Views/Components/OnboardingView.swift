@@ -264,7 +264,7 @@ private struct SetupPage: View {
         VStack(spacing: 32) {
             Spacer()
 
-            Text("Quick Setup")
+            Text("Thiết lập nhanh")
                 .font(.title)
                 .fontWeight(.bold)
                 .foregroundColor(.white)
@@ -272,26 +272,26 @@ private struct SetupPage: View {
             VStack(spacing: 20) {
                 SetupStep(
                     number: 1,
-                    title: "Choose AI Backend",
-                    description: "OpenClaw for tools & tasks, or Gemini Live for conversation"
+                    title: "Dán API key Gemini",
+                    description: "Cài đặt → Gemini. Lấy key miễn phí ở Google AI Studio"
                 )
 
                 SetupStep(
                     number: 2,
-                    title: "Add Credentials",
-                    description: "Enter your gateway URL or API key in Settings"
+                    title: "Kết nối kính",
+                    description: "Đăng ký kính Ray-Ban Meta qua ứng dụng Meta AI"
                 )
 
                 SetupStep(
                     number: 3,
-                    title: "Connect Glasses",
-                    description: "Register your Meta Ray-Bans (or use iPhone camera)"
+                    title: "Chụp và hỏi",
+                    description: "Bấm nút chụp trên gọng kính, rồi nói \"Ok Vision\" + câu hỏi"
                 )
 
                 SetupStep(
                     number: 4,
-                    title: "Start Talking",
-                    description: "Say \"Ok Vision\" and ask anything"
+                    title: "Nghe và xem",
+                    description: "Kính đọc đáp án; iPhone hiện lời giải chi tiết có công thức"
                 )
             }
             .padding(.horizontal, 24)

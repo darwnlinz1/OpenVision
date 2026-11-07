@@ -51,6 +51,19 @@ final class GeminiLiveService: ObservableObject {
         imageFingerprintInHistory = nil
     }
 
+    /// Continue a past conversation from History: its last exchanges (text only — photos are not
+    /// kept in History) become the model's context for the next question.
+    func seedHistory(from messages: [(isUser: Bool, text: String)]) {
+        clearConversationHistory()
+        var turns: [[String: Any]] = messages.suffix(Self.maxHistoryEntries).map { message in
+            message.isUser ? Self.userTurn(text: message.text, imageData: nil)
+                           : Self.modelTurn(text: message.text, signature: nil)
+        }
+        // The history must open with a user turn.
+        while let first = turns.first, (first["role"] as? String) != "user" { turns.removeFirst() }
+        conversationHistory = turns
+    }
+
     // MARK: - Callbacks
 
     var onTextReceived: ((String) -> Void)?
@@ -668,7 +681,7 @@ final class GeminiLiveService: ObservableObject {
 
     /// Keys from Settings: one or several, separated by commas, semicolons, spaces or new lines.
     /// Never compiled into the app — the repository is public.
-    static func parseKeys(_ raw: String) -> [String] {
+    nonisolated static func parseKeys(_ raw: String) -> [String] {
         var seen = Set<String>()
         return raw.components(separatedBy: CharacterSet(charactersIn: ",; \n\r\t"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }

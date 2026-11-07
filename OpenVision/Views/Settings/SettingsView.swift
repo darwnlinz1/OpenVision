@@ -1,5 +1,5 @@
 // OpenVision - SettingsView.swift
-// Main settings menu with navigation to configuration panels
+// Settings: one brain (Gemini), the glasses, and the voice — nothing else.
 
 import SwiftUI
 
@@ -14,148 +14,106 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                // AI Backend Section
+                // AI
                 Section {
                     NavigationLink {
-                        AIBackendSettingsView()
+                        GeminiSettingsView()
                     } label: {
                         HStack {
-                            Label("AI Backend", systemImage: "cpu")
+                            Label("Gemini", systemImage: "sparkles")
                             Spacer()
-                            Text(settingsManager.settings.aiBackend.displayName)
-                                .foregroundColor(.secondary)
-                            if !settingsManager.settings.isCurrentBackendConfigured {
+                            if settingsManager.settings.isGeminiConfigured {
+                                Text("\(GeminiLiveService.parseKeys(settingsManager.settings.geminiAPIKey).count) key")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("Chưa có key")
+                                    .foregroundColor(Theme.warning)
                                 Image(systemName: "exclamationmark.circle.fill")
-                                    .foregroundColor(.orange)
+                                    .foregroundColor(Theme.warning)
                             }
                         }
                     }
 
                     NavigationLink {
-                        WebSearchSettingsView()
+                        AdditionalInstructionsView()
                     } label: {
-                        HStack {
-                            Label("Web Search", systemImage: "magnifyingglass")
-                            Spacer()
-                            Text(settingsManager.settings.tavilyAPIKey.isEmpty ? "DuckDuckGo" : "Tavily")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                        Label("Hướng dẫn riêng", systemImage: "text.quote")
                     }
 
-                    // Only show for Gemini Live (OpenClaw has its own system prompt & memories)
-                    if settingsManager.settings.aiBackend == .geminiLive {
-                        NavigationLink {
-                            AdditionalInstructionsView()
-                        } label: {
-                            Label("Custom Instructions", systemImage: "text.quote")
-                        }
-
-                        NavigationLink {
-                            MemoriesView()
-                        } label: {
-                            HStack {
-                                Label("Memories", systemImage: "brain")
-                                Spacer()
-                                Text("\(settingsManager.settings.memories.count)")
-                                    .foregroundColor(.secondary)
-                            }
+                    NavigationLink {
+                        MemoriesView()
+                    } label: {
+                        HStack {
+                            Label("Ghi nhớ", systemImage: "brain")
+                            Spacer()
+                            Text("\(settingsManager.settings.memories.count)")
+                                .foregroundColor(.secondary)
                         }
                     }
                 } header: {
                     Text("AI")
                 }
 
-                // Hardware Section
+                // Glasses
                 Section {
                     NavigationLink {
                         GlassesSettingsView()
                     } label: {
                         HStack {
-                            Label("Glasses", systemImage: "eyeglasses")
+                            Label("Kính Ray-Ban Meta", systemImage: "eyeglasses")
                             Spacer()
-                            if glassesManager.isRegistered {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.green)
-                            } else {
-                                Image(systemName: "exclamationmark.circle.fill")
-                                    .foregroundColor(.orange)
-                            }
+                            Image(systemName: glassesManager.isRegistered ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                                .foregroundColor(glassesManager.isRegistered ? Theme.success : Theme.warning)
                         }
                     }
                 } header: {
-                    Text("Hardware")
+                    Text("Phần cứng")
                 }
 
-                // Voice Section
+                // Voice
                 Section {
                     NavigationLink {
                         VoiceSettingsView()
                     } label: {
                         HStack {
-                            Label("Voice Control", systemImage: "mic.fill")
+                            Label("Giọng nói", systemImage: "mic.fill")
                             Spacer()
-                            if settingsManager.settings.wakeWordEnabled {
-                                Text(settingsManager.settings.wakeWord)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                Text("Off")
-                                    .foregroundColor(.secondary)
-                            }
+                            Text(settingsManager.settings.wakeWordEnabled ? settingsManager.settings.wakeWord : "Tắt")
+                                .foregroundColor(.secondary)
                         }
                     }
                 } header: {
-                    Text("Voice")
+                    Text("Giọng nói")
                 }
 
-                // Advanced Section
+                // Display
                 Section {
-                    NavigationLink {
-                        DocumentsSettingsView()
-                    } label: {
-                        Label("My Documents", systemImage: "books.vertical")
-                    }
-
-                    NavigationLink {
-                        TelemetrySettingsView()
-                    } label: {
-                        Label("Telemetry", systemImage: "chart.line.uptrend.xyaxis")
-                    }
-
-                    Toggle(isOn: $settingsManager.settings.autoReconnect) {
-                        Label("Auto-Reconnect", systemImage: "arrow.triangle.2.circlepath")
-                    }
-
                     Toggle(isOn: $settingsManager.settings.showTranscripts) {
-                        Label("Show Transcripts", systemImage: "text.bubble")
+                        Label("Hiện hội thoại trên màn hình", systemImage: "text.bubble")
                     }
                 } header: {
-                    Text("Advanced")
+                    Text("Hiển thị")
                 }
 
-                // About Section
+                // About
                 Section {
                     HStack {
-                        Label("Version", systemImage: "info.circle")
+                        Label("Phiên bản", systemImage: "info.circle")
                         Spacer()
                         Text("\(Config.appVersion) (\(Config.buildNumber))")
                             .foregroundColor(.secondary)
                     }
 
-                    Link(destination: URL(string: "https://github.com/rayl15/OpenVision")!) {
-                        Label("GitHub Repository", systemImage: "link")
-                    }
-
-                    Link(destination: URL(string: "https://github.com/openclaw/openclaw")!) {
-                        Label("Get OpenClaw", systemImage: "arrow.up.right.square")
+                    Link(destination: URL(string: "https://github.com/darwnlinz1/OpenVision")!) {
+                        Label("Mã nguồn trên GitHub", systemImage: "link")
                     }
                 } header: {
-                    Text("About")
+                    Text("Giới thiệu")
                 } footer: {
-                    Text("OpenVision is open source under the MIT license.")
+                    Text("OpenVision là phần mềm mã nguồn mở (MIT).")
                 }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("Cài đặt")
         }
     }
 }

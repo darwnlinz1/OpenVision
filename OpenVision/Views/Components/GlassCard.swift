@@ -321,7 +321,7 @@ struct FloatingActionButton: View {
         .ignoresSafeArea()
 
         VStack(spacing: 30) {
-            StatusPill(status: "OpenClaw", color: .green, isConnected: true)
+            StatusPill(status: "Gemini", color: .green, isConnected: true)
 
             GlassCard {
                 VStack(spacing: 12) {

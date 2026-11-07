@@ -91,13 +91,13 @@ final class BlueprintSolverTests: XCTestCase {
     }
 
     func testVoiceFollowsAnswerLanguage() {
-        let english = TTSService.voice(forText: "The answer is B because the derivative is positive.", chosen: nil)
+        let english = TTSService.voice(forText: "The answer is B because the derivative is positive.")
         XCTAssertTrue(english?.language.hasPrefix("en") ?? false, "English answer → English voice, got \(String(describing: english?.language))")
         if AVSpeechSynthesisVoice(language: "vi-VN") != nil {
-            let vietnamese = TTSService.voice(forText: "Đáp án là B vì đạo hàm dương.", chosen: nil)
+            let vietnamese = TTSService.voice(forText: "Đáp án là B vì đạo hàm dương.")
             XCTAssertEqual(vietnamese?.language, "vi-VN")
             let chosenEnglish = AVSpeechSynthesisVoice(language: "en-GB")
-            XCTAssertEqual(TTSService.voice(forText: "x bằng 2", chosen: chosenEnglish)?.language, "vi-VN",
+            XCTAssertEqual(TTSService.voice(forText: "x bằng 2", english: chosenEnglish)?.language, "vi-VN",
                            "a Vietnamese answer is never read by an English voice")
         }
     }
@@ -240,10 +240,25 @@ final class BlueprintSolverTests: XCTestCase {
 
     // MARK: - Workflow: shutter photo → "Ok Vision" + anything, in Vietnamese or English
 
-    func testGeminiNeverDependsOnAFixedPhraseList() {
-        XCTAssertTrue(SolverIntent.modelDecidesIntent(for: .geminiLive))
-        // Only the small backends keep keyword routing.
-        XCTAssertFalse(SolverIntent.modelDecidesIntent(for: .localGemma))
+    /// Math that slipped into SPOKEN is read as words, in the answer's language.
+    func testSpokenMathReadsSymbolsAsWords() {
+        XCTAssertEqual(SpokenMath.normalize("x^2 = 4 nên x = 2 hoặc x = -2.", vietnamese: true),
+                       "x bình phương bằng 4 nên x bằng 2 hoặc x bằng âm 2.")
+        XCTAssertEqual(SpokenMath.normalize("Đáp án: 3/4 + 1/4 = 1", vietnamese: true),
+                       "Đáp án: 3 phần 4 cộng 1 phần 4 bằng 1")
+        XCTAssertEqual(SpokenMath.normalize("The answer is x^2 = 9, so x = -3 or x = 3.", vietnamese: false),
+                       "The answer is x squared equals 9, so x equals negative 3 or x equals 3.")
+        XCTAssertEqual(SpokenMath.normalize("e^(x+1) là đạo hàm", vietnamese: true), "e mũ x cộng 1 là đạo hàm")
+        XCTAssertEqual(SpokenMath.normalize("x² ≥ 0, √16 = 4, giảm 20%", vietnamese: true),
+                       "x bình phương lớn hơn hoặc bằng 0, căn 16 bằng 4, giảm 20 phần trăm")
+        // Not math: ranges and names are left alone.
+        XCTAssertEqual(SpokenMath.normalize("câu 1-5 của Ray-Ban", vietnamese: true), "câu 1-5 của Ray-Ban")
+    }
+
+    func testRecognizerLanguageSetting() {
+        XCTAssertEqual(VoiceCommandService.recognitionLocaleIdentifier("vi-VN"), "vi-VN")
+        XCTAssertEqual(VoiceCommandService.recognitionLocaleIdentifier("en-US"), "en-US")
+        XCTAssertFalse(VoiceCommandService.recognitionLocaleIdentifier("auto").contains("_"))
     }
 
     func testPhotoContextLivesFor120SecondsAndFiveQuestions() {

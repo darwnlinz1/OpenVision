@@ -22,10 +22,6 @@ struct VoiceAgentView: View {
 
     @StateObject private var voiceCommandService = VoiceCommandService.shared
     @StateObject private var ttsService = TTSService.shared
-    @StateObject private var kokoroTTS = KokoroTTSService.shared
-    @StateObject private var grokTTS = CloudTTSService.grok
-    @StateObject private var openAITTS = CloudTTSService.openAI
-    @StateObject private var documentFocus = DocumentFocus.shared
     @StateObject private var photoScanner = RecentPhotoScanner.shared
 
     /// The solution open in the sheet — frozen when opened, so a new question doesn't blank it.
@@ -47,22 +43,6 @@ struct VoiceAgentView: View {
             VStack(spacing: 0) {
                 topBar
                     .padding(.top, 8)
-                // Document-focus pill: visible whenever a document is "open" so the mode is never
-                // silently steering answers. Tap to release focus.
-                if let doc = documentFocus.activeDocument {
-                    HStack(spacing: 6) {
-                        Image(systemName: "book.fill").font(.caption2)
-                        Text(doc.title).font(.caption.bold()).lineLimit(1)
-                        Image(systemName: "xmark.circle.fill").font(.caption2).opacity(0.7)
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.indigo.opacity(0.8)))
-                    .padding(.top, 8)
-                    .onTapGesture { documentFocus.deactivate() }
-                    .transition(.opacity)
-                }
                 Spacer()
                 centerContent
                 Spacer()
@@ -105,15 +85,6 @@ struct VoiceAgentView: View {
         .onChange(of: ttsService.isSpeaking) { isSpeaking in
             viewModel.ttsSpeakingChanged(isSpeaking)
         }
-        .onChange(of: kokoroTTS.isSpeaking) { speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
-        .onChange(of: grokTTS.isSpeaking) { _, speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
-        .onChange(of: openAITTS.isSpeaking) { _, speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
         // Control thinking sound based on agent state
         .onChange(of: viewModel.agentState) { newState in
             viewModel.agentStateChanged(newState)
@@ -128,39 +99,11 @@ struct VoiceAgentView: View {
 
     private var topBar: some View {
         HStack {
-            // AI Backend status (or Live Video indicator)
-            if viewModel.isLiveVideoMode {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(.red)
-                        .frame(width: 10, height: 10)
-                        .overlay(
-                            Circle()
-                                .stroke(.red.opacity(0.5), lineWidth: 2)
-                                .scaleEffect(1.5)
-                        )
-
-                    Text("LIVE")
-                        .font(.caption.bold())
-                        .foregroundColor(.white)
-
-                    Image(systemName: "video.fill")
-                        .font(.caption)
-                        .foregroundColor(.white)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(
-                    Capsule()
-                        .fill(.red.opacity(0.8))
-                )
-            } else {
-                StatusPill(
-                    status: settingsManager.settings.backendDisplayName,
-                    color: viewModel.agentState == .idle ? .gray : .green,
-                    isConnected: viewModel.agentState != .idle && viewModel.agentState != .connecting
-                )
-            }
+            StatusPill(
+                status: settingsManager.settings.backendDisplayName,
+                color: viewModel.agentState == .idle ? .gray : .green,
+                isConnected: viewModel.agentState != .idle && viewModel.agentState != .connecting
+            )
 
             Spacer()
 
@@ -231,8 +174,8 @@ struct VoiceAgentView: View {
         switch viewModel.agentState {
         case .listening: return .listening
         case .speaking: return .speaking
-        case .thinking, .toolRunning, .connecting: return .thinking
-        case .idle, .liveVideo: return .idle
+        case .thinking, .connecting: return .thinking
+        case .idle: return .idle
         }
     }
 
@@ -240,16 +183,7 @@ struct VoiceAgentView: View {
         VStack(spacing: 28) {
             // Heading / status prompt
             Group {
-                if viewModel.agentState == .liveVideo {
-                    VStack(spacing: 6) {
-                        Text(settingsManager.settings.backendDisplayName)
-                            .font(.headline)
-                            .foregroundColor(Theme.heading)
-                        Text("Nói \"stop video\" để thoát")
-                            .font(.caption)
-                            .foregroundColor(Theme.textSecondary)
-                    }
-                } else if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
+                if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
                     VStack(spacing: 8) {
                         Text("Hỏi gì cũng được")
                             .font(.system(size: 30, weight: .bold, design: .rounded))
@@ -280,12 +214,6 @@ struct VoiceAgentView: View {
                 .font(.title3)
                 .fontWeight(.medium)
                 .foregroundColor(Theme.textPrimary)
-
-            // Tool status
-            if let tool = viewModel.currentToolName, viewModel.agentState == .toolRunning {
-                ToolStatusView(toolName: tool, isRunning: true)
-                    .transition(.scale.combined(with: .opacity))
-            }
         }
     }
 

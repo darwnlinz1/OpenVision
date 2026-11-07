@@ -332,7 +332,7 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         // Lesson 4: "speaking" is set synchronously, BEFORE the OS starts audio, so the mic
         // can't hear the first syllables of the temple speaker as a new command.
         XCTAssertTrue(tts.isSpeaking)
-        XCTAssertEqual(tts.pendingUtterances, 1)
+        XCTAssertGreaterThanOrEqual(tts.pendingUtterances, 2, "queued sentence by sentence (one voice per language)")
         await fulfillment(of: [ended], timeout: 60)
         XCTAssertFalse(tts.isSpeaking)
         XCTAssertEqual(tts.pendingUtterances, 0, "every utterance finished — nothing was cut off")

@@ -169,8 +169,11 @@ def main() -> int:
           "history is sent with every request")
 
     # --- Workflow (section 2): free-form, bilingual, resilient.
-    intent = function_body(vm, r"static\s+func\s+modelDecidesIntent\s*\(") or ""
-    check("workflow", "geminiLive" in intent, "Gemini receives the wearer's words verbatim (no fixed phrase list)")
+    send = strip_comments(function_body(vm, r"func\s+sendCommand\s*\(") or "")
+    check("workflow", "sendRESTMessage(command" in send and "visualKeywords" not in vm,
+          "Gemini receives the wearer's words verbatim (no fixed phrase list)")
+    check("workflow", not re.search(r"MLX|Kokoro|GemmaLocal|OpenClaw|AppleFoundation", read("project.yml")),
+          "lean app: no on-device LLM / extra backends in the project")
     check("workflow", "language the user used" in gemini, "answers in the language the wearer asked in")
     check("workflow", "streamGenerateContent" in gemini and "URLSession.shared" not in strip_comments(gemini),
           "streamed requests on a dedicated session (idle timeout, test-injectable)")

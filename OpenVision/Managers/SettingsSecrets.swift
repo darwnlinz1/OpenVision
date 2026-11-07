@@ -12,15 +12,9 @@ import Security
 enum SettingsSecrets {
 
     /// Every secret field, by its Keychain account.
+    /// (Accounts of removed backends are simply no longer read; their Keychain items are harmless.)
     static let fields: [(account: String, keyPath: WritableKeyPath<AppSettings, String>)] = [
-        ("openClawAuthToken", \.openClawAuthToken),
         ("geminiAPIKey", \.geminiAPIKey),
-        ("openAIAPIKey", \.openAIAPIKey),
-        ("grokAPIKey", \.grokAPIKey),
-        ("hermesAPIKey", \.hermesAPIKey),
-        ("tavilyAPIKey", \.tavilyAPIKey),
-        ("telemetryToken", \.telemetryToken),
-        ("telemetryPassword", \.telemetryPassword),
     ]
 
     /// What the Keychain said about one account: a value, nothing stored, or no answer (it can't

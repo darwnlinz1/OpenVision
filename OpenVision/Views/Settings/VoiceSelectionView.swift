@@ -1,124 +1,78 @@
 // OpenVision - VoiceSelectionView.swift
-// Voice picker for TTS output
+// Apple voice picker for one language (Vietnamese or English answers).
 
 import SwiftUI
 import AVFoundation
 
 struct VoiceSelectionView: View {
-    // MARK: - Environment
-
-    @EnvironmentObject var settingsManager: SettingsManager
+    /// "vi" or "en".
+    let languagePrefix: String
+    let title: String
+    let sample: String
+    @Binding var selection: String?
 
     // MARK: - State
 
     @State private var voices: [AVSpeechSynthesisVoice] = []
-    @State private var isTestingVoice: Bool = false
-    @State private var testingVoiceId: String? = nil
+    @State private var testingVoiceId: String?
+    /// Held for the duration of a preview: a synthesizer created inside a function is released as
+    /// soon as it returns and speaks nothing (why "test voice" used to be silent).
+    @State private var previewSynthesizer = AVSpeechSynthesizer()
 
     // MARK: - Body
 
     var body: some View {
         List {
-            // System Default Option
             Section {
-                voiceRow(
-                    name: "System Default",
-                    quality: nil,
-                    identifier: nil,
-                    isSelected: settingsManager.settings.selectedVoiceIdentifier == nil
-                )
+                voiceRow(name: "Tự động (giọng tốt nhất đã cài)", quality: nil, identifier: nil)
             } footer: {
-                Text("Uses the default voice from iOS Settings → Accessibility → Spoken Content")
+                Text("Tự chọn giọng chất lượng cao nhất (Premium › Enhanced › Default) có trên máy.")
             }
 
-            // Premium Voices
-            let premiumVoices = voices.filter { $0.quality == .premium }
-            if !premiumVoices.isEmpty {
-                Section {
-                    ForEach(premiumVoices, id: \.identifier) { voice in
-                        voiceRow(
-                            name: voice.name,
-                            quality: voice.quality,
-                            identifier: voice.identifier,
-                            isSelected: settingsManager.settings.selectedVoiceIdentifier == voice.identifier
-                        )
+            ForEach([AVSpeechSynthesisVoiceQuality.premium, .enhanced, .default], id: \.rawValue) { quality in
+                let group = voices.filter { $0.quality == quality }
+                if !group.isEmpty {
+                    Section {
+                        ForEach(group, id: \.identifier) { voice in
+                            voiceRow(name: voice.name, quality: voice.quality, identifier: voice.identifier)
+                        }
+                    } header: {
+                        Text(TTSService.qualityDisplayName(quality))
                     }
-                } header: {
-                    Text("Premium Voices")
-                } footer: {
-                    Text("Highest quality, most natural sounding")
                 }
             }
 
-            // Enhanced Voices
-            let enhancedVoices = voices.filter { $0.quality == .enhanced }
-            if !enhancedVoices.isEmpty {
-                Section {
-                    ForEach(enhancedVoices, id: \.identifier) { voice in
-                        voiceRow(
-                            name: voice.name,
-                            quality: voice.quality,
-                            identifier: voice.identifier,
-                            isSelected: settingsManager.settings.selectedVoiceIdentifier == voice.identifier
-                        )
-                    }
-                } header: {
-                    Text("Enhanced Voices")
-                } footer: {
-                    Text("Better quality than default")
-                }
-            }
-
-            // Default Voices
-            let defaultVoices = voices.filter { $0.quality == .default }
-            if !defaultVoices.isEmpty {
-                Section {
-                    ForEach(defaultVoices, id: \.identifier) { voice in
-                        voiceRow(
-                            name: voice.name,
-                            quality: voice.quality,
-                            identifier: voice.identifier,
-                            isSelected: settingsManager.settings.selectedVoiceIdentifier == voice.identifier
-                        )
-                    }
-                } header: {
-                    Text("Default Voices")
-                }
-            }
-
-            // Download More Voices
             Section {
                 Link(destination: URL(string: "App-prefs:ACCESSIBILITY&path=SPEECH")!) {
                     HStack {
-                        Label("Download More Voices", systemImage: "square.and.arrow.down")
+                        Label("Tải thêm giọng", systemImage: "square.and.arrow.down")
                         Spacer()
                         Image(systemName: "arrow.up.right.square")
                             .foregroundColor(.secondary)
                     }
                 }
             } footer: {
-                Text("Download premium and enhanced voices in iOS Settings → Accessibility → Spoken Content → Voices")
+                Text("Giọng Enhanced/Premium phát âm tự nhiên hơn nhiều. Tải trong Cài đặt iOS → Trợ năng → Nội dung được đọc → Giọng nói.")
             }
         }
-        .navigationTitle("TTS Voice")
+        .navigationTitle(title)
         .onAppear {
-            loadVoices()
+            voices = TTSService.availableVoices(for: languagePrefix)
         }
     }
 
     // MARK: - Voice Row
 
     @ViewBuilder
-    private func voiceRow(name: String, quality: AVSpeechSynthesisVoiceQuality?, identifier: String?, isSelected: Bool) -> some View {
+    private func voiceRow(name: String, quality: AVSpeechSynthesisVoiceQuality?, identifier: String?) -> some View {
         Button {
-            selectVoice(identifier: identifier)
+            selection = identifier
         } label: {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(name)
                         .foregroundColor(.primary)
-
-                    if let quality = quality {
+                    if let quality {
                         Text(TTSService.qualityDisplayName(quality))
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -127,22 +81,16 @@ struct VoiceSelectionView: View {
 
                 Spacer()
 
-                // Test button
                 Button {
-                    testVoice(identifier: identifier)
+                    preview(identifier: identifier)
                 } label: {
-                    if testingVoiceId == identifier {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "play.circle")
-                            .foregroundColor(Theme.accent)
-                    }
+                    Image(systemName: testingVoiceId == identifier ? "speaker.wave.2.fill" : "play.circle")
+                        .foregroundColor(Theme.accent)
                 }
                 .buttonStyle(.plain)
-                .disabled(isTestingVoice)
+                .accessibilityLabel("Nghe thử \(name)")
 
-                if isSelected {
+                if selection == identifier {
                     Image(systemName: "checkmark")
                         .foregroundColor(Theme.accent)
                         .fontWeight(.semibold)
@@ -154,41 +102,23 @@ struct VoiceSelectionView: View {
 
     // MARK: - Actions
 
-    private func loadVoices() {
-        voices = TTSService.availableVoices(for: "en")
-    }
-
-    private func selectVoice(identifier: String?) {
-        settingsManager.settings.selectedVoiceIdentifier = identifier
-    }
-
-    private func testVoice(identifier: String?) {
-        isTestingVoice = true
+    private func preview(identifier: String?) {
+        previewSynthesizer.stopSpeaking(at: .immediate)
         testingVoiceId = identifier
-
-        let utterance = AVSpeechUtterance(string: "Hello! This is how I sound. I'm your AI assistant.")
-
-        if let identifier = identifier,
-           let voice = AVSpeechSynthesisVoice(identifier: identifier) {
-            utterance.voice = voice
-        } else {
-            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-        }
-
-        let synthesizer = AVSpeechSynthesizer()
-        synthesizer.speak(utterance)
-
-        // Reset state after estimated speech duration
+        let utterance = AVSpeechUtterance(string: sample)
+        utterance.voice = identifier.flatMap { AVSpeechSynthesisVoice(identifier: $0) }
+            ?? TTSService.bestVoice(for: languagePrefix == "vi" ? "vi-VN" : "en-US")
+        utterance.rate = SettingsManager.shared.settings.speechRate
+        previewSynthesizer.speak(utterance)
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            isTestingVoice = false
-            testingVoiceId = nil
+            if testingVoiceId == identifier { testingVoiceId = nil }
         }
     }
 }
 
 #Preview {
     NavigationStack {
-        VoiceSelectionView()
-            .environmentObject(SettingsManager.shared)
+        VoiceSelectionView(languagePrefix: "vi", title: "Giọng tiếng Việt",
+                           sample: "Xin chào, đáp án là x bằng 2.", selection: .constant(nil))
     }
 }

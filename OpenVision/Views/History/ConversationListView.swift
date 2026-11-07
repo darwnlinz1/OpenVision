@@ -35,7 +35,7 @@ struct ConversationListView: View {
                         // Fresh conversation: next exchange starts a new History entry with
                         // no carried-over model context.
                         conversationManager.startNewConversation()
-                        ConversationContext.shared.clear()
+                        GeminiLiveService.shared.clearConversationHistory()
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -163,7 +163,7 @@ struct ConversationDetailView: View {
                     // and reload its recent exchanges as the model's live context, so the next
                     // "Ok Vision" follow-up picks up where it left off.
                     ConversationManager.shared.resumeConversation(conversation)
-                    ConversationContext.shared.seed(from: conversation)
+                    GeminiLiveService.shared.seedHistory(from: conversation.messages.map { ($0.role == .user, $0.content) })
                     resumed = true
                 } label: {
                     Label(resumed ? "Resumed" : "Continue", systemImage: resumed ? "checkmark.circle" : "arrow.right.circle")

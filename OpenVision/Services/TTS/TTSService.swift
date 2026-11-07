@@ -4,7 +4,8 @@
 import AVFoundation
 import Foundation
 
-/// Text-to-speech service for OpenClaw mode
+/// Speaks Gemini's SPOKEN channel through the glasses: each sentence in its own language's voice
+/// (Vietnamese or English), with leftover math symbols read as words.
 @MainActor
 final class TTSService: NSObject, ObservableObject {
     // MARK: - Singleton
@@ -38,8 +39,6 @@ final class TTSService: NSObject, ObservableObject {
     private var streamingActive = false
 
     // MARK: - Voice Selection
-
-    private var selectedVoice: AVSpeechSynthesisVoice? { Self.userVoice }
 
     /// Auto-detect Vietnamese characters or math keywords in the text
     static func containsVietnamese(_ text: String) -> Bool {
@@ -81,15 +80,20 @@ final class TTSService: NSObject, ObservableObject {
     /// answer comes back in the same language. (The device language no longer decides: on a
     /// Vietnamese iPhone an English answer was read in the Vietnamese voice.)
     private func voice(for text: String) -> AVSpeechSynthesisVoice? {
-        Self.voice(forText: text, chosen: selectedVoice)
+        let settings = SettingsManager.shared.settings
+        return Self.voice(forText: text,
+                          vietnamese: settings.selectedVietnameseVoiceIdentifier.flatMap { AVSpeechSynthesisVoice(identifier: $0) },
+                          english: settings.selectedVoiceIdentifier.flatMap { AVSpeechSynthesisVoice(identifier: $0) })
     }
 
-    static func voice(forText text: String, chosen: AVSpeechSynthesisVoice?) -> AVSpeechSynthesisVoice? {
+    /// The voice for one sentence: the chosen (or best installed) voice of the sentence's language.
+    static func voice(forText text: String, vietnamese: AVSpeechSynthesisVoice? = nil,
+                      english: AVSpeechSynthesisVoice? = nil) -> AVSpeechSynthesisVoice? {
         if containsVietnamese(text) {
-            if let chosen, chosen.language.hasPrefix("vi") { return chosen }
+            if let vietnamese, vietnamese.language.hasPrefix("vi") { return vietnamese }
             if let viVoice = bestVoice(for: "vi-VN") { return viVoice }
         }
-        if let chosen, !chosen.language.hasPrefix("vi") { return chosen }
+        if let english, !english.language.hasPrefix("vi") { return english }
         return bestVoice(for: "en-US")
     }
 
@@ -109,19 +113,6 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Per-language pick, so streaming sentence-by-sentence doesn't rescan the voice list.
     private static var bestVoiceCache: [String: AVSpeechSynthesisVoice] = [:]
-
-    /// The Apple voice chosen in Settings, or the default English voice. Also used by the cloud
-    /// voices' Apple fallback, so the choice lives in one place.
-    static var userVoice: AVSpeechSynthesisVoice? {
-        // Check if user has selected a specific voice
-        if let identifier = SettingsManager.shared.settings.selectedVoiceIdentifier,
-           let voice = AVSpeechSynthesisVoice(identifier: identifier) {
-            return voice
-        }
-
-        // Fall back to default English voice
-        return AVSpeechSynthesisVoice(language: "en-US")
-    }
 
     /// Get all available voices for a language
     static func availableVoices(for languageCode: String = "en") -> [AVSpeechSynthesisVoice] {
@@ -155,20 +146,14 @@ final class TTSService: NSObject, ObservableObject {
 
     // MARK: - Speak
 
-    /// Speak text (single-shot: replaces anything currently playing).
+    /// Speak text (single-shot: replaces anything currently playing). Queued sentence by
+    /// sentence, so a reply mixing Vietnamese and English is read with the right voice for each.
     func speak(_ text: String) {
         stop()
-        enqueue(text)
-    }
-
-    /// Ambient narration (watch loop): speaks only into silence and never preempts — `speak`
-    /// stops the synthesizer first, which cut replies off mid-sentence when a watch line landed
-    /// during one. Dropped lines are fine; the next scene change describes again.
-    func speakAmbient(_ text: String) {
-        guard !isSpeaking, !streamingActive else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        enqueue(trimmed)
+        let sentences = TextChunking.sentences(text)
+        for sentence in sentences.isEmpty ? [text] : sentences {
+            enqueue(sentence)
+        }
     }
 
     // MARK: - Streaming (sentence-by-sentence)
@@ -199,15 +184,26 @@ final class TTSService: NSObject, ObservableObject {
         }
     }
 
-    /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
+    /// Lead-in silence before the first sentence of a reply: Bluetooth speakers drop the first
+    /// few hundred milliseconds of audio after silence, which clipped the start of answers.
+    static let bluetoothLeadIn: TimeInterval = 0.3
+
+    /// Build an utterance with the right voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
         let cleaned = Self.cleanSpokenAudio(text)
         guard !cleaned.isEmpty else { return }
-        let utterance = AVSpeechUtterance(string: cleaned)
+        let vietnamese = Self.containsVietnamese(cleaned)
+        let spoken = SpokenMath.normalize(cleaned, vietnamese: vietnamese)
+        guard !spoken.isEmpty else { return }
+        let utterance = AVSpeechUtterance(string: spoken)
         utterance.voice = voice(for: cleaned)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        utterance.rate = min(max(SettingsManager.shared.settings.speechRate, AVSpeechUtteranceMinimumSpeechRate),
+                             AVSpeechUtteranceMaximumSpeechRate)
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
+        if pendingUtterances == 0 {
+            utterance.preUtteranceDelay = Self.bluetoothLeadIn
+        }
         pendingUtterances += 1
         isSpeaking = true
         synthesizer.speak(utterance)
@@ -270,5 +266,64 @@ extension TTSService: AVSpeechSynthesizerDelegate {
                 self.onSpeechEnded?()
             }
         }
+    }
+}
+
+// MARK: - Spoken math (pure, unit-testable)
+
+/// Reads math symbols that slipped into the SPOKEN channel as words in the answer's language, so
+/// the voice says "x bình phương bằng 4" instead of "x caret 2 equals sign 4". The system prompt
+/// already asks Gemini to spell math out; this is the safety net. Deliberately conservative:
+/// "1-5" (a range), "Ray-Ban" and plain prose dashes are left alone.
+enum SpokenMath {
+    private struct Words {
+        let squared, cubed, power, root, over, times, divided, notEqual, lessEqual, greaterEqual,
+            approx, less, greater, equals, plus, minus, negative, percent: String
+    }
+
+    private static let vietnamese = Words(
+        squared: "bình phương", cubed: "lập phương", power: "mũ", root: "căn", over: "phần",
+        times: "nhân", divided: "chia", notEqual: "khác", lessEqual: "nhỏ hơn hoặc bằng",
+        greaterEqual: "lớn hơn hoặc bằng", approx: "xấp xỉ", less: "nhỏ hơn", greater: "lớn hơn",
+        equals: "bằng", plus: "cộng", minus: "trừ", negative: "âm", percent: "phần trăm")
+
+    private static let english = Words(
+        squared: "squared", cubed: "cubed", power: "to the power of", root: "the square root of",
+        over: "over", times: "times", divided: "divided by", notEqual: "is not equal to",
+        lessEqual: "is less than or equal to", greaterEqual: "is greater than or equal to",
+        approx: "is approximately", less: "is less than", greater: "is greater than",
+        equals: "equals", plus: "plus", minus: "minus", negative: "negative", percent: "percent")
+
+    static func normalize(_ text: String, vietnamese isVietnamese: Bool) -> String {
+        let w = isVietnamese ? vietnamese : english
+        var s = text
+        func replace(_ pattern: String, _ template: String) {
+            s = s.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+        }
+        replace(#"\^\s*2(?![0-9])"#, " \(w.squared)")
+        replace(#"\^\s*3(?![0-9])"#, " \(w.cubed)")
+        replace(#"\^\s*\(([^()]*)\)"#, " \(w.power) $1")
+        replace(#"\^\s*(-?[0-9A-Za-z]+)"#, " \(w.power) $1")
+        replace(#"²"#, " \(w.squared)")
+        replace(#"³"#, " \(w.cubed)")
+        replace(#"√\s*"#, "\(w.root) ")
+        replace(#"([0-9])\s*/\s*([0-9])"#, "$1 \(w.over) $2")
+        replace(#"\s*[×·∗]\s*"#, " \(w.times) ")
+        replace(#"\s*÷\s*"#, " \(w.divided) ")
+        replace(#"\s*≠\s*"#, " \(w.notEqual) ")
+        replace(#"\s*≤\s*"#, " \(w.lessEqual) ")
+        replace(#"\s*≥\s*"#, " \(w.greaterEqual) ")
+        replace(#"\s*≈\s*"#, " \(w.approx) ")
+        replace(#"\s+<\s+"#, " \(w.less) ")
+        replace(#"\s+>\s+"#, " \(w.greater) ")
+        replace(#"\s*=\s*"#, " \(w.equals) ")
+        replace(#"\s+\+\s+|(?<=[0-9A-Za-z)])\+(?=[0-9A-Za-z(])"#, " \(w.plus) ")
+        replace(#"([0-9)])\s+[-−]\s+([0-9(])"#, "$1 \(w.minus) $2")
+        replace(#"(^|[\s(])[-−]([0-9])"#, "$1\(w.negative) $2")
+        replace(#"([0-9])\s*%"#, "$1 \(w.percent)")
+        replace(#"π"#, " pi ")
+        replace(#"[_^]"#, " ")
+        replace(#"\s+"#, " ")
+        return s.trimmingCharacters(in: .whitespaces)
     }
 }
