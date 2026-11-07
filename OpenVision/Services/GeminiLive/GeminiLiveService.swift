@@ -44,6 +44,13 @@ final class GeminiLiveService: ObservableObject {
     private var currentKeyIndex: Int = 0
     private var keyCooldowns: [String: Date] = [:]
 
+    // MARK: - Multi-turn Conversation History
+    private var conversationHistory: [[String: Any]] = []
+
+    public func clearConversationHistory() {
+        conversationHistory.removeAll()
+    }
+
     // MARK: - Callbacks
 
     var onTextReceived: ((String) -> Void)?
@@ -159,18 +166,21 @@ final class GeminiLiveService: ObservableObject {
         let promptText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Giải giúp tôi bài toán hoặc câu hỏi trong ảnh này" : text
         parts.append(["text": promptText])
 
+        let userTurn: [String: Any] = [
+            "role": "user",
+            "parts": parts
+        ]
+
+        var contentsToSend = conversationHistory
+        contentsToSend.append(userTurn)
+
         let requestBody: [String: Any] = [
             "systemInstruction": [
                 "parts": [
                     ["text": buildSystemPrompt()]
                 ]
             ],
-            "contents": [
-                [
-                    "role": "user",
-                    "parts": parts
-                ]
-            ],
+            "contents": contentsToSend,
             "generationConfig": [
                 "temperature": 0.2,
                 "maxOutputTokens": 2048
@@ -230,6 +240,16 @@ final class GeminiLiveService: ObservableObject {
 
                 NSLog("[GeminiLive] Received response (%d chars)", rawText.count)
 
+                let assistantTurn: [String: Any] = [
+                    "role": "model",
+                    "parts": [["text": rawText]]
+                ]
+                self.conversationHistory.append(userTurn)
+                self.conversationHistory.append(assistantTurn)
+                if self.conversationHistory.count > 6 {
+                    self.conversationHistory.removeFirst(2)
+                }
+
                 // Parse dual-channel format
                 let (spoken, display) = Self.parseDualChannel(rawText)
 
@@ -286,62 +306,80 @@ final class GeminiLiveService: ObservableObject {
         keyCooldowns[key] = Date().addingTimeInterval(60) // 60 seconds cooldown
     }
 
-    // MARK: - Dual Channel Response Parser
- 
+    // MARK: - Dual Channel Response Parser (Visor line-anchored regex)
+
     static func parseDualChannel(_ text: String) -> (spoken: String, display: String) {
-        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = cleanText.lowercased()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let spokenPattern = #"(?i)(?:^|\n)\s*[-*•]?\s*(?:\[SPOKEN\]|\*{0,2}SPOKEN(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*SPOKEN)\s*([\s\S]*?)(?=(?:(?:^|\n)\s*[-*•]?\s*(?:\[DISPLAY\]|\*{0,2}DISPLAY(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*DISPLAY))|$)"#
+        let displayPattern = #"(?i)(?:^|\n)\s*[-*•]?\s*(?:\[DISPLAY\]|\*{0,2}DISPLAY(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*DISPLAY)\s*([\s\S]*?)(?=(?:(?:^|\n)\s*[-*•]?\s*(?:\[SPOKEN\]|\*{0,2}SPOKEN(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*SPOKEN))|$)"#
 
-        let spokenIdx = lower.range(of: "spoken")
-        let displayIdx = lower.range(of: "display")
+        let spokenRegex = try? NSRegularExpression(pattern: spokenPattern)
+        let displayRegex = try? NSRegularExpression(pattern: displayPattern)
 
-        if let sRange = spokenIdx, let dRange = displayIdx {
-            var spokenPart = ""
-            var displayPart = ""
-            if sRange.lowerBound < dRange.lowerBound {
-                spokenPart = String(cleanText[sRange.upperBound..<dRange.lowerBound])
-                displayPart = String(cleanText[dRange.upperBound...])
-            } else {
-                displayPart = String(cleanText[dRange.upperBound..<sRange.lowerBound])
-                spokenPart = String(cleanText[sRange.upperBound...])
+        let nsString = trimmed as NSString
+        let fullRange = NSRange(location: 0, length: nsString.length)
+
+        var spokenPart: String?
+        var displayPart: String?
+
+        if let sm = spokenRegex?.firstMatch(in: trimmed, range: fullRange), sm.numberOfRanges > 1 {
+            let r = sm.range(at: 1)
+            if r.location != NSNotFound {
+                spokenPart = nsString.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-
-            let s = cleanChannelText(spokenPart)
-            let d = cleanChannelText(displayPart)
-            return (s.isEmpty ? cleanText : s, d.isEmpty ? cleanText : d)
         }
 
-        if let sRange = spokenIdx {
-            let s = cleanChannelText(String(cleanText[sRange.upperBound...]))
-            return (s.isEmpty ? cleanText : s, cleanText)
+        if let dm = displayRegex?.firstMatch(in: trimmed, range: fullRange), dm.numberOfRanges > 1 {
+            let r = dm.range(at: 1)
+            if r.location != NSNotFound {
+                displayPart = nsString.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
 
-        if let dRange = displayIdx {
-            let d = cleanChannelText(String(cleanText[dRange.upperBound...]))
-            return (d.isEmpty ? cleanText : d, d.isEmpty ? cleanText : d)
+        if let s = spokenPart, let d = displayPart {
+            let cleanS = cleanChannelText(s)
+            let cleanD = cleanChannelText(d)
+            return (cleanS.isEmpty ? cleanD : cleanS, cleanD.isEmpty ? cleanS : cleanD)
+        } else if let s = spokenPart {
+            let cleanS = cleanChannelText(s)
+            return (cleanS, cleanS)
+        } else if let d = displayPart {
+            let cleanD = cleanChannelText(d)
+            return (generateSpokenSummary(from: cleanD), cleanD)
         }
 
-        return (cleanText, cleanText)
+        return (trimmed, trimmed)
+    }
+
+    private static func generateSpokenSummary(from display: String) -> String {
+        let lines = display.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        var resultLine: String?
+        for line in lines.reversed() {
+            let lower = line.lowercased()
+            if lower.hasPrefix("kết quả") || lower.hasPrefix("đáp án") || lower.hasPrefix("đáp số") ||
+                lower.hasPrefix("nghiệm") || lower.hasPrefix("vậy") || lower.hasPrefix("chọn") ||
+                lower.hasPrefix("result") || lower.hasPrefix("answer") || lower.hasPrefix("therefore") {
+                resultLine = line
+                break
+            }
+        }
+        let prefix = resultLine ?? lines.first ?? ""
+        let cleanPrefix = cleanChannelText(prefix)
+        return "\(cleanPrefix). Các bước giải chi tiết đã hiển thị trên màn hình điện thoại."
     }
 
     private static func cleanChannelText(_ text: String) -> String {
         var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        while let first = s.first, ":*#-_ \t\r\n".contains(first) {
-            s.removeFirst()
-        }
-        if let lastLineRange = s.range(of: "\n", options: .backwards) {
-            let lastLine = s[lastLineRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-            if lastLine.hasPrefix("#") || lastLine.hasPrefix("*") {
-                s = String(s[..<lastLineRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
+        s = s.replacingOccurrences(of: #"(?i)^\s*[-*•]?\s*(?:\[?(?:SPOKEN|DISPLAY)\]?)\s*:?\s*"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"(?i)\b(?:SPOKEN|DISPLAY)\b\s*:"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"^[:\s\-*#]+"#, with: "", options: .regularExpression)
         while let last = s.last, "*# \t\r\n".contains(last) {
             s.removeLast()
         }
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - System Prompt
+    // MARK: - System Prompt (Visor parity: natural, multi-sentence spoken explanation)
 
     private func buildSystemPrompt() -> String {
         let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
@@ -351,7 +389,9 @@ final class GeminiLiveService: ObservableObject {
         When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
 
         SPOKEN:
-        Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker (under 250 characters). State the final answer directly without filler. NEVER use LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, power, subscripts). NEVER use Markdown formatting (no asterisks, hashes, backticks) in this section. If the problem or question is in Vietnamese, speak in natural, grammatically correct Vietnamese with full tone marks and diacritics (tiếng Việt có dấu đầy đủ, chuẩn xác).
+        Provide a natural, comprehensive spoken explanation in 2 to 4 complete sentences for the Ray-Ban Meta smart glasses speaker. State the core method, key calculation steps, and the final answer clearly and confidently in natural Vietnamese (tiếng Việt có dấu đầy đủ, chuẩn xác). Then briefly mention that the complete derivation is shown on the phone screen.
+        NEVER use raw LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, subscripts). Spell out math naturally (ví dụ: 'x bằng 2', 'tích phân từ 0 đến 1', 'đáp án là A').
+        For multiple choice questions, explicitly state the question number and the selected option with brief reasoning.
 
         DISPLAY:
         Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ inline, $$...$$ block display) for all formulas. Provide clear derivations, explanations, and final answer. If multiple choice, clearly state the selected option and rationale.

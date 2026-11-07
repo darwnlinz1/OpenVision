@@ -1,3 +1,5 @@
+import Photos
+import UIKit
 // OpenVision - VoiceAgentViewModel.swift
 // MVVM: all voice-session orchestration for the main screen lives here — session lifecycle,
 // command routing, live video, face intents, photo capture, TTS streaming, and history.
@@ -15,8 +17,89 @@ struct CapturedPhotoContext {
     let id: UUID = UUID()
     let data: Data
     let timestamp: Date = Date()
-    var isConsumed: Bool = false
-    var isFresh: Bool { !isConsumed && Date().timeIntervalSince(timestamp) < 60.0 }
+    var useCount: Int = 0
+    var isFresh: Bool { Date().timeIntervalSince(timestamp) < 120.0 && useCount < 5 }
+}
+
+// MARK: - Recent Photo Scanner (Visor Parity)
+
+@MainActor
+final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
+    static let shared = RecentPhotoScanner()
+
+    @Published private(set) var lastScannedPhotoData: Data?
+    @Published private(set) var lastScannedTimestamp: Date?
+
+    private override init() {
+        super.init()
+        PHPhotoLibrary.shared().register(self)
+    }
+
+    deinit {
+        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+    }
+
+    func requestAuthorizationIfNeeded() async -> Bool {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        switch status {
+        case .authorized, .limited:
+            return true
+        case .notDetermined:
+            let granted = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+            return granted == .authorized || granted == .limited
+        default:
+            return false
+        }
+    }
+
+    func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = 120.0) -> Data? {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else {
+            NSLog("[RecentPhotoScanner] Photo library not authorized (%d)", status.rawValue)
+            return nil
+        }
+
+        let cutoffDate = Date().addingTimeInterval(-seconds)
+        let fetchOptions = PHFetchOptions()
+        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        fetchOptions.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@", PHAssetMediaType.image.rawValue, cutoffDate as NSDate)
+        fetchOptions.fetchLimit = 1
+
+        let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+        guard let asset = assets.firstObject else {
+            NSLog("[RecentPhotoScanner] No photos found created after %@", cutoffDate.description)
+            return nil
+        }
+
+        NSLog("[RecentPhotoScanner] Found asset created at: %@", asset.creationDate?.description ?? "unknown")
+
+        var resultData: Data?
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = true
+
+        let targetSize = CGSize(width: 2048, height: 2048)
+        PHImageManager.default().requestImage(for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options) { image, _ in
+            if let image = image {
+                resultData = image.jpegData(compressionQuality: 0.88)
+            }
+        }
+
+        if let data = resultData {
+            NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
+            self.lastScannedPhotoData = data
+            self.lastScannedTimestamp = Date()
+        }
+
+        return resultData
+    }
+
+    nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+        Task { @MainActor in
+            _ = self.fetchMostRecentPhoto(withinSeconds: 60.0)
+        }
+    }
 }
 
 @MainActor
@@ -747,6 +830,20 @@ final class VoiceAgentViewModel: ObservableObject {
 
     /// Setup AI service callbacks for receiving responses
     private func setupAIServiceCallbacks() {
+        // Wire TTS completion with 350ms echo settling delay (prevents temple speaker echo from triggering false barge-in)
+        ttsService.onSpeechEnded = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                if !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 {
+                    self.voiceCommandService.isBargeInPaused = false
+                    if self.agentState == .speaking {
+                        self.agentState = self.isSessionActive ? .listening : .idle
+                    }
+                }
+            }
+        }
+
         // Shared reply/state wiring — every AIBackend reports through the same two callbacks,
         // so wire them once for all. (Gemini Live is a streaming session and delivers replies
         // via its own transcription callbacks below; its protocol callbacks are inert.)
@@ -795,12 +892,12 @@ final class VoiceAgentViewModel: ObservableObject {
                         }
                         self.ttsStreaming = false
                     }
-                    if !self.ttsService.isSpeaking && !NeuralSpeech.isAnySpeaking {
+                    if !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 && !NeuralSpeech.isAnySpeaking {
                         // Turn produced no speech (error/interrupt) — release the narration hold.
                         self.commandTurnActive = false
                     }
                     if self.agentState == .thinking
-                        && !self.ttsService.isSpeaking && !NeuralSpeech.isAnySpeaking {
+                        && !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 && !NeuralSpeech.isAnySpeaking {
                         // Return to the live video indicator, not plain listening, while in live mode.
                         self.agentState = self.isLiveVideoMode ? .liveVideo
                             : (self.isSessionActive ? .listening : .idle)
@@ -1033,10 +1130,17 @@ final class VoiceAgentViewModel: ObservableObject {
 
         agentState = .thinking
 
-        // Visor: Check for pre-captured photo (Capture First, Ask Later workflow)
+        // Visor Parity: Check for pre-captured photo or recent photo synced from Ray-Ban Meta
+        if activePhotoContext?.isFresh != true {
+            if let recentPhoto = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0) {
+                print("[VoiceAgent] ✓ Fetched recent glasses photo from library (\(recentPhoto.count) bytes)")
+                self.activePhotoContext = CapturedPhotoContext(data: recentPhoto)
+            }
+        }
+
         if let photo = activePhotoContext, photo.isFresh {
-            activePhotoContext?.isConsumed = true
-            print("[VoiceAgent] ✓ Fusing pre-captured photo (\(photo.data.count) bytes) with command: \(command)")
+            activePhotoContext?.useCount += 1
+            print("[VoiceAgent] ✓ Fusing photo context (\(photo.data.count) bytes, use #\(photo.useCount)) with command: \(command)")
             let visionPrompt = visionPromptFromCommand(command)
             do {
                 try await sendPromptToActiveBackend(visionPrompt, imageData: photo.data)
@@ -1047,28 +1151,27 @@ final class VoiceAgentViewModel: ObservableObject {
             return
         }
 
-        // Check if this is a vision-related command
-        // Keywords for "take a photo" - capture and send to active backend (supports Vietnamese & English)
-        let photoKeywords = ["take a photo", "take a picture", "take photo", "take picture",
-                            "capture a photo", "capture photo", "snap a photo", "snap a picture",
-                            "what do you see", "what are you looking at", "look at this",
-                            "what's in front of me", "describe what you see", "what is this",
-                            "what am i looking at", "can you see",
-                            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "xem bài này",
-                            "đọc bài này", "bài này làm sao", "nhìn cái này", "tính cái này", "bài toán"]
+        // Comprehensive visual & math keywords (Visor parity: 40+ phrases)
+        let visualKeywords = [
+            "câu này", "câu 1", "câu 2", "câu 3", "câu 4", "câu 5", "câu 6", "câu 7", "câu 8", "câu 9", "câu 10",
+            "bài này", "bài 1", "bài 2", "bài 3", "bài 4", "bài 5", "bài toán", "đáp án", "đề bài",
+            "giải bài", "giải câu", "giải giúp", "giải bài này", "giải đề", "xem bài", "đọc bài",
+            "tính cái này", "tính câu", "tính bài", "tính toán", "phương trình", "hệ phương trình",
+            "tích phân", "đạo hàm", "hình học", "chọn đáp án", "cái này là gì", "dịch cái này",
+            "đọc cái này", "nhìn cái này", "xem cái này", "đây là cái gì", "trong ảnh", "trên bảng",
+            "take a photo", "take photo", "take picture", "capture photo", "snap photo",
+            "what is this", "what do you see", "solve this", "look at this", "read this",
+            "cau nay", "bai nay", "dap an", "de bai", "giai bai", "giai cau", "giai giup", "phuong trinh", "tich phan"
+        ]
 
-        let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
+        let isVisualCommand = visualKeywords.contains { lowerCommand.contains($0) }
 
-        // Drive whichever backend is selected through the AIBackend protocol — capabilities
-        // (localLLM, supportsImageInput) decide the path, not concrete service types.
         let backend = AIBackendRegistry.backend(for: settingsManager.settings.aiBackend)
         do {
             if let llm = backend.localLLM {
-                // On-device routing brain (Gemma / Apple Intelligence): one generation that
-                // routes faces, web search, native tools, or answers.
-                await handleLocalCommand(command, llm: llm, isPhotoCommand: isPhotoCommand)
-            } else if isPhotoCommand && backend.supportsImageInput {
-                print("[VoiceAgent] Photo command on \(backend.backendType.displayName) — capturing...")
+                await handleLocalCommand(command, llm: llm, isPhotoCommand: isVisualCommand)
+            } else if isVisualCommand && backend.supportsImageInput {
+                print("[VoiceAgent] Visual command on \(backend.backendType.displayName) — capturing...")
                 await captureAndSendPhoto(withPrompt: command)
             } else {
                 try await backend.sendMessage(command, imageData: nil)
@@ -1736,8 +1839,7 @@ final class VoiceAgentViewModel: ObservableObject {
             "take a picture of this", "take a photo of this", "take a picture", "take a photo",
             "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
             "snap a picture", "go ahead and take",
-            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "xem bài này", "đọc bài này",
-            "bài này làm sao", "nhìn cái này", "tính cái này", "bài toán"
+            "chụp ảnh", "chụp hình", "chụp tấm ảnh", "chụp giùm"
         ]
         for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
         s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1981,52 +2083,44 @@ final class VoiceAgentViewModel: ObservableObject {
     }
 
     private func captureAndSendPhoto(withPrompt prompt: String) async {
-        // Try to get an image from various sources
         var imageData: Data?
         var startedStreamingForPhoto = false
 
-        // Start streaming if glasses are registered but not streaming (required by Meta SDK to capture)
-        if glassesManager.isRegistered && !glassesManager.isStreaming {
-            print("[VoiceAgent] Starting glasses camera stream for photo...")
-            await glassesManager.startStreaming()
-            startedStreamingForPhoto = true
+        // 1. Try glasses direct capture if registered
+        if glassesManager.isRegistered {
+            if !glassesManager.isStreaming {
+                print("[VoiceAgent] Starting glasses camera stream for photo...")
+                await glassesManager.startStreaming()
+                startedStreamingForPhoto = true
+            }
+            imageData = await capturePhotoFromGlasses()
+            if imageData == nil {
+                imageData = await freshLiveFrame()
+            }
+            if glassesManager.isStreaming && !isLiveVideoMode {
+                await glassesManager.stopStreaming()
+            }
         }
 
-        // 1. Try static photo from glasses first (max native sensor quality up to 12MP)
-        imageData = await capturePhotoFromGlasses()
-
-        // 2. Fall back to fresh live video frame if static capture fails or times out
+        // 2. Fall back to RecentPhotoScanner (photos synced to Camera Roll from temple capture button)
         if imageData == nil {
-            NSLog("[OV] Static photo capture returned nil; falling back to fresh live frame")
-            imageData = await freshLiveFrame()
+            NSLog("[OV] Glasses direct capture nil; checking recent photo from library")
+            imageData = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
         }
 
-        NSLog("[OV] captureAndSendPhoto result: %@ (streaming=%@, registered=%@)",
-              imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes",
-              glassesManager.isStreaming ? "yes" : "no",
-              glassesManager.isRegistered ? "yes" : "no")
+        NSLog("[OV] captureAndSendPhoto result: %@", imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes")
 
-        // Visor "Click & Go": Stop streaming immediately after photo acquisition
-        // to free Bluetooth bandwidth and prevent Ray-Ban 20s watchdog disconnect during inference
-        if glassesManager.isStreaming && !isLiveVideoMode {
-            NSLog("[OV] photo acquired — stopping camera immediately (click and go)")
-            await glassesManager.stopStreaming()
-        }
-
-        // Send with or without image
         do {
             if let imageData = imageData {
                 self.activePhotoContext = CapturedPhotoContext(data: imageData)
-                // The image is attached, so strip the "take a picture" wording — otherwise the
-                // VLM replies "I can't take photos / please provide an image" before describing.
                 let visionPrompt = visionPromptFromCommand(prompt)
                 NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
                 try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
             } else {
-                NSLog("[OV] No image available from glasses for photo command")
+                NSLog("[OV] No image available from glasses or library for visual command")
                 let errMsg = TTSService.containsVietnamese(prompt)
-                    ? "Không thể lấy ảnh từ kính Ray-Ban. Vui lòng thử chụp lại."
-                    : "Could not capture image from Ray-Ban glasses. Please try again."
+                    ? "Không tìm thấy ảnh chụp bài tập từ kính Ray-Ban. Bạn hãy bấm nút chụp trên gọng kính rồi hỏi lại nhé."
+                    : "No photo found from Ray-Ban glasses. Please press the temple capture button and ask again."
                 errorMessage = errMsg
                 speakResponse(errMsg)
             }
@@ -2035,7 +2129,6 @@ final class VoiceAgentViewModel: ObservableObject {
             errorMessage = "Failed to send: \(error.localizedDescription)"
             agentState = isSessionActive ? .listening : .idle
 
-            // Stop streaming on error if we started it for this photo
             if startedStreamingForPhoto && glassesManager.isStreaming {
                 await glassesManager.stopStreaming()
             }
@@ -2053,8 +2146,8 @@ final class VoiceAgentViewModel: ObservableObject {
         NSLog("[OV] capturePhotoFromGlasses: requesting capture (streaming=%@)", glassesManager.isStreaming ? "yes" : "no")
         await glassesManager.capturePhoto()
 
-        // Wait for photo data to appear (poll for up to 12 seconds / 120 iterations of 100ms)
-        for _ in 0..<120 {
+        // Wait for photo data to appear (poll for up to 1.5 seconds / 15 iterations of 100ms)
+        for _ in 0..<15 {
             if let photoData = glassesManager.lastPhotoData {
                 glassesManager.lastPhotoData = nil
                 NSLog("[OV] Photo captured: %d bytes", photoData.count)
@@ -2063,7 +2156,7 @@ final class VoiceAgentViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
-        NSLog("[OV] Photo capture TIMED OUT after 12s")
+        NSLog("[OV] Photo capture timed out after 1.5s — falling back")
         return nil
     }
 
@@ -2110,20 +2203,23 @@ final class VoiceAgentViewModel: ObservableObject {
             startedStreaming = true
         }
 
-        let data = await capturePhotoFromGlasses()
+        var data = await capturePhotoFromGlasses()
+        if data == nil {
+            data = await freshLiveFrame()
+        }
+        if data == nil {
+            data = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
+        }
+
         if let data = data {
             self.activePhotoContext = CapturedPhotoContext(data: data)
             HapticFeedback.success()
             print("[VoiceAgent] ✓ Manual photo context cached (\(data.count) bytes)")
-        } else if let fallback = await freshLiveFrame() {
-            self.activePhotoContext = CapturedPhotoContext(data: fallback)
-            HapticFeedback.success()
-            print("[VoiceAgent] ✓ Manual live frame context cached (\(fallback.count) bytes)")
         } else {
             HapticFeedback.error()
             let errMsg = TTSService.containsVietnamese(lastProcessedCommand)
-                ? "Không thể lấy ảnh từ kính Ray-Ban. Vui lòng thử chụp lại."
-                : "Could not capture image from Ray-Ban glasses. Please try again."
+                ? "Không tìm thấy ảnh từ kính Ray-Ban. Vui lòng bấm nút chụp trên gọng kính."
+                : "Could not capture image from Ray-Ban glasses. Please press the temple button."
             errorMessage = errMsg
             speakResponse(errMsg)
         }
@@ -2260,6 +2356,8 @@ final class VoiceAgentViewModel: ObservableObject {
     private func speakResponse(_ text: String, historyText: String? = nil) {
         guard !text.isEmpty else { return }
         recordAssistantReply(historyText ?? text)
+        agentState = .speaking
+        voiceCommandService.isBargeInPaused = true
         // Perceived latency ends here: the gap between this and speechEnd is the wearer's wait.
         // (An approximation — synthesis still has to start — but it is the moment we hand off,
         // and the difference between Kokoro and Apple TTS shows up in `ttsLeadIn`.)

@@ -31,7 +31,7 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Utterances enqueued but not yet finished. `isSpeaking` only drops to false when this
     /// hits 0 AND no more chunks are coming — so it doesn't flap between queued sentences.
-    private var pendingUtterances = 0
+    public private(set) var pendingUtterances = 0
 
     /// True while a streamed reply is still being fed sentence-by-sentence. Keeps `isSpeaking`
     /// latched even if the audio queue momentarily drains faster than the LLM produces text.
@@ -53,6 +53,23 @@ final class TTSService: NSObject, ObservableObject {
             if lower.contains(w) { return true }
         }
         return false
+    }
+
+    // MARK: - Spoken Audio Cleaning (Visor parity)
+
+    /// Clean LaTeX formulas, markdown, and lingering tags before speech synthesis
+    static func cleanSpokenAudio(_ text: String) -> String {
+        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        s = s.replacingOccurrences(of: #"(?i)^\s*[-*•]?\s*(?:\[?(?:SPOKEN|DISPLAY)\]?)\s*:?\s*"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"(?i)\b(?:SPOKEN|DISPLAY)\b\s*:"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"^[:\s\-*#]+"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"\*{1,3}([^*]+)\*{1,3}"#, with: "$1", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"`{1,3}[^`]*`{1,3}"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"#{1,6}\s*"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"\\[a-zA-Z]+"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"[\$\{\}\[\]\\]"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Select voice dynamically based on text content: auto-detects Vietnamese and chooses vi-VN
@@ -156,12 +173,15 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = voice(for: text)
+        let cleaned = Self.cleanSpokenAudio(text)
+        guard !cleaned.isEmpty else { return }
+        let utterance = AVSpeechUtterance(string: cleaned)
+        utterance.voice = voice(for: cleaned)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
         pendingUtterances += 1
+        isSpeaking = true
         synthesizer.speak(utterance)
     }
 
