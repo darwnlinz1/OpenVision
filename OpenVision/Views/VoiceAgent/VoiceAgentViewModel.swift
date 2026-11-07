@@ -10,6 +10,15 @@
 import SwiftUI
 import Speech
 
+/// Pre-captured photo context for Visor "Capture First, Ask Later" workflow
+struct CapturedPhotoContext {
+    let id: UUID = UUID()
+    let data: Data
+    let timestamp: Date = Date()
+    var isConsumed: Bool = false
+    var isFresh: Bool { !isConsumed && Date().timeIntervalSince(timestamp) < 60.0 }
+}
+
 @MainActor
 final class VoiceAgentViewModel: ObservableObject {
 
@@ -43,6 +52,8 @@ final class VoiceAgentViewModel: ObservableObject {
     @Published var isRecording = false
     /// Transient status shown after a recording finishes ("Saved to Photos" / a failure). Auto-clears.
     @Published var recordingStatus: String?
+    /// Active pre-captured photo context (60s TTL, Capture First, Ask Later)
+    @Published var activePhotoContext: CapturedPhotoContext?
 
     // MARK: - Internal state
 
@@ -373,7 +384,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // Bluetooth link, so the SCO audio channel can't be serviced. configureForGlasses() can
         // still "succeed" in that state, but the mic is deaf — commands are never transcribed
         // (seen when recording starts the stream before a wake-word session). Phone mic instead.
-        if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
+        if settingsManager.settings.preferGlassesMic,
            !glassesManager.isStreaming,
            (try? AudioSessionManager.shared.configureForGlasses()) == true {
             return true
@@ -391,7 +402,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // link, which the glasses render as a "Bluetooth connecting/closing" blip — heard on every
         // wake after the first (the route stays on HFP between sessions, so the re-config is pure
         // churn). Skipping it keeps SCO stable, so the wake chime plays cleanly each time.
-        if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
+        if settingsManager.settings.preferGlassesMic,
            !glassesManager.isStreaming,   // HFP is deaf while the camera streams — reconfigure to phone
            AudioSessionManager.shared.isBluetoothHFPActive, voiceCommandService.isListening {
             return
@@ -725,6 +736,14 @@ final class VoiceAgentViewModel: ObservableObject {
             self.stopSession()
         }
 
+        // Auto-reconfigure audio route when Bluetooth / Ray-Ban Meta connects or disconnects
+        AudioSessionManager.shared.onRouteChange = { [weak self] in
+            Task { @MainActor in
+                print("[VoiceAgent] Audio route changed - reapplying preferred audio route")
+                self?.configureAudioForGlasses()
+            }
+        }
+
         // Setup AI service callbacks for responses
         setupAIServiceCallbacks()
 
@@ -857,6 +876,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
         GeminiLiveService.shared.onTurnComplete = { [weak self] in
             guard let self else { return }
+            guard self.isLiveVideoMode, !self.ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking else { return }
             // Cloud live turns can only be COUNTED: the server does VAD, so the client never
             // sees when the user stopped speaking and a perceived-latency figure would be
             // fabricated. Counting keeps live-mode usage visible without inventing numbers.
@@ -1011,6 +1031,20 @@ final class VoiceAgentViewModel: ObservableObject {
         }
 
         agentState = .thinking
+
+        // Visor: Check for pre-captured photo (Capture First, Ask Later workflow)
+        if let photo = activePhotoContext, photo.isFresh {
+            activePhotoContext?.isConsumed = true
+            print("[VoiceAgent] ✓ Fusing pre-captured photo (\(photo.data.count) bytes) with command: \(command)")
+            let visionPrompt = visionPromptFromCommand(command)
+            do {
+                try await sendPromptToActiveBackend(visionPrompt, imageData: photo.data)
+            } catch {
+                errorMessage = "Failed to send command with photo: \(error.localizedDescription)"
+                agentState = isSessionActive ? .listening : .idle
+            }
+            return
+        }
 
         // Check if this is a vision-related command
         // Keywords for "take a photo" - capture and send to active backend (supports Vietnamese & English)
@@ -1984,21 +2018,12 @@ final class VoiceAgentViewModel: ObservableObject {
                 NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
                 try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
             } else {
-                NSLog("[OV] No image available from glasses")
-                let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                let purePhotoWords = ["take a photo", "take a picture", "take photo", "take picture", "capture a photo", "snap a photo", "chụp ảnh", "chụp hình"]
-                let isPurePhoto = purePhotoWords.contains { trimmed.lowercased() == $0 }
-
-                if !isPurePhoto && !trimmed.isEmpty {
-                    NSLog("[OV] Forwarding text question directly to backend: %@", trimmed)
-                    try await sendPromptToActiveBackend(trimmed, imageData: nil)
-                } else {
-                    let errMsg = TTSService.containsVietnamese(prompt)
-                        ? "Không thể chụp ảnh từ kính Ray-Ban. Vui lòng kiểm tra kết nối kính và thử lại."
-                        : "Couldn't capture a photo from the glasses. Please make sure they are connected."
-                    errorMessage = errMsg
-                    speakResponse(errMsg)
-                }
+                NSLog("[OV] No image available from glasses for photo command")
+                let errMsg = TTSService.containsVietnamese(prompt)
+                    ? "Không thể lấy ảnh từ kính Ray-Ban. Vui lòng thử chụp lại."
+                    : "Could not capture image from Ray-Ban glasses. Please try again."
+                errorMessage = errMsg
+                speakResponse(errMsg)
             }
         } catch {
             print("[VoiceAgent] Failed to send: \(error)")
@@ -2066,6 +2091,39 @@ final class VoiceAgentViewModel: ObservableObject {
         return nil
     }
 
+    /// Manually trigger a photo capture from glasses to cache in activePhotoContext (Capture First, Ask Later)
+    func snapPhotoFromGlasses() async {
+        HapticFeedback.light()
+        print("[VoiceAgent] Manual photo snap requested from glasses...")
+        var startedStreaming = false
+        if glassesManager.isRegistered && !glassesManager.isStreaming {
+            await glassesManager.startStreaming()
+            startedStreaming = true
+        }
+
+        let data = await capturePhotoFromGlasses()
+        if let data = data {
+            self.activePhotoContext = CapturedPhotoContext(data: data)
+            HapticFeedback.success()
+            print("[VoiceAgent] ✓ Manual photo context cached (\(data.count) bytes)")
+        } else if let fallback = await freshLiveFrame() {
+            self.activePhotoContext = CapturedPhotoContext(data: fallback)
+            HapticFeedback.success()
+            print("[VoiceAgent] ✓ Manual live frame context cached (\(fallback.count) bytes)")
+        } else {
+            HapticFeedback.error()
+            let errMsg = TTSService.containsVietnamese(lastProcessedCommand)
+                ? "Không thể lấy ảnh từ kính Ray-Ban. Vui lòng thử chụp lại."
+                : "Could not capture image from Ray-Ban glasses. Please try again."
+            errorMessage = errMsg
+            speakResponse(errMsg)
+        }
+
+        if startedStreaming && glassesManager.isStreaming && !isLiveVideoMode {
+            await glassesManager.stopStreaming()
+        }
+    }
+
     // MARK: - Glasses Video Integration
 
     /// Setup glasses callbacks to stream video to Gemini Vision
@@ -2088,10 +2146,12 @@ final class VoiceAgentViewModel: ObservableObject {
             }
         }
 
-        // Photo captured callback (for OpenClaw photo analysis)
-        glassesManager.onPhotoCaptured = { data in
-            print("[VoiceAgent] Photo captured: \(data.count) bytes")
-            // Photos are handled via OpenClaw's attachment system
+        // Photo captured callback (Capture First, Ask Later workflow)
+        glassesManager.onPhotoCaptured = { [weak self] data in
+            Task { @MainActor in
+                self?.activePhotoContext = CapturedPhotoContext(data: data)
+                print("[VoiceAgent] ✓ Active photo context cached (60s TTL, \(data.count) bytes)")
+            }
         }
 
         print("[VoiceAgent] Glasses callbacks configured")
