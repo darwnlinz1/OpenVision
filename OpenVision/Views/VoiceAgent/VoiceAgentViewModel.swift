@@ -380,12 +380,8 @@ final class VoiceAgentViewModel: ObservableObject {
     /// pre-checking availability (which can't see HFP until it's allowed). Returns true on glasses.
     @discardableResult
     private func applyPreferredAudioRoute() -> Bool {
-        // Never pick the glasses HFP mic while the camera is streaming: video saturates the
-        // Bluetooth link, so the SCO audio channel can't be serviced. configureForGlasses() can
-        // still "succeed" in that state, but the mic is deaf — commands are never transcribed
-        // (seen when recording starts the stream before a wake-word session). Phone mic instead.
+        // "Click & Go" architecture shuts down camera stream after photo capture anyway, so glasses mic can be used.
         if settingsManager.settings.preferGlassesMic,
-           !glassesManager.isStreaming,
            (try? AudioSessionManager.shared.configureForGlasses()) == true {
             return true
         }
@@ -397,15 +393,13 @@ final class VoiceAgentViewModel: ObservableObject {
     }
 
     private func configureAudioForGlasses(forceRestart: Bool = false) {
-        // If we're already on the glasses' Bluetooth (HFP) route and still listening, and not forcing a restart,
-        // do NOT tear the audio session down and re-activate it. That re-activation renegotiates the HFP SCO
-        // link, which the glasses render as a "Bluetooth connecting/closing" blip — heard on every
-        // wake after the first (the route stays on HFP between sessions, so the re-config is pure
-        // churn). Skipping it keeps SCO stable, so the wake chime plays cleanly each time.
-        if !forceRestart,
-           settingsManager.settings.preferGlassesMic,
-           !glassesManager.isStreaming,   // HFP is deaf while the camera streams — reconfigure to phone
-           AudioSessionManager.shared.isBluetoothHFPInputActive, voiceCommandService.isListening {
+        // If voiceCommandService is already listening and the current route is acceptable,
+        // do NOT stop and restart AVAudioEngine. That prevents Mach IPC deadlock and audio churn.
+        let wantsGlasses = settingsManager.settings.preferGlassesMic
+        let isHFPActive = AudioSessionManager.shared.isBluetoothHFPInputActive
+        let routeAcceptable = (wantsGlasses && isHFPActive) || (!wantsGlasses && !isHFPActive)
+
+        if !forceRestart && voiceCommandService.isListening && routeAcceptable {
             return
         }
         let wasListening = voiceCommandService.isListening
@@ -740,8 +734,8 @@ final class VoiceAgentViewModel: ObservableObject {
         // Auto-reconfigure audio route when Bluetooth / Ray-Ban Meta connects or disconnects
         AudioSessionManager.shared.onRouteChange = { [weak self] in
             Task { @MainActor in
-                print("[VoiceAgent] Audio route changed - reapplying preferred audio route with restart")
-                self?.configureAudioForGlasses(forceRestart: true)
+                print("[VoiceAgent] Audio route changed - reapplying preferred audio route without restart")
+                self?.configureAudioForGlasses(forceRestart: false)
             }
         }
 
