@@ -66,7 +66,7 @@ struct SolutionWebView: UIViewRepresentable {
             guard let url = navigationAction.request.url else { return .cancel }
             if url.isFileURL { return .allow }
             if navigationAction.navigationType == .linkActivated {
-                UIApplication.shared.open(url)
+                _ = await UIApplication.shared.open(url)
             }
             return .cancel
         }

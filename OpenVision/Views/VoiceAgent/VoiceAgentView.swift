@@ -82,15 +82,15 @@ struct VoiceAgentView: View {
             await viewModel.requestSpeechAuthorization()
         }
         // Observe TTS state changes
-        .onChange(of: ttsService.isSpeaking) { isSpeaking in
+        .onChange(of: ttsService.isSpeaking) { _, isSpeaking in
             viewModel.ttsSpeakingChanged(isSpeaking)
         }
         // Control thinking sound based on agent state
-        .onChange(of: viewModel.agentState) { newState in
+        .onChange(of: viewModel.agentState) { _, newState in
             viewModel.agentStateChanged(newState)
         }
         // Observe VoiceCommandService state changes
-        .onChange(of: voiceCommandService.state) { newState in
+        .onChange(of: voiceCommandService.state) { _, newState in
             viewModel.voiceStateChanged(newState)
         }
     }
