@@ -36,9 +36,13 @@ final class AudioSessionManager {
     /// Callback invoked when audio route changes (device connected/disconnected)
     var onRouteChange: (() -> Void)?
 
+    private var routeChangeWorkItem: DispatchWorkItem?
+    private var lastInputPortUID: String?
+
     // MARK: - Initialization
 
     private init() {
+        lastInputPortUID = audioSession.currentRoute.inputs.first?.uid
         setupRouteChangeObserver()
     }
 
@@ -60,14 +64,24 @@ final class AudioSessionManager {
         print("[AudioSession] Route changed: reason=\(reason.rawValue), route: \(currentRouteDescription)")
 
         switch reason {
-        case .newDeviceAvailable, .oldDeviceUnavailable, .categoryChange, .routeConfigurationChange:
-            if let hfp = findBluetoothHFPInput() {
-                print("[AudioSession] Bluetooth device route changed -> selecting \(hfp.portName)")
-                try? audioSession.setPreferredInput(hfp)
-            } else {
-                try? audioSession.setPreferredInput(nil)
+        case .newDeviceAvailable, .oldDeviceUnavailable:
+            // IGNORE .categoryChange and .routeConfigurationChange to prevent infinite ping-pong loops!
+            // DO NOT call audioSession.setPreferredInput(hfp) inside handleAudioRouteChange!
+            // Debounce onRouteChange?() by 0.5s and check if input actually changed to prevent hardware bursts.
+            routeChangeWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                let currentInputUID = self.audioSession.currentRoute.inputs.first?.uid
+                if currentInputUID != self.lastInputPortUID {
+                    self.lastInputPortUID = currentInputUID
+                    print("[AudioSession] Debounced route change fired, active input changed to: \(self.currentRouteDescription)")
+                    self.onRouteChange?()
+                } else {
+                    print("[AudioSession] Route change debounced: input port UID unchanged (\(currentInputUID ?? "none"))")
+                }
             }
-            onRouteChange?()
+            routeChangeWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
         default:
             break
         }
@@ -177,6 +191,7 @@ final class AudioSessionManager {
             return false
         }
         try audioSession.setPreferredInput(hfpInput)
+        lastInputPortUID = hfpInput.uid
         currentMode = .voiceChat
         print("[AudioSession] ✓ Configured for glasses (Bluetooth HFP): \(hfpInput.portName) — route: \(currentRouteDescription)")
         return true
@@ -199,6 +214,7 @@ final class AudioSessionManager {
         )
         try audioSession.setActive(true)
         try? audioSession.setPreferredInput(nil)
+        lastInputPortUID = audioSession.currentRoute.inputs.first?.uid
         // If still routed to the quiet earpiece (carried over from a glasses/voiceChat config),
         // force the loud speaker — but leave AirPods / headphones alone if they're connected.
         if audioSession.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) {
