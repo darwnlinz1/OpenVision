@@ -6,6 +6,46 @@ import Speech
 import AVFoundation
 import QuartzCore
 
+// MARK: - Concurrency Trackers (Top-level Module Scope)
+
+final class RouteChangeTracker: @unchecked Sendable {
+    static let shared = RouteChangeTracker()
+    private let lock = NSLock()
+    private var _lastTime: TimeInterval = 0
+
+    func mark() {
+        lock.lock()
+        _lastTime = CACurrentMediaTime()
+        lock.unlock()
+    }
+
+    func isWithinStabilizationWindow(duration: TimeInterval = 1.0) -> Bool {
+        lock.lock()
+        let elapsed = CACurrentMediaTime() - _lastTime
+        lock.unlock()
+        return elapsed < duration
+    }
+}
+
+final class VoiceCaptureTracker: @unchecked Sendable {
+    static let shared = VoiceCaptureTracker()
+    private let lock = NSLock()
+    private var _isCapturing: Bool = false
+
+    func set(_ val: Bool) {
+        lock.lock()
+        _isCapturing = val
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        let val = _isCapturing
+        lock.unlock()
+        return val
+    }
+}
+
 /// Voice command service with wake word detection
 ///
 /// Features:
@@ -133,47 +173,7 @@ final class VoiceCommandService: ObservableObject {
 
     private var activationSound: AVAudioPlayer?
 
-// MARK: - Concurrency Trackers
-
-final class RouteChangeTracker: @unchecked Sendable {
-    static let shared = RouteChangeTracker()
-    private let lock = NSLock()
-    private var _lastTime: TimeInterval = 0
-
-    func mark() {
-        lock.lock()
-        _lastTime = CACurrentMediaTime()
-        lock.unlock()
-    }
-
-    func isWithinStabilizationWindow(duration: TimeInterval = 1.0) -> Bool {
-        lock.lock()
-        let elapsed = CACurrentMediaTime() - _lastTime
-        lock.unlock()
-        return elapsed < duration
-    }
-}
-
-final class VoiceCaptureTracker: @unchecked Sendable {
-    static let shared = VoiceCaptureTracker()
-    private let lock = NSLock()
-    private var _isCapturing: Bool = false
-
-    func set(_ val: Bool) {
-        lock.lock()
-        _isCapturing = val
-        lock.unlock()
-    }
-
-    func get() -> Bool {
-        lock.lock()
-        let val = _isCapturing
-        lock.unlock()
-        return val
-    }
-}
-
-// MARK: - Route change and stabilization tracking
+    // MARK: - Route change and stabilization tracking
 
     nonisolated func markRouteChange() {
         RouteChangeTracker.shared.mark()
