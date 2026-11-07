@@ -1,5 +1,6 @@
 import Photos
 import UIKit
+import ImageIO
 // OpenVision - VoiceAgentViewModel.swift
 // MVVM: all voice-session orchestration for the main screen lives here — session lifecycle,
 // command routing, live video, face intents, photo capture, TTS streaming, and history.
@@ -14,25 +15,133 @@ import Speech
 
 /// Pre-captured photo context for Visor "Capture First, Ask Later" workflow
 struct CapturedPhotoContext {
+    /// How long a captured photo stays attached to follow-up questions (Blueprint §2.1 step 7).
+    static let ttl: TimeInterval = 120.0
+    /// How many questions may reuse one photo before a fresh capture is required.
+    static let maxUses = 5
+
     let id: UUID = UUID()
     let data: Data
-    let timestamp: Date = Date()
-    var useCount: Int = 0
-    var isFresh: Bool { Date().timeIntervalSince(timestamp) < 120.0 && useCount < 5 }
+    let timestamp: Date
+    var useCount: Int
+
+    init(data: Data, timestamp: Date = Date(), useCount: Int = 0) {
+        self.data = data
+        self.timestamp = timestamp
+        self.useCount = useCount
+    }
+
+    var isFresh: Bool { isFresh(at: Date()) }
+
+    /// Freshness at an explicit instant — lets tests check the TTL boundary without sleeping.
+    func isFresh(at now: Date) -> Bool {
+        now.timeIntervalSince(timestamp) < Self.ttl && useCount < Self.maxUses
+    }
+}
+
+// MARK: - Solver intent (pure, unit-testable)
+
+/// Pure command classification for the solver flow. Kept free of state so the Blueprint
+/// end-to-end suite can pin the routing rules that protect against the "fatal pitfalls"
+/// (MASTER_HANDOVER_BLUEPRINT.md §3 and checklist §7).
+enum SolverIntent {
+    /// Window in which a photo synced to Camera Roll by the temple shutter counts as "the
+    /// photo the user is asking about" (Visor `hasRecentShutterPhoto`, Blueprint lesson 6).
+    static let recentPhotoWindow: TimeInterval = 120.0
+
+    /// Delay after the last TTS utterance before the mic may barge in again, so the temple
+    /// speaker's echo is not heard as a new command (Blueprint lesson 4).
+    static let ttsEchoSettleNanoseconds: UInt64 = 350_000_000
+
+    /// Visual & math phrases (Visor parity: 40+ phrases). Used ONLY for backends that cannot
+    /// judge intent themselves (see `modelDecidesIntent`): a command containing any of these
+    /// triggers a photo capture there. Gemini never depends on this list.
+    static let visualKeywords: [String] = [
+        "câu này", "câu 1", "câu 2", "câu 3", "câu 4", "câu 5", "câu 6", "câu 7", "câu 8", "câu 9", "câu 10",
+        "bài này", "bài 1", "bài 2", "bài 3", "bài 4", "bài 5", "bài toán", "đáp án", "đề bài",
+        "giải bài", "giải câu", "giải giúp", "giải bài này", "giải đề", "xem bài", "đọc bài",
+        "tính cái này", "tính câu", "tính bài", "tính toán", "phương trình", "hệ phương trình",
+        "tích phân", "đạo hàm", "hình học", "chọn đáp án", "cái này là gì", "dịch cái này",
+        "đọc cái này", "nhìn cái này", "xem cái này", "đây là cái gì", "trong ảnh", "trên bảng",
+        "take a photo", "take photo", "take picture", "capture photo", "snap photo",
+        "what is this", "what do you see", "solve this", "look at this", "read this",
+        "cau nay", "bai nay", "dap an", "de bai", "giai bai", "giai cau", "giai giup", "phuong trinh", "tich phan"
+    ]
+
+    /// Backends that receive the wearer's question verbatim and judge intent themselves (any
+    /// language, any phrasing). Only the small/local models still need the keyword routing.
+    static func modelDecidesIntent(for backend: AIBackendType) -> Bool {
+        backend == .geminiLive
+    }
+
+    static func isVisualCommand(_ command: String) -> Bool {
+        let lower = command.lowercased()
+        return visualKeywords.contains { lower.contains($0) }
+    }
+
+    /// "Stop" detection. Matched on WORDS, not substrings: `.contains("stop")` treated
+    /// "what's on the desktop" as a stop command and killed the session mid-question.
+    /// Phrases mentioning video/stream are left to the live-video stop handling.
+    static func isStopCommand(_ command: String) -> Bool {
+        let lowerCommand = command.lowercased()
+        let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
+        let stopExact: Set<String> = ["stop", "quiet", "silence", "enough", "dừng", "thôi", "ngừng"]
+        let stopPhrases = [
+            "be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it",
+            "dừng lại", "dừng đi", "thôi đi", "ngừng lại", "ngừng đi"
+        ]
+        let isExactStop = stopExact.contains(lowerCommand.trimmingCharacters(in: .whitespacesAndNewlines))
+        return (isExactStop
+                || !commandWords.isDisjoint(with: stopSingleWords)
+                || stopPhrases.contains { lowerCommand.contains($0) })
+                && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
+    }
+
+    /// What the glasses say when the AI could not be reached even after retries.
+    @MainActor
+    static func networkFailureMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Mạng đang chậm nên mình chưa nhận được câu trả lời. Bạn hỏi lại giúp mình nhé."
+            : "The connection is slow and I didn't get an answer. Please ask again."
+    }
+
+    /// What the glasses say when a visual question arrives and no photo can be found
+    /// (checklist test 5) — in the language the question was asked in.
+    @MainActor
+    static func missingPhotoMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Không tìm thấy ảnh chụp bài tập từ kính Ray-Ban. Bạn hãy bấm nút chụp trên gọng kính rồi hỏi lại nhé."
+            : "No photo found from Ray-Ban glasses. Please press the temple capture button and ask again."
+    }
 }
 
 // MARK: - Recent Photo Scanner (Visor Parity)
 
+/// Finds the photo the wearer just took with the glasses' temple shutter. Meta View syncs it to
+/// Camera Roll 1-3 s after the press; we prefetch it the moment it lands so that by the time the
+/// wearer says "Ok Vision …" the full-resolution bytes are already in memory.
+///
+/// Everything heavy (PhotoKit fetch, image decode/encode) runs OFF the main thread — the previous
+/// synchronous 2048 px decode on the main actor stalled the UI on every library change.
 @MainActor
 final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     static let shared = RecentPhotoScanner()
 
     @Published private(set) var lastScannedPhotoData: Data?
     @Published private(set) var lastScannedTimestamp: Date?
+    /// True when the user granted "Selected Photos" only: new glasses photos are then invisible
+    /// to the app and the shutter workflow cannot work. Surfaced to the UI as a warning.
+    @Published private(set) var isLimitedAccess = false
+
+    /// Full-resolution bytes of the newest asset we loaded, keyed by its local identifier.
+    private var cache: (assetID: String, created: Date, data: Data)?
+    private var prefetchTask: Task<Void, Never>?
 
     private override init() {
         super.init()
         PHPhotoLibrary.shared().register(self)
+        isLimitedAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited
     }
 
     deinit {
@@ -40,19 +149,20 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
     }
 
     func requestAuthorizationIfNeeded() async -> Bool {
-        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        switch status {
-        case .authorized, .limited:
-            return true
-        case .notDetermined:
-            let granted = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-            return granted == .authorized || granted == .limited
-        default:
-            return false
+        var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status == .notDetermined {
+            status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         }
+        isLimitedAccess = status == .limited
+        if status == .limited {
+            NSLog("[RecentPhotoScanner] Limited photo access — new glasses photos will NOT be visible. Ask for Full Access.")
+        }
+        return status == .authorized || status == .limited
     }
 
-    func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = 120.0) -> Data? {
+    /// The newest photo created within `seconds`, as full-resolution image bytes (see
+    /// `PhotoPayload.fullResolutionJPEG`), or nil when there is none / no permission.
+    func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = SolverIntent.recentPhotoWindow) async -> Data? {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard status == .authorized || status == .limited else {
             NSLog("[RecentPhotoScanner] Photo library not authorized (%d)", status.rawValue)
@@ -60,45 +170,184 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
         }
 
         let cutoffDate = Date().addingTimeInterval(-seconds)
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        fetchOptions.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@", PHAssetMediaType.image.rawValue, cutoffDate as NSDate)
-        fetchOptions.fetchLimit = 1
-
-        let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
-        guard let asset = assets.firstObject else {
+        guard let newest = await Self.newestImageAsset(since: cutoffDate) else {
             NSLog("[RecentPhotoScanner] No photos found created after %@", cutoffDate.description)
             return nil
         }
 
-        NSLog("[RecentPhotoScanner] Found asset created at: %@", asset.creationDate?.description ?? "unknown")
-
-        var resultData: Data?
-        let options = PHImageRequestOptions()
-        options.isSynchronous = true
-        options.deliveryMode = .highQualityFormat
-        options.isNetworkAccessAllowed = true
-
-        let targetSize = CGSize(width: 2048, height: 2048)
-        PHImageManager.default().requestImage(for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options) { image, _ in
-            if let image = image {
-                resultData = image.jpegData(compressionQuality: 0.88)
-            }
+        if let cached = cache, cached.assetID == newest.id {
+            NSLog("[RecentPhotoScanner] Using prefetched photo (%d bytes)", cached.data.count)
+            return cached.data
         }
 
-        if let data = resultData {
-            NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
-            self.lastScannedPhotoData = data
-            self.lastScannedTimestamp = Date()
+        NSLog("[RecentPhotoScanner] Found asset created at: %@", newest.created.description)
+        guard let data = await Self.loadFullResolution(assetID: newest.id) else {
+            NSLog("[RecentPhotoScanner] Could not load image data for newest asset")
+            return nil
         }
-
-        return resultData
+        NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
+        cache = (newest.id, newest.created, data)
+        lastScannedPhotoData = data
+        lastScannedTimestamp = Date()
+        return data
     }
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
         Task { @MainActor in
-            _ = self.fetchMostRecentPhoto(withinSeconds: 60.0)
+            // Coalesce bursts of change notifications (iCloud, Meta View writing metadata).
+            self.prefetchTask?.cancel()
+            self.prefetchTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                _ = await self.fetchMostRecentPhoto(withinSeconds: 60.0)
+            }
         }
+    }
+
+    // MARK: - Background PhotoKit work
+
+    /// Newest image asset created at/after `cutoff` — (localIdentifier, creationDate).
+    private nonisolated static func newestImageAsset(since cutoff: Date) async -> (id: String, created: Date)? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fetchOptions = PHFetchOptions()
+                fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                fetchOptions.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@",
+                                                     PHAssetMediaType.image.rawValue, cutoff as NSDate)
+                fetchOptions.fetchLimit = 1
+                let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+                if let asset = assets.firstObject {
+                    continuation.resume(returning: (asset.localIdentifier, asset.creationDate ?? Date()))
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// The asset's ORIGINAL image at full sensor resolution (12 MP on Ray-Ban Meta Gen 2).
+    /// JPEG originals pass through byte-for-byte; HEIC/other formats are re-encoded once to a
+    /// high-quality JPEG at full size, so every backend can read it.
+    private nonisolated static func loadFullResolution(assetID: String) async -> Data? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
+                guard let asset = assets.firstObject else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let options = PHImageRequestOptions()
+                options.isSynchronous = true
+                options.deliveryMode = .highQualityFormat
+                options.isNetworkAccessAllowed = true
+                options.version = .current
+                // Synchronous request: the handler runs before this returns. A box (not a captured
+                // var) carries the result out, which is safe in any concurrency-checking mode.
+                let box = DataBox()
+                PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                    box.value = data
+                }
+                continuation.resume(returning: box.value.flatMap { PhotoPayload.fullResolutionJPEG(from: $0) })
+            }
+        }
+    }
+}
+
+/// Result carrier for synchronous PhotoKit callbacks on a background queue.
+private final class DataBox: @unchecked Sendable {
+    var value: Data?
+}
+
+// MARK: - Photo payload (pure, unit-testable)
+
+/// Image bytes sent to the AI. Keeps the glasses' full resolution while staying inside what a
+/// mobile upload can carry without timing out.
+enum PhotoPayload {
+    /// Above this the original is re-encoded (same pixel size, lower JPEG quality). 12 MP JPEGs
+    /// from Ray-Ban Meta are normally 2-5 MB, so they pass through untouched.
+    static let maxUploadBytes = 7 * 1024 * 1024
+
+    /// Longest edge of the copy kept in conversation history: follow-up questions re-send the
+    /// whole history, so they carry this lighter copy instead of the 12 MP original.
+    static let historyMaxDimension: CGFloat = 2048
+
+    static func isJPEG(_ data: Data) -> Bool {
+        let bytes = [UInt8](data.prefix(3))
+        return bytes.count == 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+    }
+
+    /// MIME type from the magic bytes (Gemini accepts JPEG, PNG, WEBP, HEIC, HEIF).
+    static func mimeType(for data: Data) -> String {
+        let bytes = [UInt8](data.prefix(12))
+        if bytes.count >= 3, bytes[0] == 0xFF, bytes[1] == 0xD8, bytes[2] == 0xFF { return "image/jpeg" }
+        if bytes.count >= 4, bytes[0] == 0x89, bytes[1] == 0x50, bytes[2] == 0x4E, bytes[3] == 0x47 { return "image/png" }
+        if bytes.count >= 12, bytes[0] == 0x52, bytes[1] == 0x49, bytes[2] == 0x46, bytes[3] == 0x46,
+           bytes[8] == 0x57, bytes[9] == 0x45, bytes[10] == 0x42, bytes[11] == 0x50 { return "image/webp" }
+        if bytes.count >= 12, bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {   // "ftyp"
+            let brand = String(decoding: bytes[8..<12], as: UTF8.self)
+            return brand.hasPrefix("hei") || brand.hasPrefix("hev") ? "image/heic" : "image/heif"
+        }
+        return "image/jpeg"
+    }
+
+    /// Pixel size and EXIF orientation (1 = upright) read from the header, without decoding.
+    static func imageInfo(_ data: Data) -> (width: Int, height: Int, orientation: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        let orientation = props[kCGImagePropertyOrientation] as? Int ?? 1
+        return (width, height, orientation)
+    }
+
+    /// Full-resolution JPEG for upload. An upright JPEG original passes through byte-for-byte
+    /// (no generation loss, no CPU). Anything else (HEIC, rotated-by-EXIF, oversized) is decoded
+    /// ONCE at full size with the rotation applied — the model may ignore EXIF orientation.
+    static func fullResolutionJPEG(from original: Data) -> Data? {
+        guard let info = imageInfo(original) else { return nil }
+        if isJPEG(original), info.orientation == 1, original.count <= maxUploadBytes { return original }
+        let longest = max(info.width, info.height)
+        for quality in [0.92, 0.85, 0.75, 0.6] as [CGFloat] {
+            guard let jpeg = renderJPEG(from: original, maxPixelSize: longest, quality: quality) else { return nil }
+            if jpeg.count <= maxUploadBytes || quality == 0.6 { return jpeg }
+        }
+        return nil
+    }
+
+    /// Lighter copy for conversation history (longest edge `historyMaxDimension`, JPEG 0.85).
+    /// Returns the input unchanged if it is already that small or cannot be decoded.
+    static func historyCopy(of data: Data) -> Data {
+        guard let info = imageInfo(data), max(info.width, info.height) > Int(historyMaxDimension) else { return data }
+        return renderJPEG(from: data, maxPixelSize: Int(historyMaxDimension), quality: 0.85) ?? data
+    }
+
+    /// Decode (EXIF rotation applied, longest edge `maxPixelSize`) and encode as JPEG with ImageIO —
+    /// thread-safe and memory-light, so it runs on background queues.
+    static func renderJPEG(from data: Data, maxPixelSize: Int, quality: CGFloat) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output as CFMutableData, "public.jpeg" as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
+
+    /// Cheap identity for "is this the same photo the model already has?" checks.
+    static func fingerprint(_ data: Data) -> Int {
+        var hasher = Hasher()
+        hasher.combine(data.count)
+        hasher.combine(data.prefix(256))
+        hasher.combine(data.suffix(256))
+        return hasher.finalize()
     }
 }
 
@@ -216,6 +465,17 @@ final class VoiceAgentViewModel: ObservableObject {
         setupVoiceCommandService()
         setupGlassesCallbacks()
         preloadLocalModelIfNeeded()
+        // The temple-shutter workflow reads glasses photos from Camera Roll: ask for Photos access
+        // up front (it was never requested before, so the scanner silently found nothing), and
+        // warn when only "Selected Photos" is granted — new glasses photos are invisible then.
+        Task { @MainActor in
+            let granted = await RecentPhotoScanner.shared.requestAuthorizationIfNeeded()
+            if !granted {
+                errorMessage = "OpenVision cần quyền Ảnh (Toàn bộ ảnh) để đọc ảnh chụp từ kính Ray-Ban. Vào Cài đặt → OpenVision → Ảnh."
+            } else if RecentPhotoScanner.shared.isLimitedAccess {
+                errorMessage = "Quyền Ảnh đang ở chế độ Giới hạn nên app không thấy ảnh mới từ kính. Vào Cài đặt → OpenVision → Ảnh → chọn Toàn bộ ảnh."
+            }
+        }
         // Resume wake-word listening when returning to this screen. onDisappear stops it
         // (e.g. when navigating to Settings), and the one-time .task doesn't re-run on return —
         // so without this, the wake word stayed dead until you tapped the mic button.
@@ -834,7 +1094,7 @@ final class VoiceAgentViewModel: ObservableObject {
         ttsService.onSpeechEnded = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                try? await Task.sleep(nanoseconds: SolverIntent.ttsEchoSettleNanoseconds)
                 if !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 {
                     self.voiceCommandService.isBargeInPaused = false
                     if self.agentState == .speaking {
@@ -865,7 +1125,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 if self.ttsStreaming {
                     // A streamed utterance is open (local model + Apple TTS pipelining):
                     // flush the unspoken tail and close the session.
-                    self.feedStreamingSpeech(spoken, isFinal: true)
+                    self.feedStreamingSpeech(spoken, isFinal: true, historyText: display)
                 } else {
                     self.speakResponse(spoken, historyText: display)
                 }
@@ -904,6 +1164,22 @@ final class VoiceAgentViewModel: ObservableObject {
                     }
                 }
             }
+        }
+
+        // Gemini streams its reply: start speaking the SPOKEN channel at the first finished sentence
+        // instead of waiting for the long step-by-step DISPLAY channel to be generated.
+        GeminiLiveService.shared.onPartialSpoken = { [weak self] (spoken: String) in
+            guard let self else { return }
+            guard self.isSessionActive, !self.isLiveVideoMode, self.canStreamSpeech else { return }
+            if !self.ttsStreaming {
+                // Blueprint lesson 4: be "speaking" with barge-in paused BEFORE the first sentence is
+                // queued, so the temple speaker's echo can never be taken for a new command.
+                self.agentState = .speaking
+                self.voiceCommandService.isBargeInPaused = true
+            }
+            self.aiTranscript = spoken
+            MetricsCollector.shared.markFirstToken()
+            self.feedStreamingSpeech(spoken, isFinal: false)
         }
 
         // Local Gemma extra: token streaming (pipelines Apple TTS behind generation).
@@ -1009,23 +1285,8 @@ final class VoiceAgentViewModel: ObservableObject {
     private func sendCommand(_ command: String) async {
         let lowerCommand = command.lowercased()
 
-        // Check for "stop" command - stops TTS and waits for next command.
-        // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
-        // as a stop command and killed the session mid-question.
-        let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
-        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
-        let stopExact: Set<String> = ["stop", "quiet", "silence", "enough", "dừng", "thôi", "ngừng"]
-        let stopPhrases = [
-            "be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it",
-            "dừng lại", "dừng đi", "thôi đi", "ngừng lại", "ngừng đi"
-        ]
-        let isExactStop = stopExact.contains(lowerCommand.trimmingCharacters(in: .whitespacesAndNewlines))
-        let isStopCommand = (isExactStop
-                             || !commandWords.isDisjoint(with: stopSingleWords)
-                             || stopPhrases.contains { lowerCommand.contains($0) })
-                             && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
-
-        if isStopCommand {
+        // Check for "stop" command - stops TTS and waits for next command (word-matched, see SolverIntent).
+        if SolverIntent.isStopCommand(lowerCommand) {
             // In live video mode, "stop" means SHUT UP, not "tear down my camera session" —
             // silence everything and stay live. "Stop video" (excluded above) exits the mode.
             if isLiveVideoMode {
@@ -1132,39 +1393,33 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Visor Parity: Check for pre-captured photo or recent photo synced from Ray-Ban Meta
         if activePhotoContext?.isFresh != true {
-            if let recentPhoto = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0) {
+            if let recentPhoto = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow) {
                 print("[VoiceAgent] ✓ Fetched recent glasses photo from library (\(recentPhoto.count) bytes)")
                 self.activePhotoContext = CapturedPhotoContext(data: recentPhoto)
             }
         }
 
+        // Gemini understands free-form Vietnamese AND English and decides for itself whether the
+        // attached photo is relevant. So on Gemini the wearer's own words go through untouched —
+        // no fixed phrase list, no rewriting an unrelated question into "solve the image".
+        let modelDecidesIntent = SolverIntent.modelDecidesIntent(for: settingsManager.settings.aiBackend)
+
         if let photo = activePhotoContext, photo.isFresh {
             activePhotoContext?.useCount += 1
             print("[VoiceAgent] ✓ Fusing photo context (\(photo.data.count) bytes, use #\(photo.useCount)) with command: \(command)")
-            let visionPrompt = visionPromptFromCommand(command)
+            let visionPrompt = modelDecidesIntent ? command : visionPromptFromCommand(command)
             do {
                 try await sendPromptToActiveBackend(visionPrompt, imageData: photo.data)
             } catch {
-                errorMessage = "Failed to send command with photo: \(error.localizedDescription)"
-                agentState = isSessionActive ? .listening : .idle
+                handleSendFailure(error, command: command, context: "with photo")
             }
             return
         }
 
-        // Comprehensive visual & math keywords (Visor parity: 40+ phrases)
-        let visualKeywords = [
-            "câu này", "câu 1", "câu 2", "câu 3", "câu 4", "câu 5", "câu 6", "câu 7", "câu 8", "câu 9", "câu 10",
-            "bài này", "bài 1", "bài 2", "bài 3", "bài 4", "bài 5", "bài toán", "đáp án", "đề bài",
-            "giải bài", "giải câu", "giải giúp", "giải bài này", "giải đề", "xem bài", "đọc bài",
-            "tính cái này", "tính câu", "tính bài", "tính toán", "phương trình", "hệ phương trình",
-            "tích phân", "đạo hàm", "hình học", "chọn đáp án", "cái này là gì", "dịch cái này",
-            "đọc cái này", "nhìn cái này", "xem cái này", "đây là cái gì", "trong ảnh", "trên bảng",
-            "take a photo", "take photo", "take picture", "capture photo", "snap photo",
-            "what is this", "what do you see", "solve this", "look at this", "read this",
-            "cau nay", "bai nay", "dap an", "de bai", "giai bai", "giai cau", "giai giup", "phuong trinh", "tich phan"
-        ]
-
-        let isVisualCommand = visualKeywords.contains { lowerCommand.contains($0) }
+        // Keyword routing is only for the smaller backends. On Gemini a question without a photo
+        // goes as text; the system prompt tells the model to ask for a temple-button photo when the
+        // wearer is clearly asking about something they are looking at.
+        let isVisualCommand = !modelDecidesIntent && SolverIntent.isVisualCommand(lowerCommand)
 
         let backend = AIBackendRegistry.backend(for: settingsManager.settings.aiBackend)
         do {
@@ -1184,7 +1439,20 @@ final class VoiceAgentViewModel: ObservableObject {
                 agentState = isSessionActive ? .listening : .idle
             }
         } catch {
-            errorMessage = "Failed to send command: \(error.localizedDescription)"
+            handleSendFailure(error, command: command, context: "")
+        }
+    }
+
+    /// A turn failed after the backend's own retries. Hands-free: the wearer is not looking at
+    /// the phone, so SAY it (in their language) instead of only setting a banner. A cancellation
+    /// (the wearer said "stop" or asked something new) stays silent.
+    private func handleSendFailure(_ error: Error, command: String, context: String) {
+        if error is CancellationError { return }
+        print("[VoiceAgent] Send failed \(context): \(error)")
+        errorMessage = "Failed to send command\(context.isEmpty ? "" : " " + context): \(error.localizedDescription)"
+        if isSessionActive, !ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking {
+            speakResponse(SolverIntent.networkFailureMessage(for: command))
+        } else {
             agentState = isSessionActive ? .listening : .idle
         }
     }
@@ -2105,7 +2373,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // 2. Fall back to RecentPhotoScanner (photos synced to Camera Roll from temple capture button)
         if imageData == nil {
             NSLog("[OV] Glasses direct capture nil; checking recent photo from library")
-            imageData = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
+            imageData = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
         }
 
         NSLog("[OV] captureAndSendPhoto result: %@", imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes")
@@ -2118,9 +2386,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
             } else {
                 NSLog("[OV] No image available from glasses or library for visual command")
-                let errMsg = TTSService.containsVietnamese(prompt)
-                    ? "Không tìm thấy ảnh chụp bài tập từ kính Ray-Ban. Bạn hãy bấm nút chụp trên gọng kính rồi hỏi lại nhé."
-                    : "No photo found from Ray-Ban glasses. Please press the temple capture button and ask again."
+                let errMsg = SolverIntent.missingPhotoMessage(for: prompt)
                 errorMessage = errMsg
                 speakResponse(errMsg)
             }
@@ -2208,7 +2474,7 @@ final class VoiceAgentViewModel: ObservableObject {
             data = await freshLiveFrame()
         }
         if data == nil {
-            data = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
+            data = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
         }
 
         if let data = data {
@@ -2287,7 +2553,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Feed the streamed reply to Apple TTS sentence-by-sentence. `cumulative` is the full text so
     /// far (the local model emits a growing snapshot each token). On non-final calls we speak only
     /// the sentences that have fully completed; on the final call we flush whatever remains.
-    private func feedStreamingSpeech(_ cumulative: String, isFinal: Bool) {
+    private func feedStreamingSpeech(_ cumulative: String, isFinal: Bool, historyText: String? = nil) {
         // Open a streamed utterance session on first content.
         if !ttsStreaming {
             guard !cumulative.isEmpty else { return }
@@ -2323,7 +2589,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 ttsService.endStreaming()
             }
             ttsStreaming = false
-            recordAssistantReply(cumulative)   // history: streamed reply is complete
+            recordAssistantReply(historyText ?? cumulative)   // history: streamed reply is complete
             return
         }
 

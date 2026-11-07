@@ -47,17 +47,22 @@ final class TTSService: NSObject, ObservableObject {
         if text.range(of: vietnamesePattern, options: .regularExpression) != nil {
             return true
         }
-        let commonViWords = ["nghiem", "phuong trinh", "ket qua", "dap an", "bang", "chup anh", "giai giup", "giai bai", "chia", "nhan", "cong", "tru"]
+        // Vietnamese typed without diacritics. Single words are matched as WHOLE words — as
+        // substrings, "tru" made "true"/"structure" Vietnamese and an English answer was read
+        // in the Vietnamese voice.
         let lower = text.lowercased()
-        for w in commonViWords {
-            if lower.contains(w) { return true }
-        }
-        return false
+        let words = Set(lower.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        let viWords: Set<String> = ["nghiem", "bang", "chia", "nhan", "cong", "tru"]
+        let viPhrases = ["phuong trinh", "ket qua", "dap an", "chup anh", "giai giup", "giai bai"]
+        return !words.isDisjoint(with: viWords) || viPhrases.contains { lower.contains($0) }
     }
 
     // MARK: - Spoken Audio Cleaning (Visor parity)
 
-    /// Clean LaTeX formulas, markdown, and lingering tags before speech synthesis
+    /// Clean LaTeX formulas, markdown, and lingering tags before speech synthesis.
+    /// `@inline(never)`: Blueprint checklist test 6 verifies this symbol is present in the
+    /// Release Mach-O; with a single caller the optimizer would otherwise inline it away.
+    @inline(never)
     static func cleanSpokenAudio(_ text: String) -> String {
         var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
         s = s.replacingOccurrences(of: #"(?i)^\s*[-*•]?\s*(?:\[?(?:SPOKEN|DISPLAY)\]?)\s*:?\s*"#, with: "", options: .regularExpression)
@@ -72,15 +77,38 @@ final class TTSService: NSObject, ObservableObject {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Select voice dynamically based on text content: auto-detects Vietnamese and chooses vi-VN
+    /// Voice for this text's language — the wearer may ask in Vietnamese or English and the
+    /// answer comes back in the same language. (The device language no longer decides: on a
+    /// Vietnamese iPhone an English answer was read in the Vietnamese voice.)
     private func voice(for text: String) -> AVSpeechSynthesisVoice? {
-        if Self.containsVietnamese(text) || Locale.current.language.languageCode?.identifier == "vi" {
-            if let viVoice = AVSpeechSynthesisVoice(language: "vi-VN") {
-                return viVoice
-            }
-        }
-        return selectedVoice
+        Self.voice(forText: text, chosen: selectedVoice)
     }
+
+    static func voice(forText text: String, chosen: AVSpeechSynthesisVoice?) -> AVSpeechSynthesisVoice? {
+        if containsVietnamese(text) {
+            if let chosen, chosen.language.hasPrefix("vi") { return chosen }
+            if let viVoice = bestVoice(for: "vi-VN") { return viVoice }
+        }
+        if let chosen, !chosen.language.hasPrefix("vi") { return chosen }
+        return bestVoice(for: "en-US")
+    }
+
+    /// Highest-quality installed voice for a language (Premium > Enhanced > Default), so a
+    /// downloaded enhanced Vietnamese/English voice is used automatically.
+    static func bestVoice(for language: String) -> AVSpeechSynthesisVoice? {
+        if let cached = bestVoiceCache[language] { return cached }
+        // Only upgraded (enhanced/premium), non-novelty voices compete; otherwise the system default.
+        let upgraded = AVSpeechSynthesisVoice.speechVoices().filter {
+            $0.language == language && $0.quality != .default && !$0.voiceTraits.contains(.isNoveltyVoice)
+        }
+        let voice = upgraded.max { $0.quality.rawValue < $1.quality.rawValue }
+            ?? AVSpeechSynthesisVoice(language: language)
+        bestVoiceCache[language] = voice
+        return voice
+    }
+
+    /// Per-language pick, so streaming sentence-by-sentence doesn't rescan the voice list.
+    private static var bestVoiceCache: [String: AVSpeechSynthesisVoice] = [:]
 
     /// The Apple voice chosen in Settings, or the default English voice. Also used by the cloud
     /// voices' Apple fallback, so the choice lives in one place.
