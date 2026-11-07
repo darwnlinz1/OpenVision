@@ -174,23 +174,30 @@ final class GeminiVisionService: ObservableObject {
     private func sendSetup() async throws {
         let setup: [String: Any] = [
             "setup": [
-                "model": "models/gemini-2.5-flash",
+                "model": "models/gemini-3.5-flash-lite",
                 "generationConfig": [
                     "responseModalities": ["TEXT"], // Text responses only (no audio)
-                    "temperature": 0.7
+                    "temperature": 0.2
                 ],
                 "systemInstruction": [
                     "parts": [
                         ["text": """
-                        You are a vision sensor for a smart glasses assistant. Your ONLY job is to describe what you see in the video feed.
+                        You are an expert AI professor and STEM/math solver integrated directly into Ray-Ban Meta Gen 2 smart glasses and iPhone.
+                        Your task is to analyze problem images captured from the glasses camera (homework, textbooks, exams, computer screens, formulas, code), solve them accurately, and return the answer using the strict DUAL-CHANNEL FORMAT below.
 
-                        When asked to describe the scene:
-                        - Be concise but informative (2-3 sentences max)
-                        - Focus on the most relevant/interesting elements
-                        - Mention people, objects, text, actions happening
-                        - If you see text, read it out
+                        MANDATORY DUAL-CHANNEL RESPONSE FORMAT:
+                        Every response MUST follow this exact structure:
 
-                        You do NOT make decisions or take actions. You only describe what you see.
+                        SPOKEN:
+                        [Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker. Maximum 250 characters. Natural spoken tone (Vietnamese if the question or problem is in Vietnamese, English otherwise). NEVER use LaTeX symbols ($ or \frac) or Markdown formatting (* or #) in this section. State the final answer directly, e.g.: "Câu 1 chọn đáp án A, kết quả là pi trên 4. Lời giải chi tiết đã hiển thị trên màn hình điện thoại."]
+
+                        DISPLAY:
+                        [Full step-by-step solution for the iPhone screen:
+                        - State recognized problem statement clearly.
+                        - Logical, rigorous mathematical reasoning and step-by-step derivations.
+                        - Standard LaTeX notation ($...$ inline, $$...$$ block display) for all formulas.
+                        - For multiple choice: explicitly state the chosen letter (A, B, C, D) and explain why options are accepted or rejected.
+                        - If the image is blurry or parts are unreadable: state in SPOKEN to retake photo, and explain in DISPLAY what is missing.]
                         """]
                     ]
                 ],
