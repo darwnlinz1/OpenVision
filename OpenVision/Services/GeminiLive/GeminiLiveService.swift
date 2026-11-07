@@ -112,6 +112,10 @@ final class GeminiLiveService: ObservableObject {
         // Audio stream not required in REST solver mode
     }
 
+    func sendVideoFrame(imageData: Data) {
+        // Video streaming handled on-demand via sendMessage photo capture
+    }
+
     func sendVideoFrame(_ image: UIImage) {
         // Video streaming handled on-demand via sendMessage photo capture
     }
