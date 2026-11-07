@@ -41,15 +41,23 @@ final class TTSService: NSObject, ObservableObject {
 
     private var selectedVoice: AVSpeechSynthesisVoice? { Self.userVoice }
 
-    /// Auto-detect Vietnamese characters in the text
+    /// Auto-detect Vietnamese characters or math keywords in the text
     static func containsVietnamese(_ text: String) -> Bool {
         let vietnamesePattern = "[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]"
-        return text.range(of: vietnamesePattern, options: .regularExpression) != nil
+        if text.range(of: vietnamesePattern, options: .regularExpression) != nil {
+            return true
+        }
+        let commonViWords = ["nghiem", "phuong trinh", "ket qua", "dap an", "bang", "chup anh", "giai giup", "giai bai", "chia", "nhan", "cong", "tru"]
+        let lower = text.lowercased()
+        for w in commonViWords {
+            if lower.contains(w) { return true }
+        }
+        return false
     }
 
     /// Select voice dynamically based on text content: auto-detects Vietnamese and chooses vi-VN
     private func voice(for text: String) -> AVSpeechSynthesisVoice? {
-        if Self.containsVietnamese(text) {
+        if Self.containsVietnamese(text) || Locale.current.language.languageCode?.identifier == "vi" {
             if let viVoice = AVSpeechSynthesisVoice(language: "vi-VN") {
                 return viVoice
             }
