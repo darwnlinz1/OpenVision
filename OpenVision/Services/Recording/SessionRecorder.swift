@@ -91,11 +91,7 @@ final class SessionRecorder: ObservableObject {
     private var micSourceFormat: AVAudioFormat?
 
     private var isVoiceCommandCapturing: Bool {
-        if Thread.isMainThread {
-            return VoiceCommandService.shared.isListening
-        } else {
-            return DispatchQueue.main.sync { VoiceCommandService.shared.isListening }
-        }
+        VoiceCaptureTracker.shared.get()
     }
 
     /// Recreated (not just restarted) on every mic re-arm: a stopped engine keeps reporting the
