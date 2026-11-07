@@ -756,7 +756,7 @@ final class VoiceAgentViewModel: ObservableObject {
                     // flush the unspoken tail and close the session.
                     self.feedStreamingSpeech(spoken, isFinal: true)
                 } else {
-                    self.speakResponse(spoken)
+                    self.speakResponse(spoken, historyText: display)
                 }
             }
             backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
@@ -843,13 +843,15 @@ final class VoiceAgentViewModel: ObservableObject {
             }
         }
 
-        // Gemini Live callbacks (for Gemini Live / REST solver mode)
+        // Gemini Live callbacks (for direct / fallback solver mode)
         GeminiLiveService.shared.onOutputTranscription = { [weak self] (text: String) in
             guard let self else { return }
+            // If Gemini is active backend, replies are already delivered through backend.onAgentMessage
+            guard self.settingsManager.settings.aiBackend != .geminiLive else { return }
             let (spoken, display) = self.parseDualChannelResponse(text)
             self.aiTranscript = display
             if !spoken.isEmpty && !self.ttsService.isSpeaking {
-                self.speakResponse(spoken)
+                self.speakResponse(spoken, historyText: display)
             }
         }
 
@@ -868,47 +870,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
     /// Parse Gemini Solver Dual-Channel Response (SPOKEN: and DISPLAY:)
     private func parseDualChannelResponse(_ text: String) -> (spoken: String, display: String) {
-        let hasSpoken = text.contains("SPOKEN:")
-        let hasDisplay = text.contains("DISPLAY:")
-
-        if !hasSpoken && !hasDisplay {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (trimmed, trimmed)
-        }
-
-        var spoken = ""
-        var display = ""
-
-        if hasSpoken && hasDisplay {
-            if let spokenRange = text.range(of: "SPOKEN:"),
-               let displayRange = text.range(of: "DISPLAY:") {
-                if spokenRange.upperBound <= displayRange.lowerBound {
-                    spoken = String(text[spokenRange.upperBound..<displayRange.lowerBound])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    display = String(text[displayRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                } else {
-                    display = String(text[displayRange.upperBound..<spokenRange.lowerBound])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    spoken = String(text[spokenRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-            }
-        } else if hasSpoken {
-            if let spokenRange = text.range(of: "SPOKEN:") {
-                spoken = String(text[spokenRange.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                display = spoken
-            }
-        } else {
-            if let displayRange = text.range(of: "DISPLAY:") {
-                display = String(text[displayRange.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                spoken = display
-            }
-        }
-
-        return (spoken.isEmpty ? text : spoken, display.isEmpty ? text : display)
+        return GeminiLiveService.parseDualChannel(text)
     }
 
     /// Start listening for wake word
@@ -1738,12 +1700,14 @@ final class VoiceAgentViewModel: ObservableObject {
         let triggers = [
             "take a picture of this", "take a photo of this", "take a picture", "take a photo",
             "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
-            "snap a picture", "go ahead and take"
+            "snap a picture", "go ahead and take",
+            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "xem bài này", "đọc bài này",
+            "bài này làm sao", "nhìn cái này", "tính cái này", "bài toán"
         ]
         for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
         s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         // Trim leftover connective prefixes left after removing the trigger ("...and tell me…").
-        for prefix in ["and ", "of this ", "of ", "please "] {
+        for prefix in ["and ", "of this ", "of ", "please ", "và ", "với ", "giúp ", "hộ "] {
             while s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
         }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
@@ -1752,8 +1716,16 @@ final class VoiceAgentViewModel: ObservableObject {
         if settingsManager.settings.aiBackend == .hermes {
             return s.count < 3 ? "What is this?" : s.prefix(1).uppercased() + s.dropFirst()
         }
+        let isVietnamese = TTSService.containsVietnamese(command)
         if s.count < 3 {
-            return "What is the main object in this image? Name it specifically and describe its key visible details in 2–3 sentences."
+            if isVietnamese {
+                return "Giải chi tiết bài toán hoặc câu hỏi trong ảnh này từng bước một bằng tiếng Việt. Trình bày rõ ràng theo định dạng SPOKEN và DISPLAY."
+            } else {
+                return "Solve or explain the problem shown in this image clearly step-by-step. Present your response strictly in SPOKEN and DISPLAY format."
+            }
+        }
+        if isVietnamese {
+            return "Giải bài toán hoặc trả lời câu hỏi trong ảnh theo yêu cầu: \(s). Trình bày rõ ràng theo định dạng SPOKEN và DISPLAY."
         }
         return "Look closely at the image and answer specifically and concretely: \(s)"
     }
@@ -2012,11 +1984,21 @@ final class VoiceAgentViewModel: ObservableObject {
                 NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
                 try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
             } else {
-                NSLog("[OV] No image available — capture returned nil; NOT sending to model")
-                // Don't send a degraded text-only prompt to the model — that's what makes it
-                // reply "please provide an image". Tell the user directly and stop.
-                errorMessage = "Couldn't capture a photo (streaming: \(glassesManager.isStreaming ? "on" : "off"), registered: \(glassesManager.isRegistered ? "yes" : "no")). Try again."
-                speakResponse("I couldn't get a photo from the glasses. Please try again.")
+                NSLog("[OV] No image available from glasses")
+                let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let purePhotoWords = ["take a photo", "take a picture", "take photo", "take picture", "capture a photo", "snap a photo", "chụp ảnh", "chụp hình"]
+                let isPurePhoto = purePhotoWords.contains { trimmed.lowercased() == $0 }
+
+                if !isPurePhoto && !trimmed.isEmpty {
+                    NSLog("[OV] Forwarding text question directly to backend: %@", trimmed)
+                    try await sendPromptToActiveBackend(trimmed, imageData: nil)
+                } else {
+                    let errMsg = TTSService.containsVietnamese(prompt)
+                        ? "Không thể chụp ảnh từ kính Ray-Ban. Vui lòng kiểm tra kết nối kính và thử lại."
+                        : "Couldn't capture a photo from the glasses. Please make sure they are connected."
+                    errorMessage = errMsg
+                    speakResponse(errMsg)
+                }
             }
         } catch {
             print("[VoiceAgent] Failed to send: \(error)")
@@ -2063,7 +2045,7 @@ final class VoiceAgentViewModel: ObservableObject {
         for _ in 0..<25 { // up to ~2.5s
             if let f = glassesManager.lastFrame {
                 NSLog("[OV] fresh live frame acquired")
-                return f.jpegData(compressionQuality: 0.8)
+                return f.jpegData(compressionQuality: 0.95)
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -2076,7 +2058,7 @@ final class VoiceAgentViewModel: ObservableObject {
         for _ in 0..<30 { // up to ~3s
             if let f = glassesManager.lastFrame {
                 NSLog("[OV] fresh live frame acquired after restart")
-                return f.jpegData(compressionQuality: 0.8)
+                return f.jpegData(compressionQuality: 0.95)
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -2205,10 +2187,10 @@ final class VoiceAgentViewModel: ObservableObject {
         }
     }
 
-    /// Speak AI response via TTS
-    private func speakResponse(_ text: String) {
+    /// Speak AI response via TTS (optionally recording different text like LaTeX DISPLAY into History)
+    private func speakResponse(_ text: String, historyText: String? = nil) {
         guard !text.isEmpty else { return }
-        recordAssistantReply(text)
+        recordAssistantReply(historyText ?? text)
         // Perceived latency ends here: the gap between this and speechEnd is the wearer's wait.
         // (An approximation — synthesis still has to start — but it is the moment we hand off,
         // and the difference between Kokoro and Apple TTS shows up in `ttsLeadIn`.)
