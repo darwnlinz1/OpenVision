@@ -59,21 +59,19 @@ extension AppleFoundationService: AIBackend {
 
 extension GeminiLiveService: AIBackend {
     var backendType: AIBackendType { .geminiLive }
+    var supportsImageInput: Bool { true }
 
-    /// Gemini Live is a streaming session: replies arrive via onOutputTranscription /
-    /// onTurnComplete (wired by the voice agent), not a whole-message callback — so the
-    /// request/response callbacks are intentionally inert here.
     var onAgentMessage: ((String) -> Void)? {
-        get { nil }
-        set {}
+        get { agentMessageCallback }
+        set { agentMessageCallback = newValue }
     }
     var onProcessingChanged: ((Bool) -> Void)? {
-        get { nil }
-        set {}
+        get { processingChangedCallback }
+        set { processingChangedCallback = newValue }
     }
 
-    /// Video frames stream continuously in live mode; a "message" is just a text turn.
+    /// Route message and optional photo payload directly to Gemini REST service.
     func sendMessage(_ text: String, imageData: Data?) async throws {
-        try await sendText(text)
+        try await sendRESTMessage(text, imageData: imageData)
     }
 }
