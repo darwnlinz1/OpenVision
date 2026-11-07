@@ -33,9 +33,43 @@ final class AudioSessionManager {
         case measurement
     }
 
+    /// Callback invoked when audio route changes (device connected/disconnected)
+    var onRouteChange: (() -> Void)?
+
     // MARK: - Initialization
 
-    private init() {}
+    private init() {
+        setupRouteChangeObserver()
+    }
+
+    private func setupRouteChangeObserver() {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAudioRouteChange(notification)
+        }
+    }
+
+    private func handleAudioRouteChange(_ notification: Notification) {
+        guard let reasonValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else {
+            return
+        }
+        print("[AudioSession] Route changed: reason=\(reason.rawValue), route: \(currentRouteDescription)")
+
+        switch reason {
+        case .newDeviceAvailable, .oldDeviceUnavailable, .categoryChange, .routeConfigurationChange:
+            if let hfp = findBluetoothHFPInput() {
+                print("[AudioSession] Bluetooth device route changed -> selecting \(hfp.portName)")
+                try? audioSession.setPreferredInput(hfp)
+            }
+            onRouteChange?()
+        default:
+            break
+        }
+    }
 
     // MARK: - Configuration
 
@@ -154,12 +188,12 @@ final class AudioSessionManager {
     /// Configure audio for phone-only use (no glasses): record from the built-in mic and play
     /// spoken responses out of the LOUD speaker. Without `.defaultToSpeaker`, `.playAndRecord`
     /// routes output to the quiet earpiece — which is why phone-only audio was inaudible.
-    /// `.allowBluetoothA2DP` still lets AirPods / other Bluetooth audio work when present.
+    /// `.allowBluetoothA2DP` and `.allowBluetoothHFP` still let Bluetooth audio / mics work when present.
     func configureForPhone() throws {
         try audioSession.setCategory(
             .playAndRecord,
             mode: .default,
-            options: [.defaultToSpeaker, .allowBluetoothA2DP]
+            options: [.defaultToSpeaker, .allowBluetoothA2DP, .allowBluetoothHFP]
         )
         try audioSession.setActive(true)
         // If still routed to the quiet earpiece (carried over from a glasses/voiceChat config),
@@ -171,10 +205,14 @@ final class AudioSessionManager {
         print("[AudioSession] Configured for phone (built-in mic + loud speaker)")
     }
 
-    /// Find Bluetooth HFP input port
+    /// Find Bluetooth HFP input port (including Ray-Ban Meta Bluetooth LE / HFP ports)
     private func findBluetoothHFPInput() -> AVAudioSessionPortDescription? {
         for input in audioSession.availableInputs ?? [] {
             if input.portType == .bluetoothHFP {
+                return input
+            }
+            let name = input.portName.lowercased()
+            if input.portType == .bluetoothLE || name.contains("ray-ban") || name.contains("meta") || name.contains("rb meta") {
                 return input
             }
         }
@@ -186,8 +224,16 @@ final class AudioSessionManager {
         let inputs = audioSession.currentRoute.inputs
         let outputs = audioSession.currentRoute.outputs
 
-        let hasHFPInput = inputs.contains { $0.portType == .bluetoothHFP }
-        let hasHFPOutput = outputs.contains { $0.portType == .bluetoothHFP }
+        let hasHFPInput = inputs.contains { input in
+            if input.portType == .bluetoothHFP { return true }
+            let name = input.portName.lowercased()
+            return input.portType == .bluetoothLE || name.contains("ray-ban") || name.contains("meta") || name.contains("rb meta")
+        }
+        let hasHFPOutput = outputs.contains { output in
+            if output.portType == .bluetoothHFP { return true }
+            let name = output.portName.lowercased()
+            return output.portType == .bluetoothA2DP && (name.contains("ray-ban") || name.contains("meta") || name.contains("rb meta"))
+        }
 
         return hasHFPInput || hasHFPOutput
     }
