@@ -86,6 +86,12 @@
     </array>
 
     <!-- External Accessory protocol for Meta Wearables -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>OpenVision nhận ảnh chất lượng cao từ kính Ray-Ban Meta qua Wi-Fi.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_bonjour._tcp</string>
+    </array>
     <key>UISupportedExternalAccessoryProtocols</key>
     <array>
         <string>com.meta.ar.wearable</string>

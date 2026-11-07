@@ -46,6 +46,7 @@
 		AF2C901CA288086B7EBA6083 /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7376B3EE1F53DF1BD56B1095 /* Constants.swift */; };
 		B512221CD0B3CD3273D5B08C /* TurnTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B4E9F35DD1BC3A8F2A72066 /* TurnTimeline.swift */; };
 		B72ACD1B63980B9C4BBC7B8E /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 0DEB724AE3EDB04ABE9E3768 /* MWDATCamera */; };
+		FD143057EFCABC55F36AFB62 /* MWDATInputs in Frameworks */ = {isa = PBXBuildFile; productRef = C884F3457DAD46D0EB8540F7 /* MWDATInputs */; };
 		BE99A2B1118292BBC7E1FC59 /* GlassesManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DD25C635E9A37E7D6CA7677 /* GlassesManager.swift */; };
 		BFD9D5E86289F987AC6931B8 /* TranscriptBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E256E8AF9CAB4123C91B979 /* TranscriptBubble.swift */; };
 		BFFCBC7433DD8C3C4423B343 /* MetricsCollector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A0370E2CC3E1D597DFC3E6 /* MetricsCollector.swift */; };
@@ -145,6 +146,7 @@
 			files = (
 				81F38E617E61131E8C87620B /* MWDATCore in Frameworks */,
 				B72ACD1B63980B9C4BBC7B8E /* MWDATCamera in Frameworks */,
+				FD143057EFCABC55F36AFB62 /* MWDATInputs in Frameworks */,
 				33D67E4757C03873F8FED385 /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -465,6 +467,7 @@
 			packageProductDependencies = (
 				A7FF778329794C28B434EEAA /* MWDATCore */,
 				0DEB724AE3EDB04ABE9E3768 /* MWDATCamera */,
+				C884F3457DAD46D0EB8540F7 /* MWDATInputs */,
 				FB9F1A1944B40CA1BC2E7998 /* FluidAudio */,
 			);
 			productName = OpenVision;
@@ -885,7 +888,7 @@
 			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
 			requirement = {
 				kind = exactVersion;
-				version = 0.9.0;
+				version = 1.0.1;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -895,6 +898,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F7EEA1ED9999A23C56A77DE0 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
 			productName = MWDATCamera;
+		};
+		C884F3457DAD46D0EB8540F7 /* MWDATInputs */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F7EEA1ED9999A23C56A77DE0 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATInputs;
 		};
 		A7FF778329794C28B434EEAA /* MWDATCore */ = {
 			isa = XCSwiftPackageProductDependency;

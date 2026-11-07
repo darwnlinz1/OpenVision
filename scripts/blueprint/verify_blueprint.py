@@ -183,6 +183,15 @@ def main() -> int:
           "API key sent in the x-goog-api-key header, never in the URL")
     check("workflow", "captureToken" in gemini and "onCaptureRequested" in vm,
           "agent loop: the model can ask the app to take a photo")
+    glasses = read("OpenVision/Managers/GlassesManager.swift")
+    plist_text = read("OpenVision/Resources/Info.plist")
+    project_text = read("project.yml")
+    check("workflow", ".photo.capturePhoto(resolution:" in glasses
+          and "addInputs(configuration:" in glasses and "MWDATInputs" in project_text
+          and "acquireGlassesPhoto" in vm and "onCaptureButton" in vm
+          and "NSLocalNetworkUsageDescription" in plist_text,
+          "glasses photo goes straight to the app (DAT capture button + full-resolution still), "
+          "Camera Roll only as fallback")
     check("workflow", "SolutionWebView" in read("OpenVision/Views/Components/SolutionView.swift")
           and (repo / "OpenVision/Resources/SolutionRenderer/katex.min.js").exists(),
           "DISPLAY channel is rendered (offline KaTeX), not shown as raw LaTeX")

@@ -7,6 +7,29 @@
 
 import Foundation
 
+/// What a press of the glasses' capture button does (Meta DAT Inputs, experimental).
+enum GlassesButtonAction: String, Codable, CaseIterable, Identifiable {
+    /// Take a full-resolution photo; it becomes the context for the next question.
+    case capture
+    /// Take a photo and solve it right away — no need to speak.
+    case captureAndSolve
+    /// Read the last answer again.
+    case repeatAnswer
+    /// Do nothing.
+    case none
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .capture: return "Chụp ảnh (chờ câu hỏi)"
+        case .captureAndSolve: return "Chụp và giải ngay"
+        case .repeatAnswer: return "Đọc lại câu trả lời"
+        case .none: return "Không làm gì"
+        }
+    }
+}
+
 /// App settings persisted to Documents/settings.json (the API key goes to the Keychain; see SettingsSecrets)
 struct AppSettings: Codable, Equatable {
     // MARK: - Gemini
@@ -36,6 +59,21 @@ struct AppSettings: Codable, Equatable {
     /// device — true hands-free. Falls back to the phone mic automatically when the glasses aren't
     /// the audio route. Turn off to always use the phone. (Glasses mic uses more battery.)
     var preferGlassesMic: Bool = true
+
+    // MARK: - Glasses (Meta DAT 1.0)
+
+    /// Receive the glasses' capture-button presses in the app (photos go straight to Gemini at full
+    /// resolution, no Camera Roll import). Experimental in the Meta SDK: needs the glasses in
+    /// Developer Mode; falls back to the Camera Roll workflow when unavailable.
+    var captureButtonEnabled: Bool = true
+    var shortPressAction: GlassesButtonAction = .capture
+    var holdAction: GlassesButtonAction = .captureAndSolve
+    var doublePressAction: GlassesButtonAction = .repeatAnswer
+    /// Also route the touchpad to the app — only if button presses never arrive (a known SDK
+    /// quirk); while on, the temple touchpad no longer controls music/volume.
+    var captureButtonIncludeTouchpad: Bool = false
+    /// Photos taken through the SDK: full sensor resolution (~12 MP, slower to transfer) or 1080p.
+    var fullResolutionPhotos: Bool = true
 
     // MARK: - Voice output (Apple system voices, one per language)
 

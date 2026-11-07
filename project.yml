@@ -76,6 +76,7 @@ targets:
         products:
           - MWDATCore
           - MWDATCamera
+          - MWDATInputs   # capture-button events (experimental, 1.0.0+)
       # Acoustic voice-activity detection for end-of-turn (see SpeechActivityDetector).
       - package: FluidAudio
         products:
@@ -100,7 +101,10 @@ packages:
     # camera-consolidation API: DeviceSession.addCamera(config:) -> Camera -> camera.stream
     # (StreamSession/addStream are gone). Requires iOS 17.2+.
     # MUST be regression-tested on Gen 1/2 glasses (register + stream + HFP mic) before merge.
-    exactVersion: "0.9.0"
+    # 0.9.0 -> 1.0.1: adds MWDATInputs (capture-button events) and camera.photo (standalone
+    # full-resolution stills). Breaking renames (StreamError thermal/power cases, removed
+    # Wearables.deviceStateStream) don't touch this app. Both new features are experimental.
+    exactVersion: "1.0.1"
   # CoreML Silero VAD (Apache 2.0). Gives us ACOUSTIC end-of-speech detection: the endpoint
   # countdown can start when the mic actually goes quiet instead of when SFSpeechRecognizer stops
   # emitting partials (which it does in bursts with ~1s gaps mid-sentence, so transcript timing

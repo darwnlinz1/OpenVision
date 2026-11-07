@@ -88,6 +88,43 @@ enum SolverIntent {
             : "The connection is slow and I didn't get an answer. Please ask again."
     }
 
+    /// Language for what the app says on its own, when there is no question to answer in kind
+    /// (a capture-button press): the listening-language setting, or the iPhone's language on "auto".
+    @MainActor
+    static var speaksVietnamese: Bool {
+        switch SettingsManager.shared.settings.recognitionLanguage {
+        case "vi-VN": return true
+        case "en-US": return false
+        default: return Locale.preferredLanguages.first?.lowercased().hasPrefix("vi") ?? false
+        }
+    }
+
+    /// The question sent for "capture and solve" (hold on the glasses' capture button).
+    @MainActor
+    static var solvePhotoQuestion: String {
+        speaksVietnamese ? "Giải bài trong ảnh này." : "Solve the problem in this photo."
+    }
+
+    /// Spoken after a capture-button photo, so the wearer knows it is ready for a question.
+    @MainActor
+    static var photoReadyMessage: String {
+        speaksVietnamese ? "Đã chụp. Bạn hỏi đi." : "Got the photo. Go ahead."
+    }
+
+    /// Spoken when the glasses' photo could not be taken or transferred.
+    @MainActor
+    static var photoFailedMessage: String {
+        speaksVietnamese
+            ? "Chưa lấy được ảnh từ kính. Bạn bấm nút chụp lại giúp mình nhé."
+            : "I couldn't get the photo from the glasses. Please press the capture button again."
+    }
+
+    /// Spoken for "repeat the answer" when nothing has been answered yet.
+    @MainActor
+    static var nothingToRepeatMessage: String {
+        speaksVietnamese ? "Chưa có câu trả lời nào để đọc lại." : "There's no answer to repeat yet."
+    }
+
     /// What the glasses say when a visual question arrives and no photo can be found
     /// (checklist test 5) — in the language the question was asked in.
     @MainActor
@@ -406,6 +443,12 @@ final class VoiceAgentViewModel: ObservableObject {
     /// system utterances (error prompts) out of the History tab.
     private var historyAwaitingReply = false
 
+    /// The SPOKEN channel of the last answer, for "read it again" (double press on the glasses).
+    private var lastSpokenAnswer = ""
+
+    /// True while a capture-button photo is being taken (extra presses are ignored meanwhile).
+    @Published private(set) var isCapturingFromButton = false
+
     // MARK: - Agent State
 
     enum AgentState: Equatable {
@@ -431,6 +474,7 @@ final class VoiceAgentViewModel: ObservableObject {
     func onAppear() {
         setupVoiceCommandService()
         setupGlassesCallbacks()
+        applyButtonLinkSetting()
         // The temple-shutter workflow reads glasses photos from Camera Roll: ask for Photos access
         // up front (it was never requested before, so the scanner silently found nothing), and
         // warn when only "Selected Photos" is granted — new glasses photos are invisible then.
@@ -814,6 +858,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
             let (spoken, display) = self.parseDualChannelResponse(message)
             self.aiTranscript = spoken.isEmpty ? display : spoken
+            if !spoken.isEmpty { self.lastSpokenAnswer = spoken }
             self.latestSolution = Self.solutionWorthShowing(spoken: spoken, display: display)
 
             // Reply text is final. markFirstToken is first-wins, so streaming kept it accurate.
@@ -908,7 +953,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Send the wearer's words — verbatim, any language — to Gemini, with the current glasses
     /// photo when there is one. Gemini decides whether the photo matters, and asks for one
     /// ([[CAPTURE]]) when it must see something and has none.
-    private func sendCommand(_ command: String) async {
+    private func sendCommand(_ command: String, allowRepeat: Bool = false) async {
         // "Stop" — stops speech and waits for the next command (word-matched, see SolverIntent).
         if SolverIntent.isStopCommand(command) {
             print("[VoiceAgent] Stop command detected - full stop")
@@ -920,7 +965,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // can emit the same phrase twice (partial + final). A *different* follow-up question must
         // still go through, even while the previous answer is generating/speaking.
         let now = Date()
-        if command == lastProcessedCommand, now.timeIntervalSince(lastProcessedAt) < 4 {
+        if !allowRepeat, command == lastProcessedCommand, now.timeIntervalSince(lastProcessedAt) < 4 {
             print("[VoiceAgent] Ignoring duplicate command within 4s: \(command)")
             return
         }
@@ -1105,15 +1150,25 @@ final class VoiceAgentViewModel: ObservableObject {
         return data
     }
 
-    /// The model needs to see and no photo is in the conversation: try, in order, the glasses camera
-    /// (DAT SDK, if registered) and a photo that reached Camera Roll meanwhile. The new photo also
+    /// The best photo the glasses can give right now, straight to the app — never waiting for the
+    /// Meta AI app's Camera Roll import: (1) a standalone still at full sensor resolution
+    /// (DAT 1.0 Camera.photo), (2) a 720p still from the video stream, (3) a glasses photo that
+    /// already reached Camera Roll.
+    private func acquireGlassesPhoto() async -> Data? {
+        if glassesManager.isRegistered, !isRecording,
+           let full = await glassesManager.captureFullResolutionPhoto(
+               fullResolution: settingsManager.settings.fullResolutionPhotos) {
+            return full
+        }
+        if let streamStill = await takeGlassesPhoto() { return streamStill }
+        return await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
+    }
+
+    /// The model needs to see and no photo is in the conversation: take one. The new photo also
     /// becomes the context for follow-up questions.
     private func captureForAgent() async -> Data? {
         HapticFeedback.light()
-        var data = await takeGlassesPhoto()
-        if data == nil {
-            data = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
-        }
+        let data = await acquireGlassesPhoto()
         if let data {
             activePhotoContext = CapturedPhotoContext(data: data)
             HapticFeedback.success()
@@ -1129,10 +1184,7 @@ final class VoiceAgentViewModel: ObservableObject {
     func snapPhotoFromGlasses() async {
         HapticFeedback.light()
         print("[VoiceAgent] Manual photo snap requested from glasses...")
-        var data = await takeGlassesPhoto()
-        if data == nil {
-            data = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
-        }
+        let data = await acquireGlassesPhoto()
 
         if let data {
             activePhotoContext = CapturedPhotoContext(data: data)
@@ -1156,6 +1208,105 @@ final class VoiceAgentViewModel: ObservableObject {
                 print("[VoiceAgent] ✓ Active photo context cached (\(data.count) bytes)")
             }
         }
+        // The glasses' own capture button, routed to the app (DAT 1.0 Inputs).
+        glassesManager.onCaptureButton = { [weak self] press in
+            self?.handleCaptureButton(press)
+        }
+    }
+
+    /// Route (or release) the glasses' capture button according to Settings.
+    func applyButtonLinkSetting() {
+        let settings = settingsManager.settings
+        Task {
+            await glassesManager.configureButtonLink(enabled: settings.captureButtonEnabled,
+                                                     includeTouchpad: settings.captureButtonIncludeTouchpad)
+        }
+    }
+
+    // MARK: - Capture button
+
+    private func handleCaptureButton(_ press: GlassesButtonPress) {
+        let settings = settingsManager.settings
+        let action: GlassesButtonAction
+        switch press {
+        case .shortPress: action = settings.shortPressAction
+        case .hold: action = settings.holdAction
+        case .doublePress: action = settings.doublePressAction
+        }
+        print("[VoiceAgent] Capture button \(press.rawValue) → \(action.rawValue)")
+        switch action {
+        case .capture:
+            Task { await takeButtonPhoto(thenSolve: false) }
+        case .captureAndSolve:
+            Task { await takeButtonPhoto(thenSolve: true) }
+        case .repeatAnswer:
+            repeatLastAnswer()
+        case .none:
+            break
+        }
+    }
+
+    /// Shutter pressed on the glasses: the photo goes straight to the app at full resolution and
+    /// becomes the context for the next question — or, for "capture and solve", is solved at once.
+    private func takeButtonPhoto(thenSolve: Bool) async {
+        guard !isCapturingFromButton else { return }
+        isCapturingFromButton = true
+        defer { isCapturingFromButton = false }
+        HapticFeedback.light()
+
+        if thenSolve {
+            // A new problem replaces whatever is being said or generated.
+            if ttsService.isSpeaking {
+                ttsService.stop()
+                ttsStreaming = false
+            }
+            await gemini.interrupt()
+        }
+
+        guard let data = await acquireGlassesPhoto() else {
+            HapticFeedback.error()
+            errorMessage = SolverIntent.photoFailedMessage
+            speakNotice(SolverIntent.photoFailedMessage)
+            return
+        }
+        activePhotoContext = CapturedPhotoContext(data: data)
+        HapticFeedback.success()
+        print("[VoiceAgent] ✓ Capture-button photo ready (\(data.count) bytes)")
+
+        if !isSessionActive {
+            startSession()
+            // Let the session finish its (instant) connect before the question is shown/sent,
+            // so its start-up reset of the transcript can't wipe it.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        if thenSolve {
+            let question = SolverIntent.solvePhotoQuestion
+            userTranscript = question
+            latestSolution = nil
+            ConversationManager.shared.addUserMessage(question)
+            historyAwaitingReply = true
+            await sendCommand(question, allowRepeat: true)
+        } else if !ttsService.isSpeaking && agentState != .thinking {
+            speakNotice(SolverIntent.photoReadyMessage)
+        }
+    }
+
+    /// Double press: read the last answer again.
+    private func repeatLastAnswer() {
+        if ttsService.isSpeaking {
+            ttsService.stop()
+            ttsStreaming = false
+        }
+        speakNotice(lastSpokenAnswer.isEmpty ? SolverIntent.nothingToRepeatMessage : lastSpokenAnswer)
+    }
+
+    /// Say something that is not an answer (kept out of History).
+    private func speakNotice(_ text: String) {
+        let awaiting = historyAwaitingReply
+        historyAwaitingReply = false
+        speakResponse(text)
+        historyAwaitingReply = awaiting
     }
 
     // MARK: - Speech output (Apple voices; the language is picked per sentence by TTSService)
