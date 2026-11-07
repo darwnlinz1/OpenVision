@@ -69,6 +69,8 @@ jobs:
           SUITE: ${{ inputs.full_suite && 'all' || 'blueprint' }}
           XCBEAUTIFY_ARGS: --renderer github-actions
           TEST_RUNNER_OPENVISION_LIVE_GEMINI: ${{ inputs.live_gemini && '1' || '' }}
+          # Repository secret (Settings → Secrets → Actions), only read when live_gemini is ticked.
+          TEST_RUNNER_OPENVISION_GEMINI_API_KEYS: ${{ inputs.live_gemini && secrets.GEMINI_API_KEYS || '' }}
         run: scripts/e2e/run-simulator-tests.sh
 
       - name: Upload test results

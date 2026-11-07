@@ -176,11 +176,26 @@ def main() -> int:
           "streamed requests on a dedicated session (idle timeout, test-injectable)")
     check("workflow", "case .rateLimited" in gemini and "case .badKey" in gemini and "overallDeadline" in gemini,
           "retry policy by failure type with an overall deadline")
+    check("workflow", "x-goog-api-key" in gemini and "?key=" not in strip_comments(gemini),
+          "API key sent in the x-goog-api-key header, never in the URL")
+    check("workflow", "captureToken" in gemini and "onCaptureRequested" in vm,
+          "agent loop: the model can ask the app to take a photo")
+    check("workflow", "SolutionWebView" in read("OpenVision/Views/Components/SolutionView.swift")
+          and (repo / "OpenVision/Resources/SolutionRenderer/katex.min.js").exists(),
+          "DISPLAY channel is rendered (offline KaTeX), not shown as raw LaTeX")
+
+    # --- Security: the repository is PUBLIC. No API key may be compiled into the app — keys are
+    # entered in Settings (Keychain). Catches plain keys and the base64-"hidden" pool that leaked.
+    key_patterns = re.compile(r"AIza[0-9A-Za-z_-]{30,}|AQ\.Ab[0-9A-Za-z_-]{20,}|QVEuQWI[A-Za-z0-9+/=]{20,}|QUl6YV[A-Za-z0-9+/=]{20,}")
+    leaks = []
+    for folder in ("OpenVision", "OpenVisionTests", "scripts", ".github"):
+        for path in (repo / folder).rglob("*"):
+            if path.is_file() and path.suffix in {".swift", ".py", ".sh", ".yml", ".yaml", ".plist", ".xcconfig", ".json", ".md"}:
+                if key_patterns.search(path.read_text(encoding="utf-8", errors="ignore")):
+                    leaks.append(str(path.relative_to(repo)))
+    check("security", not leaks, "no Gemini API keys in source" + ("" if not leaks else f" — FOUND in {leaks}"))
 
     # --- Warnings (never fail the run).
-    if re.search(r'"QVEu[A-Za-z0-9+/=]{20,}"', gemini):
-        warn("security", "GeminiLiveService embeds a base64 API key pool: anyone with the IPA can extract "
-             "and burn these keys. Prefer the key from Settings (Keychain) or a server-side proxy.")
     build_ipa = (repo / ".github/workflows/build-ipa.yml")
     if build_ipa.exists() and "push:" not in build_ipa.read_text(encoding="utf-8"):
         warn("ci", "build-ipa.yml only runs on workflow_dispatch; blueprint §6.1 says it also runs on push to main.")

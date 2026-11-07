@@ -162,7 +162,7 @@ Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ 
 1. Cắm cáp kết nối iPhone 15 Pro với máy tính Windows/Mac.
 2. Mở phần mềm **Sideloadly**.
 3. Kéo thả file `OpenVision.ipa` vào Sideloadly.
-4. Nhập Apple ID (`thanhnguyen208215@gmail.com`).
+4. Nhập Apple ID (`<Apple ID của bạn>`).
 5. Bấm **Start** để ký chứng chỉ cá nhân và cài đặt ứng dụng vào máy.
 6. Trên iPhone, vào **Cài đặt -> Cài đặt chung -> Quản lý VPN & Thiết bị** -> Bấm Tin cậy nhà phát triển.
 

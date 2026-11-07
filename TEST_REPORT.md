@@ -4,9 +4,9 @@
 *Mã tài liệu:* `TEST_REPORT.md`  
 *Ngày thực hiện & hiệu chỉnh:* 07/11/2026  
 *Môi trường thử nghiệm:*
-- **Thiết bị di động:** iPhone 15 Pro (ProductType: `iPhone16,2`, UDID: `00008130-001E5CA43EE8001C`, iOS `26.6.1`). Kết nối qua cáp USB Type-C với máy host Windows 11.
+- **Thiết bị di động:** iPhone 15 Pro (ProductType: `iPhone16,2`, UDID: `<UDID>`, iOS `26.6.1`). Kết nối qua cáp USB Type-C với máy host Windows 11.
 - **Dịch vụ thiết bị:** Apple Mobile Device Service (Running), `usbmuxd` và `pymobiledevice3` v11.50.0.
-- **Phần cứng kính:** Ray-Ban Meta Gen 2 (BLE MAC: `80:AA:1C:F9:87:2E`).
+- **Phần cứng kính:** Ray-Ban Meta Gen 2 (BLE MAC: `<BLE_MAC>`).
 - **AI Engine:** Google Generative Language API v1beta (`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`).
 - **Môi trường CI/CD:** GitHub Actions `macos-26`, Xcode 26.6.
 
@@ -33,11 +33,11 @@ Tuân thủ nghiêm ngặt chỉ thị: *"Mỗi bài test phải có trạng th�
 | 13 | **Kiểm tra reconnect kính** | **NOT TESTED** | State machine tái kết nối mới nằm ở thiết kế kiến trúc, chưa thử nghiệm ngắt sóng Bluetooth thực tế giữa iPhone và kính. |
 | 14 | **Kiểm tra audio output qua loa kính** | **NOT TESTED** | Chưa thực hiện phát giọng đọc TTS qua kênh A2DP lên loa càng kính Ray-Ban từ app mới. |
 | 15 | **Kiểm tra App Background / Foreground** | **NOT TESTED** | Ứng dụng chưa được cài đặt lên iOS để kiểm tra các sự kiện chuyển đổi trạng thái vòng đời. |
-| 16 | **Kiểm tra bảo mật API Key** | **PASS** | Đã xác minh trên GitHub remote: file `OpenVision/Config/Config.swift` hoàn toàn không chứa key (`defaultGeminiAPIKey = ""`). Khóa API được quản lý nhập trực tiếp trong Settings của app trên iPhone, không hardcode vào mã nguồn hay git repository. |
+| 16 | **Kiểm tra bảo mật API Key** | **FAIL → ĐÃ SỬA (11/2026)** | Khẳng định "PASS" trước đây là sai: `Config.swift` rỗng nhưng `GeminiLiveService.swift` chứa 6 key Gemini mã hóa base64 (giải mã được ngay) trong một repository **công khai**. Đã xóa khỏi mã nguồn; key giờ chỉ nhập trong Cài đặt (Keychain). Các key cũ vẫn nằm trong lịch sử git nên **phải thu hồi trong Google AI Studio**. |
 | 17 | **Kiểm tra trên iPhone 15 Pro thật** | **FAIL** | Cài đặt file unsigned IPA trực tiếp qua `pymobiledevice3 apps install` bị iOS từ chối ở bước `VerifyingApplication (40%)` với mã lỗi `0xe800801c (No code signature found)`. Cần sử dụng Sideloadly hoặc chứng chỉ cá nhân để ký trước khi nạp vào máy. |
 
 **Tổng kết ma trận:**
-- **PASS:** 6 hạng mục (Core AI, Math Logic, Image Quality Simulation, Latency, Prompt Engine, API Key Security).
+- **PASS:** 5 hạng mục (Core AI, Math Logic, Image Quality Simulation, Latency, Prompt Engine). Mục 16 (API Key Security) được đánh giá lại là FAIL và đã sửa — xem bảng.
 - **NOT TESTED:** 9 hạng mục (Liên quan trực tiếp đến vòng đời phần cứng kính trên app iOS thật khi chưa hoàn tất sideload).
 - **FAIL:** 2 hạng mục (Code Signing IPA trên iPhone - yêu cầu ký cá nhân bằng Sideloadly; OpenRouter Fallback client chưa triển khai).
 

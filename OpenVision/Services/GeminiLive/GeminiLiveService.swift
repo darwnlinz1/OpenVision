@@ -1,14 +1,19 @@
 // OpenVision - GeminiLiveService.swift
-// REST-based Gemini Solver Service with API Key Pool & Dual-Channel Response
+// REST-based Gemini solver: streaming, resilient, agentic (asks for a photo when it needs one).
+//
+// Design notes (see docs/architecture/ADR-001-solver-pipeline.md and
+// docs/research/Nghiên cứu nâng cấp kính Gemini.md):
+// - API keys come ONLY from Settings (Keychain); several keys may be entered. Rate limits are per
+//   Google Cloud PROJECT and per MODEL, so keys should come from different projects, and the model
+//   chain gives a second quota when the first model is exhausted.
+// - Gemini 3 gives every image a fixed token budget (HIGH ~1120, ULTRA_HIGH ~2240 tokens), so the
+//   photo is sent upright at <= 3072 px and the detail is requested with media resolution instead
+//   of uploading 12 MP of bytes that would be downscaled anyway.
 
 import Foundation
 import UIKit
 import AVFoundation
 
-/// Gemini Live REST Service for STEM/Math Solver
-///
-/// Connects to Google Generative Language API via HTTPS REST with round-robin API Key Pool,
-/// automatic 429 quota rotation, and dual-channel response parsing (SPOKEN for glasses, DISPLAY for phone).
 @MainActor
 final class GeminiLiveService: ObservableObject {
     // MARK: - Singleton
@@ -22,32 +27,14 @@ final class GeminiLiveService: ObservableObject {
     @Published var isModelSpeaking: Bool = false
     @Published var lastError: String?
 
-    // MARK: - API Key Pool (6 Verified Keys)
-
-    private static let rawKeyPool: [String] = [
-        "QVEuQWI4Uk42TDhyNzVHbFhob2RodC1ING55WDJkSk1TbURuYWNvVWppSlpSMlEyQW9sYmc=",
-        "QVEuQWI4Uk42SWR0OXBKaE1YSERVNzR0d2FHcm91Tms5bm9rVVp1VEZZS2ZrQXgwZ2ZmcHc=",
-        "QVEuQWI4Uk42S3VvckJ4TDFHZ3dacHlDRWV5bmh0ektQbU1pNWowNFlybXpxTHZxT2pYdmc=",
-        "QVEuQWI4Uk42S2ViaFJwa0tYYXRGbTRLUktzc3ZoaklieVk1VEZvWmNyRkNsQmlaVXg2Q3c=",
-        "QVEuQWI4Uk42SzBTVFdMNV92S01YclFlOWpkZmNSQ0tlNE5HS1k2RGhIWThWLVlBcEdwa1E=",
-        "QVEuQWI4Uk42S2ZXSzhzUEhvZDZQeDNISU5WWEZZUXRHOTVmVThWRkc1YW5TcjdRU19waFE="
-    ]
-
-    static var defaultAPIKeyPool: [String] {
-        rawKeyPool.compactMap { b64 in
-            guard let data = Data(base64Encoded: b64),
-                  let str = String(data: data, encoding: .utf8) else { return nil }
-            return str
-        }
-    }
-
-    private var currentKeyIndex: Int = 0
-    private var keyCooldowns: [String: Date] = [:]
-
-    // MARK: - Endpoint
+    // MARK: - Endpoint & models
 
     static let apiHost = "generativelanguage.googleapis.com"
-    static let modelName = "gemini-3.5-flash-lite"
+    /// Tried in order. Quota is per model, so the second model is a real fallback when the
+    /// first one is exhausted or unavailable (404) for every key.
+    static let modelChain = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    /// The primary model (diagnostics, settings UI).
+    static var modelName: String { modelChain[0] }
 
     // MARK: - Multi-turn Conversation History
 
@@ -78,6 +65,14 @@ final class GeminiLiveService: ObservableObject {
     var agentMessageCallback: ((String) -> Void)?
     var processingChangedCallback: ((Bool) -> Void)?
 
+    /// Streamed SPOKEN-channel text so far (cumulative, cleaned exactly like the final parse), so
+    /// the glasses can start speaking at the first finished sentence. Main actor.
+    var onPartialSpoken: ((String) -> Void)?
+
+    /// The model asked to SEE (it replied with `captureToken`) and no photo was attached: take one
+    /// (glasses camera, or a photo just synced to Camera Roll) and return it, or nil if none.
+    var onCaptureRequested: ((_ question: String) async -> Data?)?
+
     // MARK: - Active Request Tracking
 
     private var activeTask: Task<Void, Error>?
@@ -97,7 +92,7 @@ final class GeminiLiveService: ObservableObject {
 
         connectionState = .connected
         onConnectionStateChanged?(connectionState)
-        NSLog("[GeminiLive] Connected to REST solver endpoint with %d API keys in pool", keys.count)
+        NSLog("[GeminiLive] Connected to REST solver endpoint with %d API key(s)", keys.count)
     }
 
     /// Disconnect from Gemini Service
@@ -150,15 +145,10 @@ final class GeminiLiveService: ObservableObject {
 
     /// Primary solver entrypoint: send the wearer's words (+ optional glasses photo) to Gemini.
     ///
-    /// Built to never leave the wearer stuck on "thinking":
-    /// - Streams (SSE): the SPOKEN channel is handed to `onPartialSpoken` sentence by sentence,
-    ///   so the glasses start talking long before the step-by-step DISPLAY channel is finished,
-    ///   and bytes keep flowing, so long answers never hit an idle timeout.
-    /// - Retries by failure type: 429 → next key now; dead/blocked key (400/401/403) → drop it
-    ///   for an hour and use the next; 5xx → exponential backoff with jitter; network drop →
-    ///   retry, or keep what already streamed. One overall deadline bounds the whole turn.
-    /// - The photo goes at full resolution once. History keeps a 2048 px copy, and a follow-up
-    ///   on the same photo does not upload it again.
+    /// An agent loop: if the model needs to see something and no photo is in the conversation, it
+    /// answers with `captureToken`; the app then takes a photo (`onCaptureRequested`) and asks the
+    /// same question again with it. Every request streams, retries by failure type, and is bounded
+    /// by one overall deadline, so the wearer is never left on "thinking".
     func sendRESTMessage(_ text: String, imageData: Data?) async throws {
         requestGeneration += 1
         let generation = requestGeneration
@@ -174,88 +164,146 @@ final class GeminiLiveService: ObservableObject {
             }
         }
 
-        let allKeys = getAvailableKeyList()
-        guard !allKeys.isEmpty else {
+        guard !getAvailableKeyList().isEmpty else {
+            lastError = "No Gemini API key — add one in Settings → Gemini"
             throw AIBackendError.notConfigured
         }
 
+        let question = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (imageData != nil ? "Giải giúp tôi bài toán hoặc câu hỏi trong ảnh này" : "Xin chào")
+            : text
+
+        var image = imageData
+        var turn = try await performTurn(question: question, imageData: image, generation: generation)
+
+        if Self.isCaptureRequest(turn.rawText), image == nil, let capture = onCaptureRequested {
+            NSLog("[GeminiLive] Model asked to see — capturing a photo")
+            if let photo = await capture(question) {
+                guard generation == requestGeneration else { throw CancellationError() }
+                image = photo
+                turn = try await performTurn(question: question, imageData: photo, generation: generation)
+            } else {
+                let message = SolverIntent.missingPhotoMessage(for: question)
+                turn = TurnResult(rawText: "SPOKEN:\n\(message)\n\nDISPLAY:\n\(message)", sentImage: nil, historyCopyTask: nil)
+            }
+        }
+        if Self.isCaptureRequest(turn.rawText) {
+            // Asked again despite a photo: never speak the protocol token.
+            let message = SolverIntent.missingPhotoMessage(for: question)
+            turn.rawText = "SPOKEN:\n\(message)\n\nDISPLAY:\n\(message)"
+        }
+
+        deliver(turn.rawText)
+        await recordTurn(userText: question, sentImage: turn.sentImage, historyCopyTask: turn.historyCopyTask,
+                         rawText: turn.rawText, signature: turn.signature)
+    }
+
+    private struct TurnResult {
+        var rawText: String
+        var sentImage: Data?
+        var historyCopyTask: Task<Data, Never>?
+        var signature: String? = nil
+    }
+
+    /// One question → one answer, with every retry the failure calls for.
+    private func performTurn(question: String, imageData: Data?, generation: Int) async throws -> TurnResult {
+        let allKeys = getAvailableKeyList()
+
+        // Upright JPEG, long edge <= 3072 px (off the main actor). Detail comes from media
+        // resolution; bigger uploads only cost latency.
+        var prepared: Data?
+        if let imageData {
+            prepared = await Task.detached(priority: .userInitiated) { PhotoPayload.uploadJPEG(from: imageData) ?? imageData }.value
+        }
+
         // Same photo as one the model already has in this conversation? Don't upload it again.
-        var imageToSend = imageData
-        if let data = imageData, historyContainsImage,
-           imageFingerprintInHistory == PhotoPayload.fingerprint(data) {
-            imageToSend = nil
+        if let data = prepared, historyContainsImage, imageFingerprintInHistory == PhotoPayload.fingerprint(data) {
+            prepared = nil
             NSLog("[GeminiLive] Photo already in conversation history — not re-uploading")
         }
-        if let data = imageToSend {
-            NSLog("[GeminiLive] Attached image payload: %d bytes (%@)", data.count, PhotoPayload.mimeType(for: data))
+        if let data = prepared {
+            NSLog("[GeminiLive] Attached image payload: %ld bytes (%@)", data.count, PhotoPayload.mimeType(for: data))
         }
-        // Prepare the lighter history copy off the main actor while the upload runs.
-        let historyCopyTask: Task<Data, Never>? = imageToSend.map { data in
+        // The lighter history copy is made while the request runs.
+        let historyCopyTask: Task<Data, Never>? = prepared.map { data in
             Task.detached(priority: .utility) { PhotoPayload.historyCopy(of: data) }
         }
 
-        // The wearer's words go through as spoken. Only an empty turn gets a default ask.
-        let promptText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? (imageToSend != nil || imageData != nil ? "Giải giúp tôi bài toán hoặc câu hỏi trong ảnh này" : "Xin chào")
-            : text
-        let contents = conversationHistory + [Self.userTurn(text: promptText, imageData: imageToSend)]
-
         let started = Date()
-        let maxAttempts = allKeys.count + 2
+        let maxAttempts = allKeys.count * Self.modelChain.count + 3
         var attempt = 0
         var networkFailures = 0
+        var healedSignatures = false
         var lastErrorMessage = "No response from Gemini API"
 
         retryLoop: while attempt < maxAttempts && Date().timeIntervalSince(started) < Self.overallDeadline {
-            guard generation == requestGeneration, !Task.isCancelled else { throw CancellationError() }
+            guard generation == requestGeneration, !Task.isCancelled else {
+                historyCopyTask?.cancel()
+                throw CancellationError()
+            }
             attempt += 1
-            let key = getNextAvailableKey(from: allKeys)
+            let (model, key) = nextCandidate(keys: allKeys)
+            let contents = conversationHistory + [Self.userTurn(text: question, imageData: prepared,
+                                                                  perPartMediaResolution: mediaResolutionMode == .perPartUltraHigh)]
             let body = try makeRequestBody(contents: contents)
-            NSLog("[GeminiLive] Sending request (attempt %d/%d, %d KB) using key %@...",
-                  attempt, maxAttempts, body.count / 1024, String(key.prefix(8)))
+            NSLog("[GeminiLive] Sending request (attempt %ld/%ld, %ld KB) to %@ with key %@…",
+                  attempt, maxAttempts, body.count / 1024, model, String(key.prefix(6)))
 
-            let outcome = await performStreamingRequest(body: body, key: key, generation: generation)
+            let outcome = await performStreamingRequest(body: body, model: model, key: key, generation: generation)
             switch outcome {
-            case .success(let rawText):
-                NSLog("[GeminiLive] Received response (%d chars) in %.1fs", rawText.count, Date().timeIntervalSince(started))
-                deliver(rawText)
-                await recordTurn(userText: promptText, sentImage: imageToSend, historyCopyTask: historyCopyTask, rawText: rawText)
-                return
+            case .success(let rawText, let signature):
+                NSLog("[GeminiLive] %@ answered (%ld chars) in %.1fs", model, rawText.count, Date().timeIntervalSince(started))
+                return TurnResult(rawText: rawText, sentImage: prepared, historyCopyTask: historyCopyTask, signature: signature)
 
             case .cancelled:
+                historyCopyTask?.cancel()
                 throw CancellationError()
 
             case .rateLimited(let retryAfter):
-                NSLog("[GeminiLive] Key %@... returned 429 quota exhausted. Cooling down and rotating...", String(key.prefix(8)))
-                coolDownKey(key, for: retryAfter ?? 60)
+                NSLog("[GeminiLive] %@ quota exhausted for key %@… — rotating", model, String(key.prefix(6)))
+                coolDown(model: model, key: key, for: retryAfter ?? 60)
                 lastErrorMessage = "Gemini quota exhausted (429)"
 
             case .badKey(let message):
-                NSLog("[GeminiLive] Key %@... rejected (%@) — dropping it for an hour", String(key.prefix(8)), message)
-                coolDownKey(key, for: 3600)
+                NSLog("[GeminiLive] Key %@… rejected (%@) — dropping it for an hour", String(key.prefix(6)), message)
+                coolDown(model: nil, key: key, for: 3600)
                 lastErrorMessage = message
 
-            case .unsupportedField(let message):
-                guard mediaResolutionSupported else {
+            case .modelUnavailable(let message):
+                NSLog("[GeminiLive] %@ unavailable (%@) — falling back to the next model", model, message)
+                coolDown(model: model, key: nil, for: 3600)
+                lastErrorMessage = message
+
+            case .unsupportedField(let capability, let message):
+                guard downgrade(capability) else {
                     lastErrorMessage = message
                     break retryLoop
                 }
-                NSLog("[GeminiLive] Model rejected mediaResolution (%@) — retrying without it", message)
-                mediaResolutionSupported = false
+                NSLog("[GeminiLive] Model rejected %@ — retrying without it", String(describing: capability))
                 attempt -= 1   // not the key's fault
+
+            case .staleSignature(let message):
+                // History carries a thought signature the API no longer accepts: start the
+                // conversation afresh once instead of failing every follow-up.
+                guard !healedSignatures else {
+                    lastErrorMessage = message
+                    break retryLoop
+                }
+                healedSignatures = true
+                NSLog("[GeminiLive] History rejected (%@) — clearing it and retrying", message)
+                clearConversationHistory()
+                attempt -= 1
 
             case .serverError(let message):
                 lastErrorMessage = message
                 await backoff(attempt: attempt)
 
-            case .network(let message, let partial):
+            case .network(let message, let partial, let signature):
                 if !Self.parseDualChannel(partial).spoken.isEmpty {
                     // The connection dropped mid-answer: keep what arrived rather than make the
                     // wearer wait for a full retry (the spoken part streams first anyway).
-                    NSLog("[GeminiLive] Stream dropped after %d chars (%@) — using partial answer", partial.count, message)
-                    deliver(partial)
-                    await recordTurn(userText: promptText, sentImage: imageToSend, historyCopyTask: historyCopyTask, rawText: partial)
-                    return
+                    NSLog("[GeminiLive] Stream dropped after %ld chars (%@) — using partial answer", partial.count, message)
+                    return TurnResult(rawText: partial, sentImage: prepared, historyCopyTask: historyCopyTask, signature: signature)
                 }
                 lastErrorMessage = message
                 networkFailures += 1
@@ -269,32 +317,54 @@ final class GeminiLiveService: ObservableObject {
         }
 
         historyCopyTask?.cancel()
-        NSLog("[GeminiLive] Giving up after %d attempt(s), %.1fs: %@", attempt, Date().timeIntervalSince(started), lastErrorMessage)
+        NSLog("[GeminiLive] Giving up after %ld attempt(s), %.1fs: %@", attempt, Date().timeIntervalSince(started), lastErrorMessage)
         self.lastError = lastErrorMessage
         throw AIBackendError.requestFailed(lastErrorMessage)
     }
 
+    // MARK: - Agent protocol
+
+    /// What the model answers when it must see something and has no image (see system prompt).
+    static let captureToken = "[[CAPTURE]]"
+
+    static func isCaptureRequest(_ raw: String) -> Bool {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix(captureToken)
+    }
+
     // MARK: - Request plumbing
 
-    /// Hard cap on one turn, all retries included.
+    /// Hard cap on one model call, all retries included.
     nonisolated static let overallDeadline: TimeInterval = 120
     /// Longest silence tolerated between bytes (covers the model "thinking" before its first token).
     nonisolated static let idleTimeout: TimeInterval = 75
     nonisolated static let maxNetworkRetries = 2
-
-    /// Streamed SPOKEN-channel text so far (cumulative, cleaned exactly like the final parse), so
-    /// the glasses can start speaking at the first finished sentence. Main actor.
-    var onPartialSpoken: ((String) -> Void)?
 
     /// Extra URLProtocol classes for the session (tests stub the network with these).
     var urlProtocolClasses: [AnyClass] = [] {
         didSet { session = Self.makeSession(protocolClasses: urlProtocolClasses) }
     }
 
+    /// Keys to use instead of Settings (tests).
+    var apiKeysOverride: [String]?
+
+    /// How photo detail is requested. Gemini 3 accepts ULTRA_HIGH only on an image part; older or
+    /// smaller models may reject either form — each rejection steps down one level, remembered
+    /// for the rest of the run.
+    enum MediaResolutionMode: Equatable {
+        case perPartUltraHigh, configHigh, none
+    }
+
+    /// Request features a model may not support.
+    enum Capability: Equatable {
+        case mediaResolution, thinking
+    }
+
+    private(set) var mediaResolutionMode: MediaResolutionMode = .perPartUltraHigh
+    private(set) var thinkingSupported = true
+
     private var session: URLSession = GeminiLiveService.makeSession(protocolClasses: [])
     private var requestGeneration = 0
     private var imageFingerprintInHistory: Int?
-    private var mediaResolutionSupported = true
 
     private nonisolated static func makeSession(protocolClasses: [AnyClass]) -> URLSession {
         let config = URLSessionConfiguration.default
@@ -308,15 +378,33 @@ final class GeminiLiveService: ObservableObject {
         return URLSession(configuration: config)
     }
 
+    /// Step a capability down after the model rejected it. False when there is nothing left to drop.
+    private func downgrade(_ capability: Capability) -> Bool {
+        switch capability {
+        case .mediaResolution:
+            switch mediaResolutionMode {
+            case .perPartUltraHigh: mediaResolutionMode = .configHigh
+            case .configHigh: mediaResolutionMode = .none
+            case .none: return false
+            }
+        case .thinking:
+            guard thinkingSupported else { return false }
+            thinkingSupported = false
+        }
+        return true
+    }
+
     /// Outcome of one HTTP attempt, classified for the retry policy.
     enum AttemptOutcome: Equatable {
-        case success(String)
+        case success(String, signature: String?)
         case cancelled
         case rateLimited(retryAfter: TimeInterval?)
         case badKey(String)
-        case unsupportedField(String)
+        case modelUnavailable(String)
+        case unsupportedField(Capability, String)
+        case staleSignature(String)
         case serverError(String)
-        case network(String, partial: String)
+        case network(String, partial: String, signature: String?)
         case fatal(String)
     }
 
@@ -326,30 +414,48 @@ final class GeminiLiveService: ObservableObject {
         }
     }
 
-    static func userTurn(text: String, imageData: Data?) -> [String: Any] {
+    static func userTurn(text: String, imageData: Data?, perPartMediaResolution: Bool = false) -> [String: Any] {
         var parts: [[String: Any]] = []
         if let imageData {
-            parts.append([
+            var part: [String: Any] = [
                 "inlineData": [
                     "mimeType": PhotoPayload.mimeType(for: imageData),
                     "data": imageData.base64EncodedString()
                 ]
-            ])
+            ]
+            if perPartMediaResolution {
+                part["mediaResolution"] = ["level": "MEDIA_RESOLUTION_ULTRA_HIGH"]
+            }
+            parts.append(part)
         }
         parts.append(["text": text])
         return ["role": "user", "parts": parts]
     }
 
+    /// The model's turn as history: its text, plus the thought signature it ended with (Gemini 3
+    /// expects signatures back in multi-turn conversations), mirroring how the stream sent them.
+    static func modelTurn(text: String, signature: String?) -> [String: Any] {
+        var parts: [[String: Any]] = [["text": text]]
+        if let signature, !signature.isEmpty {
+            parts.append(["text": "", "thoughtSignature": signature])
+        }
+        return ["role": "model", "parts": parts]
+    }
+
     private func makeRequestBody(contents: [[String: Any]]) throws -> Data {
         var generationConfig: [String: Any] = [
             "temperature": 0.2,
-            // Thinking tokens count against this budget; 2048 could leave a hard problem with
+            // Thinking tokens may count against this budget; 2048 could leave a hard problem with
             // an empty, truncated answer.
             "maxOutputTokens": 8192
         ]
-        if mediaResolutionSupported {
-            // Read the glasses photo at the highest detail the model offers (small print, exams).
+        if mediaResolutionMode == .configHigh {
             generationConfig["mediaResolution"] = "MEDIA_RESOLUTION_HIGH"
+        }
+        if thinkingSupported {
+            // Flash-Lite defaults to MINIMAL; LOW buys a self-check on math (manifesto model 4)
+            // for a small latency cost — the spoken answer still streams first.
+            generationConfig["thinkingConfig"] = ["thinkingLevel": "LOW"]
         }
         let body: [String: Any] = [
             "systemInstruction": ["parts": [["text": buildSystemPrompt()]]],
@@ -359,21 +465,24 @@ final class GeminiLiveService: ObservableObject {
         return try JSONSerialization.data(withJSONObject: body, options: [])
     }
 
-    private func performStreamingRequest(body: Data, key: String, generation: Int) async -> AttemptOutcome {
-        let endpoint = "https://\(Self.apiHost)/v1beta/models/\(Self.modelName):streamGenerateContent?alt=sse&key=\(key)"
+    private func performStreamingRequest(body: Data, model: String, key: String, generation: Int) async -> AttemptOutcome {
+        let endpoint = "https://\(Self.apiHost)/v1beta/models/\(model):streamGenerateContent?alt=sse"
         guard let url = URL(string: endpoint) else { return .fatal("Invalid Gemini URL") }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        // Header, not URL: query strings end up in logs and proxies.
+        request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
         request.httpBody = body
         request.timeoutInterval = Self.idleTimeout
 
         var accumulated = ""
+        var signature: String?
         do {
             let (bytes, response) = try await session.bytes(for: request)
             guard let http = response as? HTTPURLResponse else {
-                return .network("No HTTP response", partial: "")
+                return .network("No HTTP response", partial: "", signature: nil)
             }
             guard (200...299).contains(http.statusCode) else {
                 var errorBody = ""
@@ -381,7 +490,7 @@ final class GeminiLiveService: ObservableObject {
                     errorBody += line
                     if errorBody.count > 4000 { break }
                 }
-                NSLog("[GeminiLive] HTTP error %d: %@", http.statusCode, errorBody)
+                NSLog("[GeminiLive] HTTP error %ld: %@", http.statusCode, errorBody)
                 return Self.classifyHTTPError(status: http.statusCode, body: errorBody,
                                               retryAfter: http.value(forHTTPHeaderField: "Retry-After"))
             }
@@ -391,6 +500,7 @@ final class GeminiLiveService: ObservableObject {
                 if let reason = chunk.blockReason {
                     return .fatal("Gemini blocked the request (\(reason))")
                 }
+                if let sig = chunk.thoughtSignature { signature = sig }
                 guard !chunk.text.isEmpty else { continue }
                 accumulated += chunk.text
                 if let spoken = Self.streamingSpokenPrefix(from: accumulated), !spoken.isEmpty {
@@ -400,13 +510,13 @@ final class GeminiLiveService: ObservableObject {
             if accumulated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return .serverError("Empty response from Gemini")
             }
-            return .success(accumulated)
+            return .success(accumulated, signature: signature)
         } catch is CancellationError {
             return .cancelled
         } catch {
             if (error as? URLError)?.code == .cancelled { return .cancelled }
             NSLog("[GeminiLive] Request error: %@", error.localizedDescription)
-            return .network(error.localizedDescription, partial: accumulated)
+            return .network(error.localizedDescription, partial: accumulated, signature: signature)
         }
     }
 
@@ -423,13 +533,14 @@ final class GeminiLiveService: ObservableObject {
 
     /// Append the finished exchange to history (photo as its lighter copy), keeping the last
     /// `maxHistoryEntries` entries.
-    private func recordTurn(userText: String, sentImage: Data?, historyCopyTask: Task<Data, Never>?, rawText: String) async {
+    private func recordTurn(userText: String, sentImage: Data?, historyCopyTask: Task<Data, Never>?,
+                            rawText: String, signature: String?) async {
         var historyImage: Data?
         if let historyCopyTask {
             historyImage = await historyCopyTask.value
         }
         conversationHistory.append(Self.userTurn(text: userText, imageData: historyImage))
-        conversationHistory.append(["role": "model", "parts": [["text": rawText]]])
+        conversationHistory.append(Self.modelTurn(text: rawText, signature: signature))
         if conversationHistory.count > Self.maxHistoryEntries {
             conversationHistory.removeFirst(conversationHistory.count - Self.maxHistoryEntries)
         }
@@ -442,8 +553,9 @@ final class GeminiLiveService: ObservableObject {
     }
 
     private func backoff(attempt: Int) async {
-        let base = min(4.0, 0.5 * pow(2.0, Double(max(0, attempt - 1))))
-        let delay = base + Double.random(in: 0...0.3)
+        // Google's guidance: exponential 1, 2, 4 s… with jitter.
+        let base = min(8.0, pow(2.0, Double(max(0, attempt - 1))))
+        let delay = base + Double.random(in: 0...0.4)
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
@@ -453,10 +565,12 @@ final class GeminiLiveService: ObservableObject {
         var text: String
         var finishReason: String?
         var blockReason: String?
+        var thoughtSignature: String? = nil
     }
 
     /// One SSE line (`data: {json}`) → its text delta. Thought parts are skipped; every text part
-    /// is joined (models that "think" can put a non-text part first).
+    /// is joined (models that "think" can put a non-text part first); a thought signature (often
+    /// on a final empty-text part) is kept for the history.
     static func parseSSELine(_ line: String) -> StreamChunk? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("data:") else { return nil }
@@ -470,17 +584,20 @@ final class GeminiLiveService: ObservableObject {
     static func parseResponseObject(_ json: [String: Any]) -> StreamChunk {
         var text = ""
         var finishReason: String?
+        var signature: String?
         if let candidates = json["candidates"] as? [[String: Any]], let first = candidates.first {
             finishReason = first["finishReason"] as? String
             if let content = first["content"] as? [String: Any],
                let parts = content["parts"] as? [[String: Any]] {
-                for part in parts where (part["thought"] as? Bool) != true {
+                for part in parts {
+                    if let sig = part["thoughtSignature"] as? String, !sig.isEmpty { signature = sig }
+                    guard (part["thought"] as? Bool) != true else { continue }
                     if let t = part["text"] as? String { text += t }
                 }
             }
         }
         let blockReason = (json["promptFeedback"] as? [String: Any])?["blockReason"] as? String
-        return StreamChunk(text: text, finishReason: finishReason, blockReason: blockReason)
+        return StreamChunk(text: text, finishReason: finishReason, blockReason: blockReason, thoughtSignature: signature)
     }
 
     static func classifyHTTPError(status: Int, body: String, retryAfter: String?) -> AttemptOutcome {
@@ -491,12 +608,20 @@ final class GeminiLiveService: ObservableObject {
             return .rateLimited(retryAfter: retryAfter.flatMap { TimeInterval($0) })
         case 401, 403:
             return .badKey(summary)
+        case 404:
+            return .modelUnavailable(summary)
         case 400:
             if lower.contains("api key") || lower.contains("api_key") {
                 return .badKey(summary)
             }
             if lower.contains("mediaresolution") || lower.contains("media_resolution") || lower.contains("media resolution") {
-                return .unsupportedField(summary)
+                return .unsupportedField(.mediaResolution, summary)
+            }
+            if lower.contains("thinking") {
+                return .unsupportedField(.thinking, summary)
+            }
+            if lower.contains("signature") {
+                return .staleSignature(summary)
             }
             return .fatal(summary)
         case 408, 500...599:
@@ -539,43 +664,73 @@ final class GeminiLiveService: ObservableObject {
         return cleanChannelText(body)
     }
 
-    // MARK: - Key Pool Rotation & Cooldown
+    // MARK: - Keys, models, rotation & cooldown
+
+    /// Keys from Settings: one or several, separated by commas, semicolons, spaces or new lines.
+    /// Never compiled into the app — the repository is public.
+    static func parseKeys(_ raw: String) -> [String] {
+        var seen = Set<String>()
+        return raw.components(separatedBy: CharacterSet(charactersIn: ",; \n\r\t"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
 
     private func getAvailableKeyList() -> [String] {
-        let userKey = SettingsManager.shared.settings.geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        var list = Self.defaultAPIKeyPool
-        if !userKey.isEmpty && !list.contains(userKey) {
-            list.insert(userKey, at: 0)
-        }
-        return list
+        if let apiKeysOverride { return apiKeysOverride }
+        return Self.parseKeys(SettingsManager.shared.settings.geminiAPIKey)
     }
 
-    private func getNextAvailableKey(from keys: [String]) -> String {
+    private var currentKeyIndex = 0
+    /// Cooldowns keyed "model|key"; "*" stands for every model (dead key) or every key (missing model).
+    private var cooldowns: [String: Date] = [:]
+
+    private func isCoolingDown(model: String, key: String, now: Date) -> Bool {
+        [cooldownKey(model, key), cooldownKey(nil, key), cooldownKey(model, nil)].contains { (cooldowns[$0] ?? .distantPast) > now }
+    }
+
+    private func cooldownKey(_ model: String?, _ key: String?) -> String {
+        "\(model ?? "*")|\(key ?? "*")"
+    }
+
+    /// First (model, key) pair that is not cooling down: the primary model with every key before
+    /// the fallback model. If everything is cooling down, the pair whose cooldown ends first.
+    private func nextCandidate(keys: [String]) -> (model: String, key: String) {
         let now = Date()
         let total = keys.count
-        for i in 0..<total {
-            let idx = (currentKeyIndex + i) % total
-            let candidate = keys[idx]
-            if let cooldown = keyCooldowns[candidate], cooldown > now {
-                continue
+        for model in Self.modelChain {
+            for i in 0..<total {
+                let idx = (currentKeyIndex + i) % total
+                if !isCoolingDown(model: model, key: keys[idx], now: now) {
+                    currentKeyIndex = (idx + 1) % total
+                    return (model, keys[idx])
+                }
             }
-            currentKeyIndex = (idx + 1) % total
-            return candidate
         }
-        // Every key is cooling down: use the one whose cooldown ends first.
-        let soonest = keys.min { (keyCooldowns[$0] ?? .distantPast) < (keyCooldowns[$1] ?? .distantPast) } ?? keys[0]
-        return soonest
+        var best = (model: Self.modelChain[0], key: keys[0])
+        var bestEnd = Date.distantFuture
+        for model in Self.modelChain {
+            for key in keys {
+                let end = [cooldownKey(model, key), cooldownKey(nil, key), cooldownKey(model, nil)]
+                    .compactMap { cooldowns[$0] }.max() ?? .distantPast
+                if end < bestEnd {
+                    bestEnd = end
+                    best = (model, key)
+                }
+            }
+        }
+        return best
     }
 
-    private func coolDownKey(_ key: String, for seconds: TimeInterval) {
-        keyCooldowns[key] = Date().addingTimeInterval(max(1, seconds))
+    private func coolDown(model: String?, key: String?, for seconds: TimeInterval) {
+        cooldowns[cooldownKey(model, key)] = Date().addingTimeInterval(max(1, seconds))
     }
 
-    /// Forget rotation position, key cooldowns and learned model capabilities (tests, fresh start).
+    /// Forget rotation position, cooldowns and learned model capabilities (tests, fresh start).
     func resetNetworkState() {
         currentKeyIndex = 0
-        keyCooldowns.removeAll()
-        mediaResolutionSupported = true
+        cooldowns.removeAll()
+        mediaResolutionMode = .perPartUltraHigh
+        thinkingSupported = true
     }
 
     // MARK: - Dual Channel Response Parser (Visor line-anchored regex)
@@ -651,7 +806,8 @@ final class GeminiLiveService: ObservableObject {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - System Prompt (Visor parity: natural, multi-sentence spoken explanation)
+
+    // MARK: - System Prompt (answer-first dual channel, bilingual, agentic photo capture)
 
     func buildSystemPrompt() -> String {
         let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
@@ -666,12 +822,19 @@ final class GeminiLiveService: ObservableObject {
         Usually the user presses the capture button on the glasses frame first, then asks. An attached image is that photo. Use it whenever the question could be about it (e.g. "giải câu này", "what does this say", "câu 3 chọn gì").
         If the question is clearly unrelated to the photo (general knowledge, chit-chat, time, advice...), ignore the photo and answer normally.
         Follow-up questions may refer to a photo earlier in this conversation; keep using it.
-        If the user is asking about something they are looking at but there is no image in this conversation, do not guess: say no photo was found and ask them to press the capture button on the glasses frame and ask again (in their language).
+        If the user is asking about something they are looking at but there is NO image anywhere in this conversation, do not guess and do not describe anything: reply with exactly [[CAPTURE]] and nothing else. The app will take a photo with the glasses and ask you again with it attached.
+
+        MODES (decide from the user's words, any language):
+        - Solve (default): give the answer and the method.
+        - Tutor ("hướng dẫn", "gợi ý", "explain step by step", "teach me"): do NOT reveal the final answer; give the next step or a hint and ask the user to try, then check what they say.
+        - Whole page ("cả trang", "tất cả các câu", "all questions"): answer every question, SPOKEN lists them briefly ("câu 1 A, câu 2 C…"), DISPLAY gives a table with a short reason per question.
+        - Read / translate / explain code or text: do exactly that, in the user's language.
+        Before answering math, silently re-check the result (conditions, signs, units); never state an answer you have not verified.
 
         When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
 
         SPOKEN:
-        Provide a natural, comprehensive spoken explanation in 2 to 4 complete sentences for the Ray-Ban Meta smart glasses speaker, in the user's language. State the core method, key calculation steps, and the final answer clearly and confidently. For a problem with a worked solution, briefly mention that the complete derivation is shown on the phone screen.
+        Provide a natural, comprehensive spoken explanation in 2 to 4 complete sentences for the Ray-Ban Meta smart glasses speaker, in the user's language. In Solve mode the FIRST sentence states the final answer (it is spoken while the rest is still being generated); the following sentences give the core method and key calculation steps. For a problem with a worked solution, briefly mention that the complete derivation is shown on the phone screen.
         NEVER use raw LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, subscripts). Spell out math naturally (ví dụ: 'x bằng 2', 'tích phân từ 0 đến 1', 'đáp án là A'; e.g. 'x equals 2', 'the answer is A').
         For multiple choice questions, explicitly state the question number and the selected option with brief reasoning.
 

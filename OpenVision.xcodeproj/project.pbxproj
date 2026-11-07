@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8454BBF538DBBE896C451BC5 /* SolutionRenderer in Resources */ = {isa = PBXBuildFile; fileRef = BC87519DBE5AB56551F9FD7C /* SolutionRenderer */; };
+		BACC061789CD33B2B52B9497 /* SolutionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6329C61801054C63D4B9646C /* SolutionView.swift */; };
 		F7171F39C05F14F095CA441A /* BlueprintSolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27298ECDFB6BF4F7743FB3AC /* BlueprintSolverTests.swift */; };
 		EB6BEF2BD2B4FC7E24248FDE /* BlueprintGeminiE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA8C2E880C1F79EB7B2A3794 /* BlueprintGeminiE2ETests.swift */; };
 		F5908580D9F4B16DB68B7155 /* BlueprintPhotoLibraryE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE24101A60E8448DFB9A1A45 /* BlueprintPhotoLibraryE2ETests.swift */; };
@@ -144,6 +146,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		BC87519DBE5AB56551F9FD7C /* SolutionRenderer */ = {isa = PBXFileReference; lastKnownFileType = folder; path = SolutionRenderer; sourceTree = "<group>"; };
+		6329C61801054C63D4B9646C /* SolutionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SolutionView.swift; sourceTree = "<group>"; };
 		27298ECDFB6BF4F7743FB3AC /* BlueprintSolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintSolverTests.swift; sourceTree = "<group>"; };
 		FA8C2E880C1F79EB7B2A3794 /* BlueprintGeminiE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintGeminiE2ETests.swift; sourceTree = "<group>"; };
 		FE24101A60E8448DFB9A1A45 /* BlueprintPhotoLibraryE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueprintPhotoLibraryE2ETests.swift; sourceTree = "<group>"; };
@@ -639,6 +643,7 @@
 			isa = PBXGroup;
 			children = (
 				CDC538C538178747352D72C8 /* Sounds */,
+				BC87519DBE5AB56551F9FD7C /* SolutionRenderer */,
 				2410F1B11CD5A7070F3E7590 /* Assets.xcassets */,
 				E553EFA930E3B93EEA8F0AB6 /* Info.plist */,
 			);
@@ -701,6 +706,7 @@
 				C27052ECD2FFC79652B5CDB3 /* OnboardingView.swift */,
 				A1E4A28F9C0979733D4ABDB2 /* SwirlOrb.swift */,
 				1ABBF4AC21A442A2C3CF6750 /* Theme.swift */,
+				6329C61801054C63D4B9646C /* SolutionView.swift */,
 				0E256E8AF9CAB4123C91B979 /* TranscriptBubble.swift */,
 			);
 			path = Components;
@@ -819,6 +825,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6F8F4FD14445FC3FE1A771D2 /* Assets.xcassets in Resources */,
+				8454BBF538DBBE896C451BC5 /* SolutionRenderer in Resources */,
 				D78274C690CE91F7747815F8 /* thinking_loop.mp3 in Resources */,
 				E7CDE1FBC061C2DF4BDDD84E /* wake_activation.mp3 in Resources */,
 				7C118644498027D47E828115 /* wake_word_ding.mp3 in Resources */,
@@ -962,6 +969,7 @@
 				9C57BDC2BF482048DD9EDEBD /* TelemetrySettingsView.swift in Sources */,
 				456B4E46EE405F5C8F45B04D /* Theme.swift in Sources */,
 				7A0FECD93C32597CA6659BC9 /* TimerTool.swift in Sources */,
+				BACC061789CD33B2B52B9497 /* SolutionView.swift in Sources */,
 				BFD9D5E86289F987AC6931B8 /* TranscriptBubble.swift in Sources */,
 				B512221CD0B3CD3273D5B08C /* TurnTimeline.swift in Sources */,
 				8BB3557D9BE4E9F2399BDBC1 /* VoiceAgentView.swift in Sources */,

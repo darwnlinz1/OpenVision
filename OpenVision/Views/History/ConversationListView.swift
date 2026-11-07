@@ -178,6 +178,14 @@ struct ConversationDetailView: View {
 
 struct MessageBubble: View {
     let message: Message
+    @State private var openSolution: SolutionItem?
+
+    /// Assistant replies with formulas or structure open in the rendered solution view.
+    private var hasRichSolution: Bool {
+        message.role == .assistant
+            && (message.content.contains("$") || message.content.contains("\\(") || message.content.contains("\\[")
+                || message.content.contains("```") || message.content.contains("\n|"))
+    }
 
     var body: some View {
         HStack {
@@ -194,9 +202,23 @@ struct MessageBubble: View {
                     .foregroundColor(message.role == .user ? Color.black.opacity(0.9) : .primary)
                     .cornerRadius(16)
 
-                Text(message.timestamp.formatted(date: .omitted, time: .shortened))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                HStack(spacing: 10) {
+                    Text(message.timestamp.formatted(date: .omitted, time: .shortened))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if hasRichSolution {
+                        Button {
+                            openSolution = SolutionItem(markdown: message.content)
+                        } label: {
+                            Label("Xem công thức", systemImage: "function")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundColor(Theme.accent)
+                    }
+                }
+            }
+            .sheet(item: $openSolution) { item in
+                SolutionSheet(markdown: item.markdown)
             }
 
             if message.role == .assistant {

@@ -21,7 +21,7 @@
 
 ## 2. KẾT QUẢ KIỂM THỬ THỰC TẾ DANH MỤC MODEL (EMPIRICAL AUDIT)
 
-Qua kiểm tra trực tiếp endpoint `https://generativelanguage.googleapis.com/v1beta/models?key=...` với API Key thực tế của dự án (`YOUR_GEMINI_KEY6L8r75GlXhodht-H4nyX2dJMSmDnacoUjiJZR2Q2Aolbg`), hệ thống ghi nhận ma trận tình trạng thực tế:
+Qua kiểm tra trực tiếp endpoint `https://generativelanguage.googleapis.com/v1beta/models?key=...` với API Key thực tế của dự án (`<GEMINI_API_KEY>`), hệ thống ghi nhận ma trận tình trạng thực tế:
 
 | Model ID | Tình trạng kiểm thử thực tế | RPM / RPD | Thời gian phản hồi thực tế (RTT) | Khả năng giải toán & suy luận hình ảnh | Phân vai trò trong hệ thống |
 |---|---|---|---|---|---|

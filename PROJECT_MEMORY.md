@@ -62,7 +62,7 @@ The Ray-Ban Meta glasses communicate with Android over Bluetooth LE via a custom
 
 ## 3. Google AI Studio & Gemini API Specifications (Direct Browser Audit)
 
-*Audit Source:* Project `gen-lang-client-0856382547` (`helloa`), Account: `Minh Anh (leminh4698@gmail.com)`, Google AI Studio Rate Limit Dashboard.
+*Audit Source:* Project `<project-id>` (`helloa`), Account: `<tài khoản Google>`, Google AI Studio Rate Limit Dashboard.
 
 ### 3.1 Live Active Model Matrix & Quotas
 | Model Display Name | API Model ID (`data-test-id`) | Category | RPM Limit | TPM Limit | RPD Limit | Recommended Role in Visor |

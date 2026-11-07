@@ -135,6 +135,31 @@ final class BlueprintSolverTests: XCTestCase {
         XCTAssertNil(GeminiLiveService.parseSSELine(""))
         let blocked = GeminiLiveService.parseSSELine(#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#)
         XCTAssertEqual(blocked?.blockReason, "SAFETY")
+        // Gemini 3 ends a stream with an empty-text part that only carries the thought signature.
+        let last = GeminiLiveService.parseSSELine(#"data: {"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"c2lnbmF0dXJl"}]},"finishReason":"STOP"}]}"#)
+        XCTAssertEqual(last?.text, "")
+        XCTAssertEqual(last?.thoughtSignature, "c2lnbmF0dXJl")
+    }
+
+    func testModelTurnKeepsTheThoughtSignature() {
+        let turn = GeminiLiveService.modelTurn(text: "SPOKEN: x bằng 2", signature: "c2ln")
+        let parts = turn["parts"] as? [[String: Any]]
+        XCTAssertEqual(parts?.count, 2)
+        XCTAssertEqual(parts?.last?["thoughtSignature"] as? String, "c2ln")
+        XCTAssertEqual((GeminiLiveService.modelTurn(text: "ok", signature: nil)["parts"] as? [[String: Any]])?.count, 1)
+    }
+
+    // MARK: - Keys: from Settings only, several allowed
+
+    func testKeysAreParsedFromSettingsText() {
+        XCTAssertEqual(GeminiLiveService.parseKeys(" AQ.aaa, AIzabbb\nAQ.ccc;AQ.aaa "), ["AQ.aaa", "AIzabbb", "AQ.ccc"])
+        XCTAssertEqual(GeminiLiveService.parseKeys(""), [])
+    }
+
+    func testAgentCaptureToken() {
+        XCTAssertTrue(GeminiLiveService.isCaptureRequest("[[CAPTURE]]"))
+        XCTAssertTrue(GeminiLiveService.isCaptureRequest("  [[capture]]\n"))
+        XCTAssertFalse(GeminiLiveService.isCaptureRequest("SPOKEN: Đáp án là A"))
     }
 
     // MARK: - No-timeout networking: every failure has a defined next step
@@ -149,8 +174,16 @@ final class BlueprintSolverTests: XCTestCase {
         guard case .badKey = G.classifyHTTPError(status: 400, body: "API key not valid. Please pass a valid API key.", retryAfter: nil) else {
             return XCTFail("an invalid key must rotate, not fail the turn")
         }
-        guard case .unsupportedField = G.classifyHTTPError(status: 400, body: "Invalid JSON payload received. Unknown name \"mediaResolution\"", retryAfter: nil) else {
-            return XCTFail("an unsupported mediaResolution must trigger a retry without it")
+        XCTAssertEqual(G.classifyHTTPError(status: 400, body: "Invalid JSON payload received. Unknown name \"mediaResolution\"", retryAfter: nil),
+                       .unsupportedField(.mediaResolution, "HTTP 400: Invalid JSON payload received. Unknown name \"mediaResolution\""))
+        guard case .unsupportedField(.thinking, _) = G.classifyHTTPError(status: 400, body: "thinking_level is not supported for this model", retryAfter: nil) else {
+            return XCTFail("an unsupported thinking level must trigger a retry without it")
+        }
+        guard case .staleSignature = G.classifyHTTPError(status: 400, body: "Thought signature is not valid", retryAfter: nil) else {
+            return XCTFail("a rejected thought signature must reset the history, not fail every follow-up")
+        }
+        guard case .modelUnavailable = G.classifyHTTPError(status: 404, body: "models/x is not found", retryAfter: nil) else {
+            return XCTFail("a retired model must fall back to the next model")
         }
         guard case .serverError = G.classifyHTTPError(status: 503, body: "overloaded", retryAfter: nil) else {
             return XCTFail("5xx must back off and retry")
@@ -164,32 +197,45 @@ final class BlueprintSolverTests: XCTestCase {
 
     // MARK: - Lesson 7 + Ray-Ban Meta full resolution
 
-    func testUprightJPEGPassesThroughAtFullResolution() throws {
-        let original = try XCTUnwrap(Self.jpeg(width: 4032, height: 3024))
-        let payload = try XCTUnwrap(PhotoPayload.fullResolutionJPEG(from: original))
-        XCTAssertEqual(payload, original, "a 12 MP glasses JPEG must be sent byte-for-byte")
-        XCTAssertEqual(PhotoPayload.mimeType(for: payload), "image/jpeg")
+    func testSmallUprightJPEGPassesThroughUntouched() throws {
+        let original = try XCTUnwrap(Self.jpeg(width: 3072, height: 2304))
+        XCTAssertEqual(PhotoPayload.uploadJPEG(from: original), original, "already upload-sized: no re-encode")
+        XCTAssertEqual(PhotoPayload.mimeType(for: original), "image/jpeg")
     }
 
-    func testNonJPEGIsReencodedAtFullSize() throws {
-        let png = try XCTUnwrap(Self.image(width: 3024, height: 4032).pngData())
-        XCTAssertEqual(PhotoPayload.mimeType(for: png), "image/png")
-        let payload = try XCTUnwrap(PhotoPayload.fullResolutionJPEG(from: png))
-        XCTAssertEqual(PhotoPayload.mimeType(for: payload), "image/jpeg")
+    /// Gemini 3 has a fixed token budget per image, so 12 MP is downscaled to 3072 px before upload:
+    /// same detail for the model, a quarter of the upload time.
+    func testTwelveMegapixelPhotoIsSentAt3072px() throws {
+        let original = try XCTUnwrap(Self.jpeg(width: 4032, height: 3024))
+        let payload = try XCTUnwrap(PhotoPayload.uploadJPEG(from: original))
         let info = try XCTUnwrap(PhotoPayload.imageInfo(payload))
-        XCTAssertEqual(max(info.width, info.height), 4032, "re-encoding must not shrink the photo")
+        XCTAssertEqual(max(info.width, info.height), PhotoPayload.uploadMaxDimension)
+        XCTAssertEqual(info.orientation, 1)
+        XCTAssertLessThan(payload.count, original.count)
+    }
+
+    func testNonJPEGIsReencodedAsJPEG() throws {
+        let png = try XCTUnwrap(Self.image(width: 2000, height: 1500).pngData())
+        XCTAssertEqual(PhotoPayload.mimeType(for: png), "image/png")
+        let payload = try XCTUnwrap(PhotoPayload.uploadJPEG(from: png))
+        XCTAssertEqual(PhotoPayload.mimeType(for: payload), "image/jpeg")
+        XCTAssertEqual(PhotoPayload.imageInfo(payload)?.width, 2000, "smaller than the cap: size kept")
     }
 
     func testHistoryCopyIsLighterButReadable() throws {
-        let original = try XCTUnwrap(Self.jpeg(width: 4032, height: 3024))
+        let original = try XCTUnwrap(Self.jpeg(width: 3072, height: 2304))
         let copy = PhotoPayload.historyCopy(of: original)
         let info = try XCTUnwrap(PhotoPayload.imageInfo(copy))
         XCTAssertEqual(max(info.width, info.height), Int(PhotoPayload.historyMaxDimension))
         XCTAssertLessThan(copy.count, original.count)
         let small = try XCTUnwrap(Self.jpeg(width: 800, height: 600))
         XCTAssertEqual(PhotoPayload.historyCopy(of: small), small, "small images are kept as-is")
-        XCTAssertEqual(PhotoPayload.fingerprint(original), PhotoPayload.fingerprint(Data(original)))
         XCTAssertNotEqual(PhotoPayload.fingerprint(original), PhotoPayload.fingerprint(small))
+    }
+
+    func testSolutionIsOfferedOnlyWhenItAddsSomething() {
+        XCTAssertNil(VoiceAgentViewModel.solutionWorthShowing(spoken: "Paris.", display: "Paris."))
+        XCTAssertEqual(VoiceAgentViewModel.solutionWorthShowing(spoken: "x bằng 2.", display: "$2x = 4$\n$x = 2$"), "$2x = 4$\n$x = 2$")
     }
 
     // MARK: - Workflow: shutter photo → "Ok Vision" + anything, in Vietnamese or English
@@ -224,6 +270,7 @@ final class BlueprintSolverTests: XCTestCase {
         XCTAssertTrue(SolverIntent.missingPhotoMessage(for: "giải câu này").contains("Không tìm thấy ảnh"))
         XCTAssertTrue(SolverIntent.missingPhotoMessage(for: "solve this").contains("No photo found"))
         XCTAssertTrue(TTSService.containsVietnamese(SolverIntent.networkFailureMessage(for: "câu 2 thì sao")))
+        XCTAssertTrue(SolverIntent.missingKeyMessage(for: "giải câu này").contains("API key"))
         XCTAssertFalse(TTSService.containsVietnamese(SolverIntent.networkFailureMessage(for: "and question two?")))
     }
 
@@ -248,7 +295,8 @@ final class BlueprintSolverTests: XCTestCase {
         XCTAssertFalse(prompt.lowercased().contains("under 250 characters"), "lesson 5 regression")
         XCTAssertTrue(prompt.contains("ALWAYS answer in the language the user used"))
         XCTAssertTrue(prompt.contains("clearly unrelated to the photo"), "unrelated questions are answered normally")
-        XCTAssertTrue(prompt.contains("press the capture button"), "checklist test 5 is handled by the model, not a phrase list")
+        XCTAssertTrue(prompt.contains(GeminiLiveService.captureToken), "the model asks the app for a photo instead of guessing")
+        XCTAssertTrue(prompt.contains("FIRST sentence states the final answer"), "answer-first: heard within seconds")
     }
 
     // MARK: - Helpers

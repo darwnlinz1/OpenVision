@@ -94,7 +94,7 @@ graph TD
   3. Khi ứng dụng chuyển sang Background, video codec thô sẽ tạm dừng theo thiết kế bảo mật của iOS/Meta. Do đó, tác vụ chụp ảnh phải được kích hoạt và hoàn tất khi ứng dụng ở Foreground hoặc thông qua Background Task có audio session hoạt động.
 - **Chính sách phân phối & Developer Mode:**
   - Kính Ray-Ban Meta Gen 2 phải được kích hoạt **Developer Mode** bên trong ứng dụng Meta View.
-  - Yêu cầu cấu hình Meta App ID (`306760944872162`) và Client Token (`AR|306760944872162|a919421a55a8ea18080ab2f10f57f1be`).
+  - Yêu cầu cấu hình Meta App ID (`306760944872162`) và Client Token (`AR|<META_APP_ID>|<CLIENT_TOKEN>`).
   - Gói ứng dụng triển khai cho mục đích cá nhân/nghiên cứu thông qua hình thức Sideloading (Ad-Hoc / Unsigned IPA cài đặt trực tiếp qua `pymobiledevice3`).
 
 ---

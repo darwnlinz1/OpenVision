@@ -1,9 +1,10 @@
 // OpenVision - GeminiLiveSmokeTests.swift
 // OPT-IN smoke test against the REAL Gemini API: checks that the live model honours the
 // contract the rest of the app depends on (dual-channel format, answer in the wearer's
-// language, photo used only when relevant). Skipped unless OPENVISION_LIVE_GEMINI=1 is set for
-// the test runner (CI: the "live Gemini" option of the E2E workflow; locally:
-// `TEST_RUNNER_OPENVISION_LIVE_GEMINI=1 scripts/e2e/run-simulator-tests.sh`).
+// language, photo used only when relevant). Skipped unless OPENVISION_LIVE_GEMINI=1 and
+// OPENVISION_GEMINI_API_KEYS (comma-separated) are set for the test runner. Keys are NEVER in the
+// source: CI passes the `GEMINI_API_KEYS` repository secret; locally:
+// `TEST_RUNNER_OPENVISION_LIVE_GEMINI=1 TEST_RUNNER_OPENVISION_GEMINI_API_KEYS=AQ.… make e2e-live`.
 // Assertions are deliberately loose: the model is not deterministic.
 
 import XCTest
@@ -18,14 +19,18 @@ final class GeminiLiveSmokeTests: XCTestCase {
     private var savedPartial: ((String) -> Void)?
 
     override func setUp() async throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["OPENVISION_LIVE_GEMINI"] == "1",
+        let env = ProcessInfo.processInfo.environment
+        try XCTSkipUnless(env["OPENVISION_LIVE_GEMINI"] == "1",
                           "live Gemini smoke test is opt-in (OPENVISION_LIVE_GEMINI=1)")
+        let keys = GeminiLiveService.parseKeys(env["OPENVISION_GEMINI_API_KEYS"] ?? "")
+        try XCTSkipIf(keys.isEmpty, "set OPENVISION_GEMINI_API_KEYS for the live smoke test")
         savedText = service.onTextReceived
         savedAgent = service.agentMessageCallback
         savedPartial = service.onPartialSpoken
         service.agentMessageCallback = nil
         service.onPartialSpoken = nil
         service.urlProtocolClasses = []
+        service.apiKeysOverride = keys
         service.clearConversationHistory()
         service.resetNetworkState()
     }
@@ -34,6 +39,7 @@ final class GeminiLiveSmokeTests: XCTestCase {
         service.onTextReceived = savedText
         service.agentMessageCallback = savedAgent
         service.onPartialSpoken = savedPartial
+        service.apiKeysOverride = nil
         service.clearConversationHistory()
     }
 

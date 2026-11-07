@@ -98,6 +98,14 @@ enum SolverIntent {
                 && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
     }
 
+    /// What the glasses say when no Gemini API key is set (keys are never compiled into the app).
+    @MainActor
+    static func missingKeyMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Chưa có API key Gemini. Bạn mở Cài đặt, chọn Gemini và dán key vào nhé."
+            : "There is no Gemini API key yet. Open Settings, Gemini, and paste your key."
+    }
+
     /// What the glasses say when the AI could not be reached even after retries.
     @MainActor
     static func networkFailureMessage(for prompt: String) -> String {
@@ -133,6 +141,10 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
     /// True when the user granted "Selected Photos" only: new glasses photos are then invisible
     /// to the app and the shutter workflow cannot work. Surfaced to the UI as a warning.
     @Published private(set) var isLimitedAccess = false
+    /// When the newest glasses photo was TAKEN (asset creation date) and a small preview, for the
+    /// "photo ready" indicator. Also shows on a real device how long Camera Roll import takes.
+    @Published private(set) var latestPhotoDate: Date?
+    @Published private(set) var latestThumbnail: UIImage?
 
     /// Full-resolution bytes of the newest asset we loaded, keyed by its local identifier.
     private var cache: (assetID: String, created: Date, data: Data)?
@@ -163,8 +175,8 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
         return status == .authorized || status == .limited
     }
 
-    /// The newest photo created within `seconds`, as full-resolution image bytes (see
-    /// `PhotoPayload.fullResolutionJPEG`), or nil when there is none / no permission.
+    /// The newest photo created within `seconds`, prepared for upload (see
+    /// `PhotoPayload.uploadJPEG`), or nil when there is none / no permission.
     func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = SolverIntent.recentPhotoWindow) async -> Data? {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard status == .authorized || status == .limited else {
@@ -198,10 +210,17 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
             NSLog("[RecentPhotoScanner] Could not load image data for newest asset")
             return nil
         }
-        NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
+        NSLog("[RecentPhotoScanner] Loaded photo (%ld bytes), taken %.1fs ago", data.count, Date().timeIntervalSince(newest.created))
         cache = (assetID: newest.id, created: newest.created, data: data)
         lastScannedPhotoData = data
         lastScannedTimestamp = Date()
+        latestPhotoDate = newest.created
+        let thumbnail = await Task.detached(priority: .utility) {
+            PhotoPayload.renderJPEG(from: data, maxPixelSize: 180, quality: 0.7)
+        }.value
+        if cache?.assetID == newest.id {
+            latestThumbnail = thumbnail.flatMap { UIImage(data: $0) }
+        }
         return data
     }
 
@@ -238,9 +257,8 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
         }
     }
 
-    /// The asset's ORIGINAL image at full sensor resolution (12 MP on Ray-Ban Meta Gen 2).
-    /// JPEG originals pass through byte-for-byte; HEIC/other formats are re-encoded once to a
-    /// high-quality JPEG at full size, so every backend can read it.
+    /// The asset's original image (12 MP on Ray-Ban Meta Gen 2), prepared for upload once, in the
+    /// background: upright, long edge <= 3072 px (see `PhotoPayload`).
     private nonisolated static func loadFullResolution(assetID: String) async -> Data? {
         await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -260,7 +278,7 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
                 PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
                     box.value = data
                 }
-                continuation.resume(returning: box.value.flatMap { PhotoPayload.fullResolutionJPEG(from: $0) })
+                continuation.resume(returning: box.value.flatMap { PhotoPayload.uploadJPEG(from: $0) })
             }
         }
     }
@@ -273,16 +291,20 @@ private final class DataBox: @unchecked Sendable {
 
 // MARK: - Photo payload (pure, unit-testable)
 
-/// Image bytes sent to the AI. Keeps the glasses' full resolution while staying inside what a
-/// mobile upload can carry without timing out.
+/// Image bytes sent to the AI.
+///
+/// Gemini 3 gives each image a FIXED token budget (HIGH ~1120, ULTRA_HIGH ~2240 tokens) whatever
+/// its pixel count, so a 12 MP upload carries no more detail than ~3000 px — it only costs
+/// 4-5x the bytes (seconds on mobile uplink). Detail is requested with media resolution instead
+/// (GeminiLiveService), and the photo is sent upright, long edge <= `uploadMaxDimension`.
 enum PhotoPayload {
-    /// Above this the original is re-encoded (same pixel size, lower JPEG quality). 12 MP JPEGs
-    /// from Ray-Ban Meta are normally 2-5 MB, so they pass through untouched.
-    static let maxUploadBytes = 7 * 1024 * 1024
+    /// Long edge of the uploaded photo.
+    static let uploadMaxDimension = 3072
+    static let uploadQuality: CGFloat = 0.85
 
-    /// Longest edge of the copy kept in conversation history: follow-up questions re-send the
-    /// whole history, so they carry this lighter copy instead of the 12 MP original.
-    static let historyMaxDimension: CGFloat = 2048
+    /// Long edge of the copy kept in conversation history: follow-up questions re-send the
+    /// whole history, so they carry this lighter copy.
+    static let historyMaxDimension: CGFloat = 1536
 
     static func isJPEG(_ data: Data) -> Bool {
         let bytes = [UInt8](data.prefix(3))
@@ -313,25 +335,23 @@ enum PhotoPayload {
         return (width, height, orientation)
     }
 
-    /// Full-resolution JPEG for upload. An upright JPEG original passes through byte-for-byte
-    /// (no generation loss, no CPU). Anything else (HEIC, rotated-by-EXIF, oversized) is decoded
-    /// ONCE at full size with the rotation applied — the model may ignore EXIF orientation.
-    static func fullResolutionJPEG(from original: Data) -> Data? {
+    /// Upload JPEG: an upright JPEG already within `uploadMaxDimension` passes through
+    /// byte-for-byte; anything else (12 MP originals, HEIC, EXIF-rotated) is decoded once with
+    /// the rotation applied — the model may ignore EXIF orientation — and re-encoded.
+    static func uploadJPEG(from original: Data) -> Data? {
         guard let info = imageInfo(original) else { return nil }
-        if isJPEG(original), info.orientation == 1, original.count <= maxUploadBytes { return original }
-        let longest = max(info.width, info.height)
-        for quality in [0.92, 0.85, 0.75, 0.6] as [CGFloat] {
-            guard let jpeg = renderJPEG(from: original, maxPixelSize: longest, quality: quality) else { return nil }
-            if jpeg.count <= maxUploadBytes || quality == 0.6 { return jpeg }
+        if isJPEG(original), info.orientation == 1, max(info.width, info.height) <= uploadMaxDimension {
+            return original
         }
-        return nil
+        let target = min(max(info.width, info.height), uploadMaxDimension)
+        return renderJPEG(from: original, maxPixelSize: target, quality: uploadQuality)
     }
 
-    /// Lighter copy for conversation history (longest edge `historyMaxDimension`, JPEG 0.85).
+    /// Lighter copy for conversation history (longest edge `historyMaxDimension`, JPEG 0.8).
     /// Returns the input unchanged if it is already that small or cannot be decoded.
     static func historyCopy(of data: Data) -> Data {
         guard let info = imageInfo(data), max(info.width, info.height) > Int(historyMaxDimension) else { return data }
-        return renderJPEG(from: data, maxPixelSize: Int(historyMaxDimension), quality: 0.85) ?? data
+        return renderJPEG(from: data, maxPixelSize: Int(historyMaxDimension), quality: 0.8) ?? data
     }
 
     /// Decode (EXIF rotation applied, longest edge `maxPixelSize`) and encode as JPEG with ImageIO —
@@ -399,6 +419,9 @@ final class VoiceAgentViewModel: ObservableObject {
     @Published var recordingStatus: String?
     /// Active pre-captured photo context (60s TTL, Capture First, Ask Later)
     @Published var activePhotoContext: CapturedPhotoContext?
+    /// The DISPLAY channel of the latest answer (Markdown + LaTeX), rendered by SolutionSheet.
+    /// The transcript bubble shows the SPOKEN text; this is the step-by-step derivation.
+    @Published var latestSolution: String?
 
     // MARK: - Internal state
 
@@ -449,13 +472,13 @@ final class VoiceAgentViewModel: ObservableObject {
 
         var displayText: String {
             switch self {
-            case .idle: return "Tap to start"
-            case .connecting: return "Connecting..."
-            case .listening: return "Listening..."
-            case .thinking: return "Thinking..."
-            case .speaking: return "Speaking..."
-            case .toolRunning: return "Running tool..."
-            case .liveVideo: return "Live Video"
+            case .idle: return "Chạm để bắt đầu"
+            case .connecting: return "Đang kết nối…"
+            case .listening: return "Đang nghe…"
+            case .thinking: return "Đang suy nghĩ…"
+            case .speaking: return "Đang trả lời…"
+            case .toolRunning: return "Đang chạy công cụ…"
+            case .liveVideo: return "Video trực tiếp"
             }
         }
 
@@ -996,6 +1019,7 @@ final class VoiceAgentViewModel: ObservableObject {
             }
 
             self.userTranscript = command
+            self.latestSolution = nil
             // Suspend ambient narration for the WHOLE turn (through reply playback).
             self.commandTurnActive = true
             // And CANCEL any in-flight ambient inference right now — describeFrame checks
@@ -1129,7 +1153,8 @@ final class VoiceAgentViewModel: ObservableObject {
 
                 // Parse dual-channel format (SPOKEN: and DISPLAY:)
                 let (spoken, display) = self.parseDualChannelResponse(message)
-                self.aiTranscript = display
+                self.aiTranscript = spoken.isEmpty ? display : spoken
+                self.latestSolution = Self.solutionWorthShowing(spoken: spoken, display: display)
 
                 // Reply text is final. For non-streaming backends this is also the first output
                 // we ever saw, and markFirstToken is first-wins, so it stays accurate either way.
@@ -1177,6 +1202,12 @@ final class VoiceAgentViewModel: ObservableObject {
                     }
                 }
             }
+        }
+
+        // Agent loop: Gemini asked to SEE and no photo was in the conversation — take one.
+        GeminiLiveService.shared.onCaptureRequested = { [weak self] (_: String) async -> Data? in
+            guard let self else { return nil }
+            return await self.captureForAgent()
         }
 
         // Gemini streams its reply: start speaking the SPOKEN channel at the first finished sentence
@@ -1249,7 +1280,8 @@ final class VoiceAgentViewModel: ObservableObject {
             // If Gemini is active backend, replies are already delivered through backend.onAgentMessage
             guard self.settingsManager.settings.aiBackend != .geminiLive else { return }
             let (spoken, display) = self.parseDualChannelResponse(text)
-            self.aiTranscript = display
+            self.aiTranscript = spoken.isEmpty ? display : spoken
+            self.latestSolution = Self.solutionWorthShowing(spoken: spoken, display: display)
             if !spoken.isEmpty && !self.ttsService.isSpeaking {
                 self.speakResponse(spoken, historyText: display)
             }
@@ -1267,6 +1299,14 @@ final class VoiceAgentViewModel: ObservableObject {
             // History: persist this Gemini Live exchange (transcript only, no frames).
             self.recordLiveTurn()
         }
+    }
+
+    /// The DISPLAY text when it adds something to what was spoken (a derivation, formulas, a
+    /// table) — nil for a plain one-liner, so the phone doesn't offer an empty "solution".
+    static func solutionWorthShowing(spoken: String, display: String) -> String? {
+        let trimmed = display.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != spoken.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return trimmed
     }
 
     /// Parse Gemini Solver Dual-Channel Response (SPOKEN: and DISPLAY:)
@@ -1464,6 +1504,10 @@ final class VoiceAgentViewModel: ObservableObject {
         print("[VoiceAgent] Send failed \(context): \(error)")
         errorMessage = "Failed to send command\(context.isEmpty ? "" : " " + context): \(error.localizedDescription)"
         if isSessionActive, !ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking {
+            if case AIBackendError.notConfigured = error {
+                speakResponse(SolverIntent.missingKeyMessage(for: command))
+                return
+            }
             speakResponse(SolverIntent.networkFailureMessage(for: command))
         } else {
             agentState = isSessionActive ? .listening : .idle
@@ -2470,6 +2514,35 @@ final class VoiceAgentViewModel: ObservableObject {
         }
         NSLog("[OV] freshLiveFrame: STILL no frame after restart")
         return nil
+    }
+
+    /// The model needs to see and no photo is in the conversation: try, in order, the glasses camera
+    /// (DAT SDK, if registered) and a photo that reached Camera Roll meanwhile. The new photo also
+    /// becomes the context for follow-up questions.
+    private func captureForAgent() async -> Data? {
+        HapticFeedback.light()
+        var data: Data?
+        if glassesManager.isRegistered {
+            let startedStreaming = !glassesManager.isStreaming
+            if startedStreaming { await glassesManager.startStreaming() }
+            data = await capturePhotoFromGlasses()
+            if data == nil { data = await freshLiveFrame() }
+            if startedStreaming && glassesManager.isStreaming && !isLiveVideoMode {
+                await glassesManager.stopStreaming()
+            }
+        }
+        if data == nil {
+            data = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
+        }
+        if let data {
+            activePhotoContext = CapturedPhotoContext(data: data)
+            HapticFeedback.success()
+            NSLog("[OV] Agent capture: got photo (%ld bytes)", data.count)
+        } else {
+            HapticFeedback.error()
+            NSLog("[OV] Agent capture: no photo available")
+        }
+        return data
     }
 
     /// Manually trigger a photo capture from glasses to cache in activePhotoContext (Capture First, Ask Later)

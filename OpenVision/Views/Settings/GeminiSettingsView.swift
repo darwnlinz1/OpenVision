@@ -21,33 +21,28 @@ struct GeminiSettingsView: View {
             // API Key
             Section {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("API Key")
+                    Text("API key")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    SecureField("Your Gemini API key", text: $apiKey)
+                    SecureField("AQ.… hoặc AIza…  (nhiều key: cách nhau bằng dấu phẩy)", text: $apiKey)
                         .autocapitalization(.none)
                         .autocorrectionDisabled()
                 }
             } header: {
-                Text("Authentication")
+                Text("Xác thực")
             } footer: {
-                if apiKey.isEmpty {
+                let count = GeminiLiveService.parseKeys(apiKey).count
+                VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Built-in API Key Pool active (6 verified keys)")
-                            .foregroundColor(.green)
+                        Image(systemName: count > 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundColor(count > 0 ? Theme.success : Theme.warning)
+                        Text(count > 0 ? "\(count) key — lưu trong Keychain của máy, không nằm trong mã nguồn" : "Chưa có key: app không thể gọi Gemini")
+                            .foregroundColor(count > 0 ? Theme.success : Theme.warning)
                     }
-                    .font(.caption)
-                } else {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Custom API key configured (overrides pool)")
-                            .foregroundColor(.green)
-                    }
-                    .font(.caption)
+                    Text("Quota tính theo PROJECT và theo model, không theo key: chỉ thêm key từ các project Google Cloud khác nhau mới tăng quota. Khi model chính hết quota, app tự chuyển sang \(GeminiLiveService.modelChain.dropFirst().joined(separator: ", ")).")
+                        .foregroundColor(.secondary)
                 }
+                .font(.caption)
             }
 
             // Video Settings
@@ -134,7 +129,8 @@ struct GeminiSettingsView: View {
     // MARK: - Methods
 
     private func saveSettings() {
-        settingsManager.settings.geminiAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Normalised to "key1, key2" — GeminiLiveService.parseKeys reads any separator.
+        settingsManager.settings.geminiAPIKey = GeminiLiveService.parseKeys(apiKey).joined(separator: ", ")
         settingsManager.settings.geminiVideoFPS = videoFPS
         settingsManager.saveNow()
     }

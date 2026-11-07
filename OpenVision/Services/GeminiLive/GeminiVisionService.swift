@@ -40,8 +40,9 @@ final class GeminiVisionService: ObservableObject {
 
     // MARK: - Configuration
 
+    /// First key from Settings (the field may hold several, comma-separated).
     private var apiKey: String {
-        SettingsManager.shared.settings.geminiAPIKey
+        GeminiLiveService.parseKeys(SettingsManager.shared.settings.geminiAPIKey).first ?? ""
     }
 
     // MARK: - WebSocket

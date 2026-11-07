@@ -57,6 +57,11 @@ targets:
       - path: OpenVision/Resources
         excludes:
           - "**/*.plist"
+          - "SolutionRenderer/**"
+      # Offline KaTeX + marked for the DISPLAY channel. A FOLDER reference keeps fonts/ next to
+      # katex.min.css (a flattened copy would break the relative font URLs).
+      - path: OpenVision/Resources/SolutionRenderer
+        type: folder
     settings:
       base:
         INFOPLIST_FILE: OpenVision/Resources/Info.plist

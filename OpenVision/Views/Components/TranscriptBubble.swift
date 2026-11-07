@@ -46,7 +46,7 @@ struct TranscriptBubble: View {
             if isUser { Spacer(minLength: 48) }
 
             VStack(alignment: isUser ? .trailing : .leading, spacing: 5) {
-                Text(isUser ? "You" : "Vision")
+                Text(isUser ? "Bạn" : "Vision")
                     .font(.caption2)
                     .fontWeight(.semibold)
                     .foregroundColor(isUser ? Theme.accent.opacity(0.9) : Theme.heading.opacity(0.85))

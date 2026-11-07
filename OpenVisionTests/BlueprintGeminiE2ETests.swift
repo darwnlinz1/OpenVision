@@ -19,6 +19,7 @@ final class BlueprintGeminiE2ETests: XCTestCase {
     private var savedAgent: ((String) -> Void)?
     private var savedOutput: ((String) -> Void)?
     private var savedProcessing: ((Bool) -> Void)?
+    private var savedCapture: ((String) async -> Data?)?
 
     private let answer = "SPOKEN:\nPhương trình 2x cộng 3 bằng 7, chuyển vế được 2x bằng 4 nên x bằng 2. Lời giải chi tiết ở trên điện thoại.\n\nDISPLAY:\nTa có $2x + 3 = 7$\n$$2x = 4 \\Rightarrow x = 2$$\nĐáp án: $x = 2$"
 
@@ -28,6 +29,9 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         savedAgent = service.agentMessageCallback
         savedOutput = service.onOutputTranscription
         savedProcessing = service.processingChangedCallback
+        savedCapture = service.onCaptureRequested
+        service.onCaptureRequested = nil
+        service.apiKeysOverride = ["AQ.test-key-A", "AQ.test-key-B", "AQ.test-key-C"]
         service.onTextReceived = nil
         service.onPartialSpoken = nil
         service.agentMessageCallback = nil
@@ -41,6 +45,8 @@ final class BlueprintGeminiE2ETests: XCTestCase {
 
     override func tearDown() async throws {
         service.urlProtocolClasses = []
+        service.apiKeysOverride = nil
+        service.onCaptureRequested = savedCapture
         service.clearConversationHistory()
         service.resetNetworkState()
         service.onTextReceived = savedText
@@ -53,7 +59,7 @@ final class BlueprintGeminiE2ETests: XCTestCase {
 
     // MARK: - Checklist test 1: shutter photo + question → full-resolution photo reaches Gemini
 
-    func testShutterPhotoQuestionSendsTheFullResolutionPhotoAndStreamsTheSpokenAnswer() async throws {
+    func testShutterPhotoQuestionSendsAnUprightPhotoAtUltraHighDetailAndStreamsTheSpokenAnswer() async throws {
         let photo = try XCTUnwrap(BlueprintSolverTests.jpeg(width: 4032, height: 3024))
         GeminiStub.enqueue(.stream(answer))
 
@@ -66,14 +72,21 @@ final class BlueprintGeminiE2ETests: XCTestCase {
 
         let request = try XCTUnwrap(GeminiStub.captured.first)
         XCTAssertEqual(GeminiStub.captured.count, 1)
-        XCTAssertTrue(request.url.path.hasSuffix(":streamGenerateContent"), request.url.absoluteString)
+        XCTAssertTrue(request.url.path.hasSuffix("/gemini-3.5-flash-lite:streamGenerateContent"), request.url.absoluteString)
         XCTAssertEqual(request.query("alt"), "sse")
+        XCTAssertNil(request.query("key"), "the API key must not be in the URL")
+        XCTAssertEqual(request.apiKey, "AQ.test-key-A")
 
         let turn = try XCTUnwrap(request.contents.last)
-        XCTAssertEqual(turn.imageData, photo, "the 12 MP photo must arrive byte-for-byte")
+        let sent = try XCTUnwrap(turn.imageData)
+        let info = try XCTUnwrap(PhotoPayload.imageInfo(sent))
+        XCTAssertEqual(max(info.width, info.height), PhotoPayload.uploadMaxDimension, "12 MP is sent at 3072 px")
+        XCTAssertEqual(info.orientation, 1)
         XCTAssertEqual(turn.imageMIMEType, "image/jpeg")
+        XCTAssertEqual(turn.mediaResolution, "MEDIA_RESOLUTION_ULTRA_HIGH", "detail requested on the image itself")
         XCTAssertEqual(turn.text, "giải câu này", "the wearer's words go through verbatim")
-        XCTAssertEqual(request.generationConfig["mediaResolution"] as? String, "MEDIA_RESOLUTION_HIGH")
+        XCTAssertNil(request.generationConfig["mediaResolution"])
+        XCTAssertEqual((request.generationConfig["thinkingConfig"] as? [String: Any])?["thinkingLevel"] as? String, "LOW")
         XCTAssertEqual(request.generationConfig["maxOutputTokens"] as? Int, 8192)
         XCTAssertTrue(request.systemPrompt.contains("DISPLAY:"))
 
@@ -92,7 +105,7 @@ final class BlueprintGeminiE2ETests: XCTestCase {
 
     func testFollowUpOnTheSamePhotoKeepsContextWithoutReuploading() async throws {
         let photo = try XCTUnwrap(BlueprintSolverTests.jpeg(width: 4032, height: 3024))
-        GeminiStub.enqueue(.stream(answer))
+        GeminiStub.enqueue(.stream(answer, signature: "c2lnLTE="))
         GeminiStub.enqueue(.stream("SPOKEN: Vì ta chuyển 3 sang vế phải rồi chia hai vế cho 2.\nDISPLAY: $2x = 4$"))
 
         try await service.sendRESTMessage("giải câu này", imageData: photo)
@@ -106,6 +119,7 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         let info = try XCTUnwrap(PhotoPayload.imageInfo(historyPhoto))
         XCTAssertEqual(max(info.width, info.height), Int(PhotoPayload.historyMaxDimension))
         XCTAssertEqual(followUp.contents[1].role, "model")
+        XCTAssertEqual(followUp.contents[1].thoughtSignature, "c2lnLTE=", "Gemini 3 thought signatures go back with the history")
     }
 
     func testANewPhotoIsUploadedAgain() async throws {
@@ -115,7 +129,8 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         GeminiStub.enqueue(.stream(answer))
         try await service.sendRESTMessage("giải câu này", imageData: first)
         try await service.sendRESTMessage("còn câu này?", imageData: second)
-        XCTAssertEqual(GeminiStub.captured.last?.contents.last?.imageData, second)
+        let sent = try XCTUnwrap(GeminiStub.captured.last?.contents.last?.imageData)
+        XCTAssertEqual(PhotoPayload.imageInfo(sent)?.height, PhotoPayload.uploadMaxDimension, "the second (portrait) photo was uploaded")
     }
 
     // MARK: - Free-form, bilingual, unrelated questions answered normally
@@ -147,7 +162,26 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         GeminiStub.enqueue(.stream(answer))
         try await service.sendRESTMessage("giải câu này", imageData: nil)
         XCTAssertEqual(GeminiStub.captured.count, 2)
-        XCTAssertNotEqual(GeminiStub.captured[0].query("key"), GeminiStub.captured[1].query("key"))
+        XCTAssertNotEqual(GeminiStub.captured[0].apiKey, GeminiStub.captured[1].apiKey)
+    }
+
+    /// Quota is per project AND per model: when the primary model is exhausted on every key, the
+    /// fallback model still has its own quota.
+    func testWhenEveryKeyIsExhaustedTheFallbackModelAnswers() async throws {
+        for _ in 0..<3 {
+            GeminiStub.enqueue(.status(429, body: #"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#))
+        }
+        GeminiStub.enqueue(.stream(answer))
+        try await service.sendRESTMessage("giải câu này", imageData: nil)
+        XCTAssertEqual(GeminiStub.captured.count, 4)
+        XCTAssertTrue(GeminiStub.captured[3].url.path.contains("/\(GeminiLiveService.modelChain[1]):"), GeminiStub.captured[3].url.path)
+    }
+
+    func testRetiredModelFallsBackInsteadOfFailing() async throws {
+        GeminiStub.enqueue(.status(404, body: #"{"error":{"code":404,"message":"models/gemini-3.5-flash-lite is not found"}}"#))
+        GeminiStub.enqueue(.stream(answer))
+        try await service.sendRESTMessage("giải câu này", imageData: nil)
+        XCTAssertTrue(GeminiStub.captured[1].url.path.contains("/\(GeminiLiveService.modelChain[1]):"))
     }
 
     func testRevokedKeyIsSkippedInsteadOfFailingTheTurn() async throws {
@@ -156,16 +190,80 @@ final class BlueprintGeminiE2ETests: XCTestCase {
         GeminiStub.enqueue(.stream(answer))
         try await service.sendRESTMessage("giải câu này", imageData: nil)
         XCTAssertEqual(GeminiStub.captured.count, 3)
-        XCTAssertEqual(Set(GeminiStub.captured.map { $0.query("key") }).count, 3, "each retry uses a different key")
+        XCTAssertEqual(Set(GeminiStub.captured.map { $0.apiKey }).count, 3, "each retry uses a different key")
     }
 
-    func testUnsupportedMediaResolutionIsDroppedAndRetried() async throws {
-        GeminiStub.enqueue(.status(400, body: #"{"error":{"message":"Invalid JSON payload received. Unknown name \"mediaResolution\""}}"#))
+    /// ULTRA_HIGH on the image → HIGH in generationConfig → nothing: each rejection steps down.
+    func testUnsupportedMediaResolutionStepsDownAndRetries() async throws {
+        let photo = try XCTUnwrap(BlueprintSolverTests.jpeg(width: 2048, height: 1536))
+        let rejected = #"{"error":{"message":"Invalid JSON payload received. Unknown name \"mediaResolution\""}}"#
+        GeminiStub.enqueue(.status(400, body: rejected))
+        GeminiStub.enqueue(.status(400, body: rejected))
+        GeminiStub.enqueue(.stream(answer))
+        try await service.sendRESTMessage("giải câu này", imageData: photo)
+        XCTAssertEqual(GeminiStub.captured.count, 3)
+        XCTAssertEqual(GeminiStub.captured[0].contents.last?.mediaResolution, "MEDIA_RESOLUTION_ULTRA_HIGH")
+        XCTAssertNil(GeminiStub.captured[1].contents.last?.mediaResolution)
+        XCTAssertEqual(GeminiStub.captured[1].generationConfig["mediaResolution"] as? String, "MEDIA_RESOLUTION_HIGH")
+        XCTAssertNil(GeminiStub.captured[2].generationConfig["mediaResolution"])
+        XCTAssertNil(GeminiStub.captured[2].contents.last?.mediaResolution)
+    }
+
+    func testUnsupportedThinkingLevelIsDroppedAndRetried() async throws {
+        GeminiStub.enqueue(.status(400, body: #"{"error":{"message":"thinking_level is not supported for this model"}}"#))
         GeminiStub.enqueue(.stream(answer))
         try await service.sendRESTMessage("giải câu này", imageData: nil)
+        XCTAssertNotNil(GeminiStub.captured[0].generationConfig["thinkingConfig"])
+        XCTAssertNil(GeminiStub.captured[1].generationConfig["thinkingConfig"])
+    }
+
+    // MARK: - Agent loop: the model asks to see, the app takes the photo
+
+    func testModelAsksToSeeAndTheAppCapturesThenAsksAgain() async throws {
+        let photo = try XCTUnwrap(BlueprintSolverTests.jpeg(width: 2048, height: 1536))
+        GeminiStub.enqueue(.stream("[[CAPTURE]]"))
+        GeminiStub.enqueue(.stream(answer))
+        var captures = 0
+        service.onCaptureRequested = { _ in
+            captures += 1
+            return photo
+        }
+        var partials: [String] = []
+        var finalText: String?
+        service.onPartialSpoken = { partials.append($0) }
+        service.onTextReceived = { finalText = $0 }
+
+        try await service.sendRESTMessage("câu 3 chọn gì", imageData: nil)
+
+        XCTAssertEqual(captures, 1)
         XCTAssertEqual(GeminiStub.captured.count, 2)
-        XCTAssertNotNil(GeminiStub.captured[0].generationConfig["mediaResolution"])
-        XCTAssertNil(GeminiStub.captured[1].generationConfig["mediaResolution"])
+        XCTAssertNil(GeminiStub.captured[0].contents.last?.imageData)
+        XCTAssertNotNil(GeminiStub.captured[1].contents.last?.imageData, "the question is asked again with the photo")
+        XCTAssertEqual(GeminiStub.captured[1].contents.last?.text, "câu 3 chọn gì")
+        XCTAssertEqual(finalText, answer)
+        XCTAssertFalse(partials.contains { $0.contains("CAPTURE") }, "the protocol token is never spoken")
+        XCTAssertEqual(service.conversationHistoryCount, 2, "only the real exchange is remembered")
+    }
+
+    func testWhenNoPhotoCanBeTakenTheGlassesSaySo() async throws {
+        GeminiStub.enqueue(.stream("[[CAPTURE]]"))
+        service.onCaptureRequested = { _ in nil }
+        var finalText: String?
+        service.onTextReceived = { finalText = $0 }
+        try await service.sendRESTMessage("giải câu này", imageData: nil)
+        let spoken = GeminiLiveService.parseDualChannel(try XCTUnwrap(finalText)).spoken
+        XCTAssertEqual(spoken, SolverIntent.missingPhotoMessage(for: "giải câu này"))
+        XCTAssertEqual(GeminiStub.captured.count, 1)
+    }
+
+    func testRejectedThoughtSignatureResetsTheHistoryOnce() async throws {
+        GeminiStub.enqueue(.stream(answer, signature: "b2xk"))
+        GeminiStub.enqueue(.status(400, body: #"{"error":{"message":"Thought signature is not valid"}}"#))
+        GeminiStub.enqueue(.stream(answer))
+        try await service.sendRESTMessage("giải câu này", imageData: nil)
+        try await service.sendRESTMessage("tại sao?", imageData: nil)
+        XCTAssertEqual(GeminiStub.captured.count, 3)
+        XCTAssertEqual(GeminiStub.captured[2].contents.count, 1, "retried with a fresh conversation")
     }
 
     func testServerOverloadBacksOffAndRetries() async throws {
@@ -252,8 +350,15 @@ final class GeminiStub: URLProtocol {
         var chunks: [String]
         var dropAtEnd: Bool
 
-        static func stream(_ text: String, dropAtEnd: Bool = false) -> Reply {
-            Reply(status: 200, body: "", chunks: GeminiStub.sseChunks(text), dropAtEnd: dropAtEnd)
+        static func stream(_ text: String, dropAtEnd: Bool = false, signature: String? = nil) -> Reply {
+            var chunks = GeminiStub.sseChunks(text)
+            if let signature {
+                // Like Gemini 3: a final chunk with an empty-text part carrying only the signature.
+                let event: [String: Any] = ["candidates": [["content": ["role": "model", "parts": [["text": "", "thoughtSignature": signature]]], "finishReason": "STOP"]]]
+                let json = (try? JSONSerialization.data(withJSONObject: event)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                chunks.append("data: \(json)\r\n\r\n")
+            }
+            return Reply(status: 200, body: "", chunks: chunks, dropAtEnd: dropAtEnd)
         }
 
         static func status(_ code: Int, body: String) -> Reply {
@@ -266,10 +371,13 @@ final class GeminiStub: URLProtocol {
         let text: String?
         let imageData: Data?
         let imageMIMEType: String?
+        let mediaResolution: String?
+        let thoughtSignature: String?
     }
 
     struct Captured {
         let url: URL
+        let apiKey: String?
         let json: [String: Any]
 
         func query(_ name: String) -> String? {
@@ -286,11 +394,14 @@ final class GeminiStub: URLProtocol {
         var contents: [Turn] {
             (json["contents"] as? [[String: Any]] ?? []).map { turn in
                 let parts = turn["parts"] as? [[String: Any]] ?? []
-                let inline = parts.compactMap { $0["inlineData"] as? [String: Any] }.first
+                let imagePart = parts.first { $0["inlineData"] != nil }
+                let inline = imagePart?["inlineData"] as? [String: Any]
                 return Turn(role: turn["role"] as? String ?? "",
                             text: parts.compactMap { $0["text"] as? String }.first,
                             imageData: (inline?["data"] as? String).flatMap { Data(base64Encoded: $0) },
-                            imageMIMEType: inline?["mimeType"] as? String)
+                            imageMIMEType: inline?["mimeType"] as? String,
+                            mediaResolution: (imagePart?["mediaResolution"] as? [String: Any])?["level"] as? String,
+                            thoughtSignature: parts.compactMap { $0["thoughtSignature"] as? String }.first)
             }
         }
     }
@@ -336,7 +447,7 @@ final class GeminiStub: URLProtocol {
         let body = Self.readBody(request)
         let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
         let reply: Reply = Self.lock.withLock {
-            Self.log.append(Captured(url: url, json: json))
+            Self.log.append(Captured(url: url, apiKey: request.value(forHTTPHeaderField: "x-goog-api-key"), json: json))
             return Self.replies.isEmpty ? .status(500, body: "no scripted reply") : Self.replies.removeFirst()
         }
         let contentType = reply.status == 200 ? "text/event-stream" : "application/json"

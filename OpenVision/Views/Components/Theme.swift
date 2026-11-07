@@ -67,6 +67,17 @@ enum Theme {
         )
     }
 
+    // MARK: - Semantic status colors (use these instead of .green / .red / .orange literals)
+
+    /// Ready / connected / photo available.
+    static let success = accent
+    /// Recording, live camera, destructive.
+    static let danger = Color(red: 0.96, green: 0.30, blue: 0.30)
+    /// Recoverable problems (permissions, network).
+    static let warning = Color(red: 1.0, green: 0.70, blue: 0.25)
+    /// Inactive / not connected.
+    static let inactive = Color.white.opacity(0.4)
+
     // MARK: - Surfaces
 
     /// Frosted card fill.
