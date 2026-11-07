@@ -122,10 +122,10 @@ enum Constants {
 
     enum Camera {
         /// Maximum photo dimension for compression
-        static let maxPhotoDimension: CGFloat = 512
+        static let maxPhotoDimension: CGFloat = 2048
 
         /// JPEG compression quality for photos
-        static let photoJPEGQuality: CGFloat = 0.5
+        static let photoJPEGQuality: CGFloat = 0.88
 
         /// Photo capture timeout (seconds)
         static let captureTimeout: TimeInterval = 10.0
