@@ -1,8 +1,7 @@
 // OpenVision - GeminiLiveService.swift
 // REST-based Gemini solver: streaming, resilient, agentic (asks for a photo when it needs one).
 //
-// Design notes (see docs/architecture/ADR-001-solver-pipeline.md and
-// docs/research/Nghiên cứu nâng cấp kính Gemini.md):
+// Design notes (see docs/architecture/ADR-001-solver-pipeline.md):
 // - API keys come ONLY from Settings (Keychain); several keys may be entered. Rate limits are per
 //   Google Cloud PROJECT and per MODEL, so keys should come from different projects, and the model
 //   chain gives a second quota when the first model is exhausted.

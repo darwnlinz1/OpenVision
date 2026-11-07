@@ -52,7 +52,10 @@ final class AudioSessionManager {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAudioRouteChange(notification)
+            // Delivered on the main queue (queue: .main), so the main actor is already ours.
+            MainActor.assumeIsolated {
+                self?.handleAudioRouteChange(notification)
+            }
         }
     }
 

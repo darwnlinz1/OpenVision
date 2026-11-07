@@ -162,7 +162,7 @@ final class SettingsManager: ObservableObject {
             let seconds = self?.debounceInterval ?? 0.5
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            await self?.performSave()
+            self?.performSave()
             self?.onSettingsChanged?(self?.settings ?? AppSettings())
         }
     }

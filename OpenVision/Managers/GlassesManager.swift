@@ -479,7 +479,7 @@ final class GlassesManager: ObservableObject {
         pendingPhotoID = captureID
         let data: Data? = await withCheckedContinuation { continuation in
             pendingPhoto = continuation
-            _ = cam.photo.capturePhoto(resolution: fullResolution ? .full : .large, quality: .high)
+            cam.photo.capturePhoto(resolution: fullResolution ? .full : .large, quality: .high)
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 guard let self, self.pendingPhotoID == captureID else { return }
