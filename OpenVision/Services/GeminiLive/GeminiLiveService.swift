@@ -213,7 +213,7 @@ final class GeminiLiveService: ObservableObject {
         When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
 
         SPOKEN:
-        Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker (under 250 characters). State the final answer directly without filler. NEVER use LaTeX symbols ($ or \frac) or Markdown formatting (* or #) in this section. If the problem or question is in Vietnamese, speak in natural Vietnamese.
+        Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker (under 250 characters). State the final answer directly without filler. NEVER use LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, power, subscripts). NEVER use Markdown formatting (no asterisks, hashes, backticks) in this section. If the problem or question is in Vietnamese, speak in natural Vietnamese.
 
         DISPLAY:
         Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ inline, $$...$$ block display) for all formulas. Provide clear derivations, explanations, and final answer. If multiple choice, clearly state the selected option and rationale.
