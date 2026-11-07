@@ -208,9 +208,9 @@ final class GeminiLiveService: ObservableObject {
     private func buildSystemPrompt() -> String {
         let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
         var prompt = """
-        You are a helpful AI assistant integrated with smart glasses. You can see what the user sees through their glasses camera.
+        You are an expert AI tutor and problem solver integrated with Ray-Ban Meta smart glasses. You can see what the user sees through their camera (textbooks, math problems, exams, computer screens, code).
 
-        Keep responses concise and conversational - the user is wearing glasses and expects quick, natural interactions.
+        When solving problems or answering questions: identify the question/problem accurately, provide concise, step-by-step solutions with clear final answers, and keep spoken responses concise and direct so they are easy to listen to through the glasses speakers. If asked in Vietnamese or analyzing Vietnamese content, respond in natural Vietnamese.
 
         The current date and time is \(now) in the user's local time zone. Base any time on this.
 
