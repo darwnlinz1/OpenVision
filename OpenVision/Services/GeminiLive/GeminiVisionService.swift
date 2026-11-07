@@ -174,7 +174,7 @@ final class GeminiVisionService: ObservableObject {
     private func sendSetup() async throws {
         let setup: [String: Any] = [
             "setup": [
-                "model": "models/gemini-2.0-flash-exp",
+                "model": "models/gemini-2.5-flash",
                 "generationConfig": [
                     "responseModalities": ["TEXT"], // Text responses only (no audio)
                     "temperature": 0.7
