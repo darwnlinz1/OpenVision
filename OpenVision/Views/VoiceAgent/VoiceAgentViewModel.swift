@@ -396,15 +396,16 @@ final class VoiceAgentViewModel: ObservableObject {
         return false
     }
 
-    private func configureAudioForGlasses() {
-        // If we're already on the glasses' Bluetooth (HFP) route and still listening, do NOT tear
-        // the audio session down and re-activate it. That re-activation renegotiates the HFP SCO
+    private func configureAudioForGlasses(forceRestart: Bool = false) {
+        // If we're already on the glasses' Bluetooth (HFP) route and still listening, and not forcing a restart,
+        // do NOT tear the audio session down and re-activate it. That re-activation renegotiates the HFP SCO
         // link, which the glasses render as a "Bluetooth connecting/closing" blip — heard on every
         // wake after the first (the route stays on HFP between sessions, so the re-config is pure
         // churn). Skipping it keeps SCO stable, so the wake chime plays cleanly each time.
-        if settingsManager.settings.preferGlassesMic,
+        if !forceRestart,
+           settingsManager.settings.preferGlassesMic,
            !glassesManager.isStreaming,   // HFP is deaf while the camera streams — reconfigure to phone
-           AudioSessionManager.shared.isBluetoothHFPActive, voiceCommandService.isListening {
+           AudioSessionManager.shared.isBluetoothHFPInputActive, voiceCommandService.isListening {
             return
         }
         let wasListening = voiceCommandService.isListening
@@ -739,8 +740,8 @@ final class VoiceAgentViewModel: ObservableObject {
         // Auto-reconfigure audio route when Bluetooth / Ray-Ban Meta connects or disconnects
         AudioSessionManager.shared.onRouteChange = { [weak self] in
             Task { @MainActor in
-                print("[VoiceAgent] Audio route changed - reapplying preferred audio route")
-                self?.configureAudioForGlasses()
+                print("[VoiceAgent] Audio route changed - reapplying preferred audio route with restart")
+                self?.configureAudioForGlasses(forceRestart: true)
             }
         }
 
@@ -898,8 +899,8 @@ final class VoiceAgentViewModel: ObservableObject {
         guard settingsManager.settings.wakeWordEnabled else { return }
         guard voiceCommandService.authorizationStatus == .authorized else { return }
 
-        // Configure audio for glasses before starting to listen
-        configureAudioForGlasses()
+        // Configure audio for glasses before starting to listen (force restart to bind to HFP)
+        configureAudioForGlasses(forceRestart: true)
 
         do {
             try voiceCommandService.startListening()
@@ -2012,6 +2013,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // Send with or without image
         do {
             if let imageData = imageData {
+                self.activePhotoContext = CapturedPhotoContext(data: imageData)
                 // The image is attached, so strip the "take a picture" wording — otherwise the
                 // VLM replies "I can't take photos / please provide an image" before describing.
                 let visionPrompt = visionPromptFromCommand(prompt)
@@ -2039,6 +2041,10 @@ final class VoiceAgentViewModel: ObservableObject {
 
     /// Capture photo from glasses and return the data
     private func capturePhotoFromGlasses() async -> Data? {
+        guard glassesManager.isRegistered else {
+            NSLog("[OV] capturePhotoFromGlasses: glasses not registered")
+            return nil
+        }
         // Clear any stale photo before requesting a fresh capture.
         glassesManager.lastPhotoData = nil
         NSLog("[OV] capturePhotoFromGlasses: requesting capture (streaming=%@)", glassesManager.isStreaming ? "yes" : "no")
