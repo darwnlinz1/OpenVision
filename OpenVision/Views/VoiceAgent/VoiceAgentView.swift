@@ -179,6 +179,35 @@ struct VoiceAgentView: View {
                 .accessibilityLabel(viewModel.isRecording ? "Stop recording" : "Record point of view")
             }
 
+            // Manual Shutter/Camera button (Capture First, Ask Later)
+            Button {
+                Task {
+                    await viewModel.snapPhotoFromGlasses()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: viewModel.activePhotoContext?.isFresh == true ? "camera.fill" : "camera")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(viewModel.activePhotoContext?.isFresh == true ? .green : .white)
+                    if viewModel.activePhotoContext?.isFresh == true {
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    Capsule()
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            Capsule()
+                                .stroke(viewModel.activePhotoContext?.isFresh == true ? Color.green.opacity(0.6) : Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                )
+            }
+            .accessibilityLabel("Snap photo from glasses")
+
             // Glasses status
             HStack(spacing: 8) {
                 Image(systemName: "eyeglasses")
