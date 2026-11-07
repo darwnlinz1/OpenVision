@@ -186,7 +186,7 @@ final class GlassesManager: ObservableObject {
 
         let config = StreamConfiguration(
             videoCodec: .raw,
-            resolution: .medium,
+            resolution: .high,
             frameRate: 30
         )
 
