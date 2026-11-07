@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **RAY-BAN META GEN 2 × GOOGLE GEMINI MASTER BLUEPRINT**
+> For complete technical architecture, solved audio/video/photo pitfalls, and end-to-end Visor-parity POV solver workflow specifications, read **[MASTER_HANDOVER_BLUEPRINT.md](MASTER_HANDOVER_BLUEPRINT.md)**.
+
 <p align="center">
   <img src="docs/images/banner.png" alt="OpenVision Banner" width="100%"/>
 </p>
