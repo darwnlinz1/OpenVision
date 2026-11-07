@@ -4,6 +4,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import QuartzCore
 
 /// Voice command service with wake word detection
 ///
@@ -132,6 +133,81 @@ final class VoiceCommandService: ObservableObject {
 
     private var activationSound: AVAudioPlayer?
 
+    // MARK: - Route change and stabilization tracking
+
+    private let routeChangeLock = NSLock()
+    private var _lastRouteChangeTime: TimeInterval = 0
+
+    nonisolated func markRouteChange() {
+        routeChangeLock.lock()
+        _lastRouteChangeTime = CACurrentMediaTime()
+        routeChangeLock.unlock()
+    }
+
+    nonisolated func isInStabilizationWindow() -> Bool {
+        routeChangeLock.lock()
+        let elapsed = CACurrentMediaTime() - _lastRouteChangeTime
+        routeChangeLock.unlock()
+        return elapsed < 1.0
+    }
+
+    nonisolated static func isSilentOrZeroBuffer(_ buffer: AVAudioPCMBuffer) -> Bool {
+        if let channels = buffer.floatChannelData {
+            let frames = Int(buffer.frameLength)
+            let channelCount = Int(buffer.format.channelCount)
+            for ch in 0..<channelCount {
+                let data = channels[ch]
+                for i in 0..<frames {
+                    if abs(data[i]) > 0.001 { return false }
+                }
+            }
+            return true
+        } else if let channels = buffer.int16ChannelData {
+            let frames = Int(buffer.frameLength)
+            let channelCount = Int(buffer.format.channelCount)
+            for ch in 0..<channelCount {
+                let data = channels[ch]
+                for i in 0..<frames {
+                    if abs(data[i]) > 32 { return false }
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Wake Word Variations & Stripping
+
+    static let wakeWordVariations: [String] = [
+        // English
+        "ok vision", "okay vision", "o.k. vision", "o k vision",
+        "hey vision", "hi vision",
+        "a vision", "heavy vision", "have vision", "obey vision", "oak vision",
+        // Vietnamese phonetic transcriptions
+        "ô kê vi dơn", "ô kê vi giừn", "ô kê vision",
+        "ok vi dơn", "ok vi giừn",
+        "ốc vi dơn", "ốc vi giừn",
+        "ê vi dơn",
+        "vi dơn", "vi giừn"
+    ]
+
+    static func stripWakeWord(from text: String, defaultWakeWord: String) -> String {
+        var variations = wakeWordVariations
+        let def = defaultWakeWord.lowercased()
+        if !variations.contains(def) { variations.append(def) }
+        variations.sort { $0.count > $1.count }
+
+        let lower = text.lowercased()
+        for v in variations {
+            if let r = lower.range(of: v) {
+                if lower.distance(from: lower.startIndex, to: r.lowerBound) <= 15 {
+                    return String(text[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                }
+            }
+        }
+        return text.trimmingCharacters(in: .whitespaces)
+    }
+
     // MARK: - Initialization
 
     private init() {
@@ -243,11 +319,19 @@ final class VoiceCommandService: ObservableObject {
         // The block runs on the Core Audio render thread, so it must stay allocation-light and
         // must not touch main-actor state. `feed` only converts + buffers, handing full chunks to
         // the detector's own consumer (see SpeechActivityDetector's threading note).
+        markRouteChange()
         let detector = speechDetector
         if let reason = OVCatchException({
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+                // Discard initial silence / zero buffers during the first 1,000ms after route changes
+                // to allow Bluetooth SCO link baseband stabilization without triggering false silence timeouts.
+                if let self, self.isInStabilizationWindow() && Self.isSilentOrZeroBuffer(buffer) {
+                    return
+                }
+
                 recognitionRequest.append(buffer)
                 detector.feed(buffer)
+                SessionRecorder.shared.appendMicAudio(buffer)
             }
         }) {
             print("[VoiceCommand] installTap failed: \(reason)")
@@ -260,6 +344,9 @@ final class VoiceCommandService: ObservableObject {
         audioEngine.prepare()
         do {
             try audioEngine.start()
+            if SessionRecorder.shared.isRecording {
+                SessionRecorder.shared.switchToSharedMic()
+            }
         } catch {
             print("[VoiceCommand] Failed to start audio engine: \(error)")
             // Clean up
@@ -437,12 +524,20 @@ final class VoiceCommandService: ObservableObject {
 
         // Reinstall may follow a route change (phone mic <-> glasses HFP), so the detector's
         // cached converter is built for the OLD format and would emit garbage — drop it.
+        markRouteChange()
         speechDetector.reset()
         let detector = speechDetector
         if let reason = OVCatchException({
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+                // Discard initial silence / zero buffers during the first 1,000ms after route changes
+                // to allow Bluetooth SCO link baseband stabilization without triggering false silence timeouts.
+                if let self, self.isInStabilizationWindow() && Self.isSilentOrZeroBuffer(buffer) {
+                    return
+                }
+
                 recognitionRequest.append(buffer)
                 detector.feed(buffer)
+                SessionRecorder.shared.appendMicAudio(buffer)
             }
         }) {
             print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
@@ -548,13 +643,7 @@ final class VoiceCommandService: ObservableObject {
             }
 
             // Strip wake word from transcription (like xmeta does)
-            var command = transcription
-            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
-                if let range = command.lowercased().range(of: ww) {
-                    command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-                    break
-                }
-            }
+            let command = Self.stripWakeWord(from: transcription, defaultWakeWord: wakeWord)
             currentTranscription = command
 
             // Mark that user has started speaking
@@ -646,7 +735,10 @@ final class VoiceCommandService: ObservableObject {
         guard detectWakeWord(in: text, bypassCooldown: true) else { return false }
         let lower = text.lowercased()
         if lower.contains("video") || lower.contains("stream") { return false }
-        let stopWords = ["stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel"]
+        let stopWords = [
+            "stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel",
+            "dừng lại", "thôi", "dừng"
+        ]
         return stopWords.contains { lower.contains($0) }
     }
 
@@ -656,17 +748,16 @@ final class VoiceCommandService: ObservableObject {
     /// word up front rejects those phantoms while still catching a real interrupt.
     private func wakeWordAtStart(_ text: String) -> Bool {
         let lower = text.lowercased()
-        let variations = [
-            wakeWord.lowercased(),
-            "ok vision", "okay vision", "o.k. vision", "o k vision",
-            "hey vision", "hi vision",
-            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
-        ]
+        var variations = Self.wakeWordVariations
+        let wakeWordLower = wakeWord.lowercased()
+        if !variations.contains(wakeWordLower) {
+            variations.insert(wakeWordLower, at: 0)
+        }
         for v in variations {
             if let r = lower.range(of: v) {
                 // Characters of speech before the wake word. A little leeway ("uh, ok vision")
                 // is fine; a whole sentence in front of it means it's echo, not a barge-in.
-                if lower.distance(from: lower.startIndex, to: r.lowerBound) <= 12 { return true }
+                if lower.distance(from: lower.startIndex, to: r.lowerBound) <= 15 { return true }
             }
         }
         return false
@@ -677,26 +768,11 @@ final class VoiceCommandService: ObservableObject {
         guard bypassCooldown || !wakeWordCooldownActive else { return false }
 
         let lowercased = text.lowercased()
+        var variations = Self.wakeWordVariations
         let wakeWordLower = wakeWord.lowercased()
-
-        // Check for exact match or common variations/misrecognitions
-        let variations = [
-            wakeWordLower,
-            // OK Vision variants (most reliable)
-            "ok vision",
-            "okay vision",
-            "o.k. vision",
-            "o k vision",
-            // Ok Vision variants
-            "hey vision",
-            "hi vision",
-            // Common misrecognitions
-            "a vision",
-            "heavy vision",
-            "have vision",
-            "obey vision",
-            "oak vision"
-        ]
+        if !variations.contains(wakeWordLower) {
+            variations.insert(wakeWordLower, at: 0)
+        }
 
         let detected = variations.contains { lowercased.contains($0) }
         if detected {
@@ -707,24 +783,7 @@ final class VoiceCommandService: ObservableObject {
 
     /// Extract command text after wake word
     private func extractCommandAfterWakeWord(_ text: String) -> String {
-        let lowercased = text.lowercased()
-        let wakeWordLower = wakeWord.lowercased()
-
-        let variations = [
-            wakeWordLower,
-            "ok vision", "okay vision", "o.k. vision", "o k vision",
-            "hey vision", "hi vision",
-            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
-        ]
-
-        for variation in variations {
-            if let range = lowercased.range(of: variation) {
-                let afterWakeWord = String(text[range.upperBound...])
-                    .trimmingCharacters(in: .whitespaces)
-                return afterWakeWord
-            }
-        }
-        return ""
+        return Self.stripWakeWord(from: text, defaultWakeWord: wakeWord)
     }
 
     /// Handle wake word detection
@@ -761,15 +820,7 @@ final class VoiceCommandService: ObservableObject {
         }
 
         // Remove wake word from beginning
-        var command = text
-        let wakeWordLower = wakeWord.lowercased()
-
-        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision"] {
-            if command.lowercased().hasPrefix(prefix) {
-                command = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
-                break
-            }
-        }
+        let command = Self.stripWakeWord(from: text, defaultWakeWord: wakeWord)
 
         guard !command.isEmpty else { return }
 
