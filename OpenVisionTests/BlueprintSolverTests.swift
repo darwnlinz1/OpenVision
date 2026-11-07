@@ -330,6 +330,15 @@ final class BlueprintSolverTests: XCTestCase {
         XCTAssertTrue(vietnamese.contains("điện thoại"))
     }
 
+    func testGoodbyeTokenEndsTheSessionAndIsNeverSpoken() {
+        let reply = "SPOKEN:\nKhông có gì, chúc bạn học tốt!\n\nDISPLAY:\nKhông có gì, chúc bạn học tốt!\n[[END]]"
+        XCTAssertTrue(GeminiLiveService.endsConversation(reply))
+        let (spoken, display) = GeminiLiveService.parseDualChannel(reply)
+        XCTAssertFalse(spoken.contains("END") || display.contains("END"))
+        XCTAssertFalse(GeminiLiveService.endsConversation("SPOKEN:\nx bằng 2.\n\nDISPLAY:\n$x = 2$"))
+        XCTAssertTrue(GeminiLiveService.shared.buildSystemPrompt().contains(GeminiLiveService.endToken))
+    }
+
     func testHistoryRepliesAreFedBackInTheDualChannelShape() {
         let rebuilt = GeminiLiveService.dualChannelFromHistory("Đáp án là B. Vì $f'(x) > 0$.\n$$f'(x) = 3x^2$$")
         let (spoken, display) = GeminiLiveService.parseDualChannel(rebuilt)

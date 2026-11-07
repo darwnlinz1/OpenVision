@@ -447,6 +447,9 @@ final class VoiceAgentViewModel: ObservableObject {
     /// The SPOKEN channel of the last answer, for "read it again" (double press on the glasses).
     private var lastSpokenAnswer = ""
 
+    /// The wearer said goodbye ([[END]] from the model): close the session once the reply is spoken.
+    private var endSessionAfterSpeaking = false
+
     /// True while a capture-button photo is being taken (extra presses are ignored meanwhile).
     @Published private(set) var isCapturingFromButton = false
 
@@ -514,7 +517,11 @@ final class VoiceAgentViewModel: ObservableObject {
             // Resume barge-in detection
             voiceCommandService.isBargeInPaused = false
 
-            if isSessionActive {
+            if isSessionActive && endSessionAfterSpeaking {
+                endSessionAfterSpeaking = false
+                print("[VoiceAgent] Goodbye spoken — ending the session")
+                stopSession()
+            } else if isSessionActive {
                 agentState = .listening
                 resumeListeningAfterSpeaking()
             } else {
@@ -745,6 +752,7 @@ final class VoiceAgentViewModel: ObservableObject {
         voiceCommandService.onWakeWordDetected = { [weak self] in
             guard let self else { return }
             print("[VoiceAgent] Wake word detected!")
+            self.endSessionAfterSpeaking = false
             HapticFeedback.medium()
             self.soundService.playWakeWordSound()
 
@@ -790,6 +798,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
             self.userTranscript = command
             self.latestSolution = nil
+            self.endSessionAfterSpeaking = false   // a new question: the goodbye no longer stands
 
             // Telemetry: the turn is now the backend's problem — everything after this is
             // think time, and everything before it was endpointing.
@@ -808,6 +817,7 @@ final class VoiceAgentViewModel: ObservableObject {
         voiceCommandService.onInterruption = { [weak self] in
             guard let self else { return }
             print("[VoiceAgent] Barge-in detected")
+            self.endSessionAfterSpeaking = false
             // Interruption rate is a satisfaction signal: users talk over an agent that is slow,
             // wrong, or too verbose. Recorded on the turn being interrupted.
             MetricsCollector.shared.markInterrupted()
@@ -859,7 +869,9 @@ final class VoiceAgentViewModel: ObservableObject {
 
             let (spoken, display) = self.parseDualChannelResponse(message)
             self.aiTranscript = spoken.isEmpty ? display : spoken
-            if !spoken.isEmpty { self.lastSpokenAnswer = spoken }
+            let isGoodbye = GeminiLiveService.endsConversation(message)
+            if !spoken.isEmpty, !isGoodbye { self.lastSpokenAnswer = spoken }
+            self.endSessionAfterSpeaking = isGoodbye
             self.latestSolution = Self.solutionWorthShowing(spoken: spoken, display: display)
 
             // Reply text is final. markFirstToken is first-wins, so streaming kept it accurate.

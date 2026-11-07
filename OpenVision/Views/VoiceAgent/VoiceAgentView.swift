@@ -101,7 +101,7 @@ struct VoiceAgentView: View {
         HStack {
             StatusPill(
                 status: settingsManager.settings.backendDisplayName,
-                color: viewModel.agentState == .idle ? .gray : .green,
+                color: viewModel.agentState == .idle ? Theme.inactive : Theme.success,
                 isConnected: viewModel.agentState != .idle && viewModel.agentState != .connecting
             )
 
@@ -125,7 +125,7 @@ struct VoiceAgentView: View {
                 } label: {
                     Image(systemName: viewModel.isRecording ? "stop.circle.fill" : "record.circle")
                         .font(.title2)
-                        .foregroundColor(viewModel.isRecording ? .red : .white)
+                        .foregroundColor(viewModel.isRecording ? Theme.danger : Theme.textPrimary)
                         .padding(.horizontal, 4)
                 }
                 .accessibilityLabel(viewModel.isRecording ? "Stop recording" : "Record point of view")
@@ -285,7 +285,7 @@ struct VoiceAgentView: View {
 
             HStack {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
+                    .foregroundColor(Theme.warning)
 
                 Text(message)
                     .font(.subheadline)
@@ -303,7 +303,7 @@ struct VoiceAgentView: View {
             .padding()
             .background(
                 RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.red.opacity(0.8))
+                    .fill(Theme.danger.opacity(0.8))
                     .overlay(
                         RoundedRectangle(cornerRadius: 16)
                             .stroke(Color.white.opacity(0.2), lineWidth: 1)

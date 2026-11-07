@@ -342,6 +342,14 @@ final class GeminiLiveService: ObservableObject {
     /// What the model answers when it must see something and has no image (see system prompt).
     static let captureToken = "[[CAPTURE]]"
 
+    /// Appended by the model when the wearer is ending the conversation ("cảm ơn", "bye"):
+    /// the app speaks the goodbye and closes the session instead of waiting for the timeout.
+    static let endToken = "[[END]]"
+
+    static func endsConversation(_ raw: String) -> Bool {
+        raw.uppercased().contains(endToken)
+    }
+
     static func isCaptureRequest(_ raw: String) -> Bool {
         raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix(captureToken)
     }
@@ -751,7 +759,8 @@ final class GeminiLiveService: ObservableObject {
     // MARK: - Dual Channel Response Parser (Visor line-anchored regex)
 
     static func parseDualChannel(_ text: String) -> (spoken: String, display: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = text.replacingOccurrences(of: endToken, with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let spokenPattern = #"(?i)(?:^|\n)\s*[-*•]?\s*(?:\[SPOKEN\]|\*{0,2}SPOKEN(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*SPOKEN)\s*([\s\S]*?)(?=(?:(?:^|\n)\s*[-*•]?\s*(?:\[DISPLAY\]|\*{0,2}DISPLAY(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*DISPLAY))|$)"#
         let displayPattern = #"(?i)(?:^|\n)\s*[-*•]?\s*(?:\[DISPLAY\]|\*{0,2}DISPLAY(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*DISPLAY)\s*([\s\S]*?)(?=(?:(?:^|\n)\s*[-*•]?\s*(?:\[SPOKEN\]|\*{0,2}SPOKEN(?:\s*:|\*{0,2}\s*:?)|\#\#+\s*SPOKEN))|$)"#
 
@@ -814,7 +823,8 @@ final class GeminiLiveService: ObservableObject {
     }
 
     static func cleanChannelText(_ text: String) -> String {
-        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = text.replacingOccurrences(of: endToken, with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         s = s.replacingOccurrences(of: #"(?i)^\s*[-*•]?\s*(?:\[?(?:SPOKEN|DISPLAY)\]?)\s*:?\s*"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"(?i)\b(?:SPOKEN|DISPLAY)\b\s*:"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"^[:\s\-*#]+"#, with: "", options: .regularExpression)
@@ -847,6 +857,7 @@ final class GeminiLiveService: ObservableObject {
         - Tutor ("hướng dẫn", "gợi ý", "explain step by step", "teach me"): do NOT reveal the final answer; give the next step or a hint and ask the user to try, then check what they say.
         - Whole page ("cả trang", "tất cả các câu", "all questions"): answer every question, SPOKEN lists them briefly ("câu 1 A, câu 2 C…"), DISPLAY gives a table with a short reason per question.
         - Read / translate / explain code or text: do exactly that, in the user's language.
+        - Ending ("cảm ơn", "tạm biệt", "thôi được rồi", "thanks", "bye", "that's all"): reply with one short friendly sentence (SPOKEN and DISPLAY the same) and put [[END]] alone on the very last line. Only when the user is clearly finishing, never after a real question.
         Before answering math, silently re-check the result (conditions, signs, units); never state an answer you have not verified.
 
         When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
