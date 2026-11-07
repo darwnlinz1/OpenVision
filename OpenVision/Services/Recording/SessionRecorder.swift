@@ -82,7 +82,21 @@ final class SessionRecorder: ObservableObject {
     private var finished = false
     private var videoFrameCount = 0
 
-    // MARK: - Audio capture (own engine)
+    // MARK: - Audio capture (shared tap or own engine)
+
+    /// True when we are sharing the mic tap from VoiceCommandService to avoid running a conflicting second AVAudioEngine.
+    private var isSharingVoiceCommandTap = false
+    private let micConvertLock = NSLock()
+    private var micConverter: AVAudioConverter?
+    private var micSourceFormat: AVAudioFormat?
+
+    private var isVoiceCommandCapturing: Bool {
+        if Thread.isMainThread {
+            return VoiceCommandService.shared.isListening
+        } else {
+            return DispatchQueue.main.sync { VoiceCommandService.shared.isListening }
+        }
+    }
 
     /// Recreated (not just restarted) on every mic re-arm: a stopped engine keeps reporting the
     /// pre-route-change input format, and installing a tap with that stale format fails forever.
@@ -138,6 +152,11 @@ final class SessionRecorder: ObservableObject {
         playbackSourceFormat = nil
         playbackConvertLock.unlock()
 
+        micConvertLock.lock()
+        micConverter = nil
+        micSourceFormat = nil
+        micConvertLock.unlock()
+
         try startMic()
 
         DispatchQueue.main.async { self.isRecording = true }
@@ -150,12 +169,16 @@ final class SessionRecorder: ObservableObject {
         guard isRecording else { return }
 
         // Tear the mic down first so no more audio is enqueued.
-        if let observer = configObserver {
-            NotificationCenter.default.removeObserver(observer)
-            configObserver = nil
+        if isSharingVoiceCommandTap {
+            isSharingVoiceCommandTap = false
+        } else {
+            if let observer = configObserver {
+                NotificationCenter.default.removeObserver(observer)
+                configObserver = nil
+            }
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
 
         DispatchQueue.main.async { self.isRecording = false }
 
@@ -501,11 +524,81 @@ final class SessionRecorder: ObservableObject {
         didCapturePlayback = true
     }
 
-    // MARK: - Audio
+    // MARK: - Audio (Shared Tap or Standalone Engine)
+
+    /// Receives live microphone buffers shared from VoiceCommandService to prevent running
+    /// a conflicting second AVAudioEngine on bus 0.
+    func appendMicAudio(_ buffer: AVAudioPCMBuffer) {
+        guard isRecording, buffer.frameLength > 0 else { return }
+        let now = CMClockGetTime(hostClock)
+
+        micConvertLock.lock()
+        if micSourceFormat != buffer.format {
+            micConverter = AVAudioConverter(from: buffer.format, to: audioOutFormat)
+            micSourceFormat = buffer.format
+        }
+        guard let converter = micConverter else {
+            micConvertLock.unlock()
+            return
+        }
+
+        let ratio = audioOutFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: audioOutFormat, frameCapacity: capacity) else {
+            micConvertLock.unlock()
+            return
+        }
+
+        var supplied = false
+        var convError: NSError?
+        converter.convert(to: outBuffer, error: &convError) { _, statusPtr in
+            if supplied {
+                statusPtr.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            statusPtr.pointee = .haveData
+            return buffer
+        }
+        micConvertLock.unlock()
+        if let convError { NSLog("[Recorder] mic audio convert error: %@", convError); return }
+        guard outBuffer.frameLength > 0 else { return }
+
+        writerQueue.async {
+            self.appendAudio(outBuffer, now: now)
+        }
+    }
+
+    /// Transition to shared VoiceCommandService tap if VoiceCommandService starts while recording.
+    func switchToSharedMic() {
+        guard isRecording, !isSharingVoiceCommandTap else { return }
+        isSharingVoiceCommandTap = true
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configObserver = nil
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        NSLog("[Recorder] Transitioned to shared VoiceCommandService mic tap")
+    }
 
     private func startMic() throws {
-        try installMicTap()
-        registerConfigObserver()
+        // If VoiceCommandService is already capturing, share its microphone tap directly
+        // rather than spawning a conflicting second AVAudioEngine instance.
+        if isVoiceCommandCapturing {
+            isSharingVoiceCommandTap = true
+            NSLog("[Recorder] Sharing active VoiceCommandService mic tap — secondary AVAudioEngine omitted")
+            return
+        }
+
+        isSharingVoiceCommandTap = false
+        do {
+            try installMicTap()
+            registerConfigObserver()
+        } catch {
+            NSLog("[Recorder] Warning: installMicTap failed: %@ — session recording will continue without standalone mic", error.localizedDescription)
+            // Soft failure: do not throw to avoid aborting the entire recording session
+        }
     }
 
     /// Observe configuration changes on the CURRENT engine instance. Must be re-registered every
@@ -549,7 +642,14 @@ final class SessionRecorder: ObservableObject {
     }
 
     private func restartMicAfterConfigChange() {
-        guard isRecording else { return }
+        guard isRecording, !isSharingVoiceCommandTap else { return }
+        if isVoiceCommandCapturing {
+            isSharingVoiceCommandTap = true
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+            NSLog("[Recorder] Switched to shared VoiceCommandService tap on config change")
+            return
+        }
         // The engine stops itself on a configuration change; rebuild the tap on the new input
         // format and restart. Don't re-arm immediately — installing a tap mid-transition is what
         // crashed with a format-mismatch exception. Wait for the route to settle, then retry a
@@ -561,7 +661,12 @@ final class SessionRecorder: ObservableObject {
 
     private func scheduleMicRearm(attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self, self.isRecording else { return }
+            guard let self, self.isRecording, !self.isSharingVoiceCommandTap else { return }
+            if self.isVoiceCommandCapturing {
+                self.isSharingVoiceCommandTap = true
+                NSLog("[Recorder] Switched to shared VoiceCommandService tap during re-arm")
+                return
+            }
             do {
                 // Fresh engine: the stopped one reports the stale pre-change format (48 kHz vs the
                 // route's real 16 kHz HFP), which made every install attempt mismatch. A new engine
