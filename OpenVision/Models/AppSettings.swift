@@ -162,8 +162,8 @@ enum TTSEngineType: String, Codable, CaseIterable, Identifiable {
 struct AppSettings: Codable, Equatable {
     // MARK: - AI Backend Selection
 
-    /// Which AI backend to use
-    var aiBackend: AIBackendType = .openClaw
+    /// Which AI backend to use (defaults to Gemini Live / STEM Math Solver)
+    var aiBackend: AIBackendType = .geminiLive
 
     // MARK: - OpenClaw Configuration
 
@@ -328,9 +328,9 @@ struct AppSettings: Codable, Equatable {
         !openClawGatewayURL.isEmpty && !openClawAuthToken.isEmpty
     }
 
-    /// Whether Gemini is configured (has API key)
+    /// Whether Gemini is configured (has custom key or uses verified built-in 6-key pool)
     var isGeminiConfigured: Bool {
-        !geminiAPIKey.isEmpty
+        true
     }
 
     /// Whether OpenAI is configured (API key, or signed in to a ChatGPT subscription)
