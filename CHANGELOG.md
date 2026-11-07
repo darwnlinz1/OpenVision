@@ -7,21 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **Free-form, bilingual solver flow (Gemini)** — after a temple-shutter photo, say "Ok Vision" and anything, in Vietnamese or English. The words reach Gemini verbatim (no fixed phrase list, no rewriting an unrelated question into "solve the image"); the answer comes back in the language you asked in, the photo is used only when relevant, and the model itself asks for a photo when you ask about something it cannot see
-- **Full-resolution glasses photos** — the Camera Roll scanner sends the original 12 MP photo (upright JPEGs byte-for-byte; HEIC / EXIF-rotated images re-encoded once at full size), loads it off the main thread and prefetches it the moment Meta View syncs it; Gemini reads it at `MEDIA_RESOLUTION_HIGH`
-- **Streaming, timeout-proof Gemini requests** — answers stream over SSE and the glasses start speaking at the first SPOKEN sentence; retries are chosen per failure (429, revoked key, 5xx, dropped connection) under one 120 s deadline; follow-ups on the same photo don't re-upload it
-- The speech voice follows the answer's language and prefers an installed enhanced/premium voice
+One workflow, done well: Ray-Ban Meta photo + free-form question (Vietnamese or English) →
+Gemini → spoken answer on the glasses + rendered solution on the phone. See
+[ADR-001](docs/architecture/ADR-001-solver-pipeline.md).
 
-### Fixed
-- Photos permission was never requested, so the temple-shutter workflow silently found no photo on a fresh install; Limited access is now reported
-- One revoked key in the pool failed the whole turn instead of rotating
-- `maxOutputTokens` 2048 could leave hard problems with an empty answer; only the first response part was read
-- English answers were read in the Vietnamese voice on a Vietnamese iPhone ("true", "structure" counted as Vietnamese)
-- A failed turn was silent on the glasses; it is now spoken
+### Security
+- **The six Gemini API keys embedded (base64) in the source were removed.** They remain in git
+  history and forks: revoke them in Google AI Studio. Keys now come only from Settings
+  (Keychain), several allowed; sent in the `x-goog-api-key` header; the static guard fails the
+  build if a key pattern appears anywhere in the repository. Personal data removed from docs.
 
 ### Added
-- End-to-end test suite for MASTER_HANDOVER_BLUEPRINT.md: static guard (`make blueprint-check`), simulator XCTest suites (`make e2e`), opt-in live Gemini smoke test, IPA symbol check, `E2E (Blueprint)` workflow, and the test plan in `docs/testing/E2E_TEST_PLAN.md`
+- **Photos straight from the glasses (Meta DAT 1.0.1)** — the capture button reaches the app
+  (short press: photo for the next question; hold: photo and solve now; double press: repeat
+  the last answer) and the photo is a full-resolution still, with no wait for the Meta AI app's
+  Camera Roll import. Falls back to the 720p stream still, then Camera Roll. Experimental in
+  the Meta SDK (Developer Mode).
+- **Rendered solutions** — the DISPLAY channel (Markdown + LaTeX) opens in an offline KaTeX
+  view on the phone; History can render past answers too.
+- **Agent loop** — the model answers `[[CAPTURE]]` when it must see something and has no
+  photo; the app takes one and asks again. Saying "cảm ơn / tạm biệt / bye" ends the session.
+- Separate Vietnamese and English voices, speech rate, listening-language setting; math
+  symbols read as words (`SpokenMath`); History "Continue" restores Gemini's context.
+- End-to-end suite for MASTER_HANDOVER_BLUEPRINT.md: static guard, simulator XCTest suites
+  with a scripted Gemini endpoint, opt-in live smoke test, IPA symbol check.
+
+### Changed
+- **Gemini REST streaming only**, model chain `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`,
+  thinking LOW, retries by failure type under one 120 s deadline (key rotation, model fallback,
+  media-resolution step-down, stale-signature reset, backoff with jitter, partial answers kept).
+- Free-form questions reach Gemini verbatim (no fixed phrase list); answers follow the
+  question's language; the first spoken sentence is the answer and is spoken while the rest
+  streams.
+- Photos are sent upright at ≤ 3072 px with `MEDIA_RESOLUTION_ULTRA_HIGH` (Gemini 3 spends a
+  fixed token budget per image, so bigger uploads only add latency); history keeps 1536 px.
+- Settings, onboarding and the main screen in Vietnamese, on the emerald theme tokens.
+
+### Removed
+- Every other brain and voice: OpenAI (+ Realtime), Grok, Hermes, OpenClaw, Apple
+  Intelligence, on-device MLX models (Gemma, SmolVLM, Qwen…), Kokoro and cloud voices, live
+  video modes, web search, native tools, face recognition, InfluxDB/Grafana telemetry.
+  ~20k → ~13k lines of Swift.
+
+### Fixed
+- Photos permission was never requested; Limited access is now reported.
+- The glasses camera streamed for every conversation (battery, heat); it now runs only to take
+  a photo.
+- The "auto-end after silence" setting was ignored; voice previews were silent.
+- One bad key failed the whole turn; `maxOutputTokens` 2048 could truncate hard answers.
+- English answers were read in the Vietnamese voice; a math-only sentence switched voices
+  mid-answer; stopping speech could end the next reply early (barge-in reopened while the
+  glasses were still talking).
+- A failed turn was silent on the glasses; it is now spoken in the wearer's language.
 
 ## [2.14.0] - 2026-10-02
 
