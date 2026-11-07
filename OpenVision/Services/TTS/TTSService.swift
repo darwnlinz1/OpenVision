@@ -32,7 +32,17 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Utterances enqueued but not yet finished. `isSpeaking` only drops to false when this
     /// hits 0 AND no more chunks are coming — so it doesn't flap between queued sentences.
-    public private(set) var pendingUtterances = 0
+    var pendingUtterances: Int { activeUtterances.count }
+
+    /// The utterances of the current reply. Tracked by identity, not a counter: `stop()` cancels
+    /// the old ones, but their didCancel callbacks arrive later — with a counter they ate into the
+    /// count of the NEXT reply and ended it early (barge-in unpaused while still speaking).
+    private var activeUtterances = Set<ObjectIdentifier>()
+
+    /// The language of the reply being spoken (nil until known). Sentences that carry no language
+    /// of their own ("x = 2.", "B.") are read in it, so a Vietnamese answer isn't interrupted by
+    /// a math line in the English voice.
+    private var replyIsVietnamese: Bool?
 
     /// True while a streamed reply is still being fed sentence-by-sentence. Keeps `isSpeaking`
     /// latched even if the audio queue momentarily drains faster than the LLM produces text.
@@ -41,7 +51,7 @@ final class TTSService: NSObject, ObservableObject {
     // MARK: - Voice Selection
 
     /// Auto-detect Vietnamese characters or math keywords in the text
-    static func containsVietnamese(_ text: String) -> Bool {
+    nonisolated static func containsVietnamese(_ text: String) -> Bool {
         let vietnamesePattern = "[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]"
         if text.range(of: vietnamesePattern, options: .regularExpression) != nil {
             return true
@@ -76,14 +86,35 @@ final class TTSService: NSObject, ObservableObject {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Voice for this text's language — the wearer may ask in Vietnamese or English and the
-    /// answer comes back in the same language. (The device language no longer decides: on a
-    /// Vietnamese iPhone an English answer was read in the Vietnamese voice.)
-    private func voice(for text: String) -> AVSpeechSynthesisVoice? {
+    /// True when a sentence says nothing about its language: no Vietnamese and fewer than two
+    /// real words ("x = 2.", "B.", "3,5 cm."). Such sentences follow the reply's language.
+    nonisolated static func isLanguageNeutral(_ text: String) -> Bool {
+        guard !containsVietnamese(text) else { return false }
+        let words = text.split(whereSeparator: { !$0.isLetter }).filter { $0.count >= 3 }
+        return words.count < 2
+    }
+
+    /// The language a sentence is read in: its own when it has one, else the reply's.
+    private func sentenceIsVietnamese(_ text: String) -> Bool {
+        if Self.isLanguageNeutral(text) {
+            return replyIsVietnamese ?? SolverIntent.speaksVietnamese
+        }
+        let vietnamese = Self.containsVietnamese(text)
+        if replyIsVietnamese == nil { replyIsVietnamese = vietnamese }
+        return vietnamese
+    }
+
+    /// Voice for one language — the chosen voice, else the best installed one.
+    private func voice(vietnamese: Bool) -> AVSpeechSynthesisVoice? {
         let settings = SettingsManager.shared.settings
-        return Self.voice(forText: text,
-                          vietnamese: settings.selectedVietnameseVoiceIdentifier.flatMap { AVSpeechSynthesisVoice(identifier: $0) },
-                          english: settings.selectedVoiceIdentifier.flatMap { AVSpeechSynthesisVoice(identifier: $0) })
+        if vietnamese {
+            if let id = settings.selectedVietnameseVoiceIdentifier,
+               let chosen = AVSpeechSynthesisVoice(identifier: id), chosen.language.hasPrefix("vi") { return chosen }
+            if let best = Self.bestVoice(for: "vi-VN") { return best }
+        }
+        if let id = settings.selectedVoiceIdentifier,
+           let chosen = AVSpeechSynthesisVoice(identifier: id), !chosen.language.hasPrefix("vi") { return chosen }
+        return Self.bestVoice(for: "en-US")
     }
 
     /// The voice for one sentence: the chosen (or best installed) voice of the sentence's language.
@@ -150,6 +181,8 @@ final class TTSService: NSObject, ObservableObject {
     /// sentence, so a reply mixing Vietnamese and English is read with the right voice for each.
     func speak(_ text: String) {
         stop()
+        let cleaned = Self.cleanSpokenAudio(text)
+        if !Self.isLanguageNeutral(cleaned) { replyIsVietnamese = Self.containsVietnamese(cleaned) }
         let sentences = TextChunking.sentences(text)
         for sentence in sentences.isEmpty ? [text] : sentences {
             enqueue(sentence)
@@ -192,29 +225,33 @@ final class TTSService: NSObject, ObservableObject {
     private func enqueue(_ text: String) {
         let cleaned = Self.cleanSpokenAudio(text)
         guard !cleaned.isEmpty else { return }
-        let vietnamese = Self.containsVietnamese(cleaned)
+        let vietnamese = sentenceIsVietnamese(cleaned)
         let spoken = SpokenMath.normalize(cleaned, vietnamese: vietnamese)
         guard !spoken.isEmpty else { return }
         let utterance = AVSpeechUtterance(string: spoken)
-        utterance.voice = voice(for: cleaned)
+        utterance.voice = voice(vietnamese: vietnamese)
         utterance.rate = min(max(SettingsManager.shared.settings.speechRate, AVSpeechUtteranceMinimumSpeechRate),
                              AVSpeechUtteranceMaximumSpeechRate)
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
-        if pendingUtterances == 0 {
+        if activeUtterances.isEmpty {
             utterance.preUtteranceDelay = Self.bluetoothLeadIn
         }
-        pendingUtterances += 1
+        activeUtterances.insert(ObjectIdentifier(utterance))
         isSpeaking = true
         synthesizer.speak(utterance)
     }
 
     /// Stop speaking and clear the queue.
     func stop() {
-        synthesizer.stopSpeaking(at: .immediate)
+        let wasSpeaking = isSpeaking || !activeUtterances.isEmpty
+        // Forget the old utterances first: their didCancel callbacks then find nothing to end.
+        activeUtterances.removeAll()
+        replyIsVietnamese = nil
         streamingActive = false
-        pendingUtterances = 0
+        synthesizer.stopSpeaking(at: .immediate)
         isSpeaking = false
+        if wasSpeaking { onSpeechEnded?() }
     }
 
     /// Pause speaking
@@ -247,10 +284,12 @@ extension TTSService: AVSpeechSynthesizerDelegate {
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        let id = ObjectIdentifier(utterance)
         Task { @MainActor in
-            self.pendingUtterances = max(0, self.pendingUtterances - 1)
+            // An utterance of a reply that was already stopped: nothing of the current one ended.
+            guard self.activeUtterances.remove(id) != nil else { return }
             // Only truly "done" when the queue is empty AND no more sentences are coming.
-            if self.pendingUtterances == 0 && !self.streamingActive {
+            if self.activeUtterances.isEmpty && !self.streamingActive {
                 self.isSpeaking = false
                 self.onSpeechEnded?()
             }
@@ -258,9 +297,11 @@ extension TTSService: AVSpeechSynthesizerDelegate {
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        let id = ObjectIdentifier(utterance)
         Task { @MainActor in
-            self.pendingUtterances = max(0, self.pendingUtterances - 1)
-            if self.pendingUtterances == 0 {
+            // stop() already forgot the utterances it cancelled (and reported the end).
+            guard self.activeUtterances.remove(id) != nil else { return }
+            if self.activeUtterances.isEmpty {
                 self.streamingActive = false
                 self.isSpeaking = false
                 self.onSpeechEnded?()

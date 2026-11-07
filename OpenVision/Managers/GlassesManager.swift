@@ -174,12 +174,14 @@ final class GlassesManager: ObservableObject {
 
     /// The started session for the connected glasses — reused when one is up, otherwise created
     /// and started (≤ 15 s). Concurrent callers share one start attempt.
-    private func ensureSession() async -> DeviceSession? {
+    /// `reportErrors: false` for background work (the button link's retries): failures go to the
+    /// log and the link status, not to an alert the wearer didn't ask for.
+    private func ensureSession(reportErrors: Bool = true) async -> DeviceSession? {
         if let session = deviceSession, sessionStarted { return session }
         if let task = sessionStartTask { return await task.value }
         let task = Task { @MainActor [weak self] () -> DeviceSession? in
             guard let self else { return nil }
-            return await self.startSession()
+            return await self.startSession(reportErrors: reportErrors)
         }
         sessionStartTask = task
         let session = await task.value
@@ -187,13 +189,17 @@ final class GlassesManager: ObservableObject {
         return session
     }
 
-    private func startSession() async -> DeviceSession? {
+    private func startSession(reportErrors: Bool) async -> DeviceSession? {
+        func report(_ message: String) {
+            print("[GlassesManager] \(message)")
+            if reportErrors { errorMessage = message }
+        }
         guard isRegistered else {
-            errorMessage = "Chưa đăng ký với Meta AI"
+            report("Chưa đăng ký với Meta AI")
             return nil
         }
         guard let deviceId = connectedDevice else {
-            errorMessage = "Chưa kết nối kính"
+            report("Chưa kết nối kính")
             return nil
         }
 
@@ -202,9 +208,9 @@ final class GlassesManager: ObservableObject {
         if let device = wearables.deviceForIdentifier(deviceId) {
             print("[GlassesManager] Device \(device.nameOrId()): type=\(device.deviceType()) link=\(device.linkState) compatibility=\(device.compatibility())")
             if device.compatibility() == .deviceUpdateRequired {
-                errorMessage = "Kính cần cập nhật firmware — cập nhật trong app Meta AI"
+                report("Kính cần cập nhật firmware — cập nhật trong app Meta AI")
             } else if device.compatibility() == .sdkUpdateRequired {
-                errorMessage = "Kính mới hơn phiên bản SDK của app"
+                report("Kính mới hơn phiên bản SDK của app")
             }
         }
 
@@ -238,7 +244,7 @@ final class GlassesManager: ObservableObject {
             sessionErrorTask = Task { @MainActor [weak self] in
                 for await error in errorStream {
                     print("[GlassesManager] Device session error: \(error) — \(error.description)")
-                    if UIApplication.shared.applicationState == .active {
+                    if reportErrors, UIApplication.shared.applicationState == .active {
                         self?.errorMessage = "Lỗi phiên kính: \(error.description)"
                     }
                 }
@@ -252,8 +258,7 @@ final class GlassesManager: ObservableObject {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
             guard sessionStarted, generation == sessionGeneration else {
-                errorMessage = "Không mở được phiên kết nối kính (hết thời gian)"
-                print("[GlassesManager] Device session failed to reach .started")
+                report("Không mở được phiên kết nối kính (hết thời gian)")
                 dumpSDKLogs(since: 30)
                 if generation == sessionGeneration { endSession() }
                 return nil
@@ -261,8 +266,7 @@ final class GlassesManager: ObservableObject {
             print("[GlassesManager] Device session started")
             return session
         } catch {
-            errorMessage = "Không mở được phiên kết nối kính: \(error.localizedDescription)"
-            print("[GlassesManager] Session start error: \(error)")
+            report("Không mở được phiên kết nối kính: \(error.localizedDescription)")
             endSession()
             return nil
         }
@@ -347,6 +351,11 @@ final class GlassesManager: ObservableObject {
             print("[GlassesManager] Already streaming")
             return
         }
+        // A still is crossing: starting the stream now would take the sensor from it.
+        guard !isTakingPhoto else {
+            print("[GlassesManager] Not starting the stream — a photo is being taken")
+            return
+        }
         guard isRegistered else {
             errorMessage = "Chưa đăng ký với Meta AI"
             return
@@ -390,7 +399,12 @@ final class GlassesManager: ObservableObject {
 
     /// Camera off (LED off, battery), session and button link kept.
     private func stopCameraKeepingSession() {
-        if photoStarted { camera?.photo.stop() }
+        if photoStarted {
+            camera?.photo.stop()
+            // Cleared now, not on the async .stopped event: a capture right after must start
+            // the shutter again instead of firing on one that is going down (PhotoError.notReady).
+            photoStarted = false
+        }
         camera?.stream.stop()
         camera?.stop()
         cleanupStreamListeners()
@@ -496,7 +510,12 @@ final class GlassesManager: ObservableObject {
 
     /// Shutter and camera off after a still (the session and button link stay).
     private func stopCameraAfterPhoto() {
-        if photoStarted { camera?.photo.stop() }
+        if photoStarted {
+            camera?.photo.stop()
+            // Cleared now, not on the async .stopped event: a capture right after must start
+            // the shutter again instead of firing on one that is going down (PhotoError.notReady).
+            photoStarted = false
+        }
         camera?.stream.stop()
         camera?.stop()
         isStreaming = false
@@ -558,6 +577,12 @@ final class GlassesManager: ObservableObject {
 
     // MARK: - Capture-button link (MWDATInputs, experimental)
 
+    /// Apply the capture-button settings (Settings screen and app start share this).
+    func applySettings(_ settings: AppSettings) async {
+        await configureButtonLink(enabled: settings.captureButtonEnabled,
+                                  includeTouchpad: settings.captureButtonIncludeTouchpad)
+    }
+
     /// Route the glasses' capture button to the app (or give it back to the glasses).
     /// `includeTouchpad` widens the request to the temple touchpad — only for glasses whose
     /// button presses never arrive otherwise; the touchpad then stops controlling media.
@@ -584,7 +609,7 @@ final class GlassesManager: ObservableObject {
         guard connectedDevice != nil else { buttonLinkStatus = "Chờ kính kết nối…"; return }
 
         buttonLinkStatus = "Đang kết nối…"
-        guard let session = await ensureSession() else {
+        guard let session = await ensureSession(reportErrors: false) else {
             buttonLinkStatus = "Không mở được phiên kính"
             scheduleLinkRetry()
             return

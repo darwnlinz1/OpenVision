@@ -57,11 +57,21 @@ final class GeminiLiveService: ObservableObject {
         clearConversationHistory()
         var turns: [[String: Any]] = messages.suffix(Self.maxHistoryEntries).map { message in
             message.isUser ? Self.userTurn(text: message.text, imageData: nil)
-                           : Self.modelTurn(text: message.text, signature: nil)
+                           : Self.modelTurn(text: Self.dualChannelFromHistory(message.text), signature: nil)
         }
         // The history must open with a user turn.
         while let first = turns.first, (first["role"] as? String) != "user" { turns.removeFirst() }
         conversationHistory = turns
+    }
+
+    /// History stores a reply's DISPLAY text only. Fed back as-is, the model sees its own past
+    /// turns without SPOKEN/DISPLAY and starts answering the same way — so rebuild the shape, with
+    /// the first sentence as the spoken part.
+    nonisolated static func dualChannelFromHistory(_ text: String) -> String {
+        if text.range(of: #"(?im)^\s*\**\s*SPOKEN"#, options: .regularExpression) != nil { return text }
+        let firstLine = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
+        let spoken = TextChunking.sentences(firstLine).first ?? firstLine
+        return "SPOKEN:\n\(spoken)\n\nDISPLAY:\n\(text)"
     }
 
     // MARK: - Callbacks
@@ -133,20 +143,6 @@ final class GeminiLiveService: ObservableObject {
         isProcessing = false
         isModelSpeaking = false
         processingChangedCallback?(false)
-    }
-
-    // MARK: - Audio / Video Stubs (Preserved for compatibility)
-
-    func sendAudio(data: Data) {
-        // Audio stream not required in REST solver mode
-    }
-
-    func sendVideoFrame(imageData: Data) {
-        // Video streaming handled on-demand via sendMessage photo capture
-    }
-
-    func sendVideoFrame(_ image: UIImage) {
-        // Video streaming handled on-demand via sendMessage photo capture
     }
 
     // MARK: - Messaging
@@ -228,6 +224,7 @@ final class GeminiLiveService: ObservableObject {
         if let imageData {
             prepared = await Task.detached(priority: .userInitiated) { PhotoPayload.uploadJPEG(from: imageData) ?? imageData }.value
         }
+        let fullUpload = prepared
 
         // Same photo as one the model already has in this conversation? Don't upload it again.
         if let data = prepared, historyContainsImage, imageFingerprintInHistory == PhotoPayload.fingerprint(data) {
@@ -238,7 +235,7 @@ final class GeminiLiveService: ObservableObject {
             NSLog("[GeminiLive] Attached image payload: %ld bytes (%@)", data.count, PhotoPayload.mimeType(for: data))
         }
         // The lighter history copy is made while the request runs.
-        let historyCopyTask: Task<Data, Never>? = prepared.map { data in
+        var historyCopyTask: Task<Data, Never>? = prepared.map { data in
             Task.detached(priority: .utility) { PhotoPayload.historyCopy(of: data) }
         }
 
@@ -305,6 +302,12 @@ final class GeminiLiveService: ObservableObject {
                 healedSignatures = true
                 NSLog("[GeminiLive] History rejected (%@) — clearing it and retrying", message)
                 clearConversationHistory()
+                // The photo may have been left out because history already had it: history is
+                // gone now, so it has to travel with this question again.
+                if prepared == nil, let fullUpload {
+                    prepared = fullUpload
+                    historyCopyTask = Task.detached(priority: .utility) { PhotoPayload.historyCopy(of: fullUpload) }
+                }
                 attempt -= 1
 
             case .serverError(let message):
@@ -805,7 +808,10 @@ final class GeminiLiveService: ObservableObject {
         }
         let prefix = resultLine ?? lines.first ?? ""
         let cleanPrefix = cleanChannelText(prefix)
-        return "\(cleanPrefix). Các bước giải chi tiết đã hiển thị trên màn hình điện thoại."
+        let note = TTSService.containsVietnamese(display)
+            ? "Các bước giải chi tiết đã hiển thị trên màn hình điện thoại."
+            : "The full working is on your phone screen."
+        return "\(cleanPrefix). \(note)"
     }
 
     static func cleanChannelText(_ text: String) -> String {

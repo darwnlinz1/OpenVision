@@ -137,9 +137,10 @@ enum SolverIntent {
 
 // MARK: - Recent Photo Scanner (Visor Parity)
 
-/// Finds the photo the wearer just took with the glasses' temple shutter. Meta View syncs it to
-/// Camera Roll 1-3 s after the press; we prefetch it the moment it lands so that by the time the
-/// wearer says "Ok Vision …" the full-resolution bytes are already in memory.
+/// Fallback for when the capture button is not linked to the app: finds a glasses photo that
+/// the Meta AI app imported into Camera Roll. That import is NOT real-time (it typically happens
+/// when the glasses are folded or charging), which is why the direct DAT capture is tried first;
+/// when a photo does land, it is prefetched so its bytes are ready when the question comes.
 ///
 /// Everything heavy (PhotoKit fetch, image decode/encode) runs OFF the main thread — the previous
 /// synchronous 2048 px decode on the main actor stalled the UI on every library change.
@@ -1155,6 +1156,17 @@ final class VoiceAgentViewModel: ObservableObject {
     /// (DAT 1.0 Camera.photo), (2) a 720p still from the video stream, (3) a glasses photo that
     /// already reached Camera Roll.
     private func acquireGlassesPhoto() async -> Data? {
+        // Another capture (button press, the agent, Settings' test) is already crossing: wait for
+        // it and share its photo instead of starting the stream under it.
+        if glassesManager.isTakingPhoto {
+            let requestedAt = Date()
+            while glassesManager.isTakingPhoto, Date().timeIntervalSince(requestedAt) < 45 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if let context = activePhotoContext, context.timestamp >= requestedAt.addingTimeInterval(-45) {
+                return context.data
+            }
+        }
         if glassesManager.isRegistered, !isRecording,
            let full = await glassesManager.captureFullResolutionPhoto(
                fullResolution: settingsManager.settings.fullResolutionPhotos) {
@@ -1217,10 +1229,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Route (or release) the glasses' capture button according to Settings.
     func applyButtonLinkSetting() {
         let settings = settingsManager.settings
-        Task {
-            await glassesManager.configureButtonLink(enabled: settings.captureButtonEnabled,
-                                                     includeTouchpad: settings.captureButtonIncludeTouchpad)
-        }
+        Task { await glassesManager.applySettings(settings) }
     }
 
     // MARK: - Capture button
@@ -1406,8 +1415,7 @@ enum TextChunking {
     /// Split `s` into speakable sentence chunks using the same boundary rules as
     /// `lastSentenceBoundary` (terminator followed by a break, or newline). Chunks are trimmed;
     /// empties dropped; text after the last terminator is included as a final chunk.
-    /// Used by Kokoro TTS to synthesize per-sentence — one long reply in a single MLX pass
-    /// spikes memory proportional to its length (jetsam risk next to SmolVLM2).
+    /// Used to queue a reply one sentence at a time, each in its own language's voice.
     static func sentences(_ s: String) -> [String] {
         let terminators: Set<Character> = [".", "!", "?"]
         var result: [String] = []

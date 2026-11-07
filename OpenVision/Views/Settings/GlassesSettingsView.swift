@@ -280,10 +280,7 @@ struct GlassesSettingsView: View {
 
     private func applyButtonLink() {
         let settings = settingsManager.settings
-        Task {
-            await glassesManager.configureButtonLink(enabled: settings.captureButtonEnabled,
-                                                     includeTouchpad: settings.captureButtonIncludeTouchpad)
-        }
+        Task { await glassesManager.applySettings(settings) }
     }
 
     private func testPhoto() {

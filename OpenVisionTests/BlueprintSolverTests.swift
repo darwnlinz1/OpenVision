@@ -314,6 +314,31 @@ final class BlueprintSolverTests: XCTestCase {
         XCTAssertTrue(prompt.contains("FIRST sentence states the final answer"), "answer-first: heard within seconds")
     }
 
+    // MARK: - Code review fixes
+
+    func testMathOnlySentencesFollowTheRepliesLanguage() {
+        XCTAssertTrue(TTSService.isLanguageNeutral("x = 2."))
+        XCTAssertTrue(TTSService.isLanguageNeutral("B."))
+        XCTAssertFalse(TTSService.isLanguageNeutral("The answer is B."))
+        XCTAssertFalse(TTSService.isLanguageNeutral("Vậy x bằng 2."))
+    }
+
+    func testFallbackSpokenSummaryUsesTheAnswersLanguage() {
+        let english = GeminiLiveService.parseDualChannel("DISPLAY:\nWe expand the bracket.\nAnswer: $x = 2$").spoken
+        XCTAssertFalse(TTSService.containsVietnamese(english), "an English answer must not end with a Vietnamese sentence: \(english)")
+        let vietnamese = GeminiLiveService.parseDualChannel("DISPLAY:\nKhai triển ngoặc.\nĐáp án: $x = 2$").spoken
+        XCTAssertTrue(vietnamese.contains("điện thoại"))
+    }
+
+    func testHistoryRepliesAreFedBackInTheDualChannelShape() {
+        let rebuilt = GeminiLiveService.dualChannelFromHistory("Đáp án là B. Vì $f'(x) > 0$.\n$$f'(x) = 3x^2$$")
+        let (spoken, display) = GeminiLiveService.parseDualChannel(rebuilt)
+        XCTAssertEqual(spoken, "Đáp án là B.")
+        XCTAssertTrue(display.contains("$$f'(x) = 3x^2$$"))
+        let already = "SPOKEN:\nB.\n\nDISPLAY:\nB"
+        XCTAssertEqual(GeminiLiveService.dualChannelFromHistory(already), already)
+    }
+
     // MARK: - Helpers
 
     static func image(width: Int, height: Int) -> UIImage {
