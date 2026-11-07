@@ -166,6 +166,22 @@ final class AudioSessionManager {
 
     // MARK: - Bluetooth HFP Routing
 
+    /// Configures audio session category allowing Bluetooth HFP & A2DP without locking preferredInput to phone.
+    func configureCategoryAllowingBluetooth() throws {
+        try audioSession.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.mixWithOthers, .allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
+        )
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        if let hfp = findBluetoothHFPInput() {
+            try? audioSession.setPreferredInput(hfp)
+            lastInputPortUID = hfp.uid
+            currentMode = .voiceChat
+            print("[AudioSession] ✓ Auto-selected Bluetooth HFP: \(hfp.portName)")
+        }
+    }
+
     /// Configure the audio session for the glasses' Bluetooth HFP mic + speaker.
     /// Returns `true` only if an HFP input was actually found and selected (i.e. the glasses are
     /// connected as an audio device); `false` means no glasses audio is present and the caller
@@ -227,17 +243,19 @@ final class AudioSessionManager {
     /// Find Bluetooth HFP input port (prioritizing Ray-Ban Meta devices)
     private func findBluetoothHFPInput() -> AVAudioSessionPortDescription? {
         let available = audioSession.availableInputs ?? []
-        // Priority 1: device explicitly identified as Ray-Ban or Meta
+        // Priority 1: standard Bluetooth HFP port
+        if let hfp = available.first(where: { $0.portType == .bluetoothHFP }) {
+            return hfp
+        }
+        // Priority 2: device explicitly identified as Ray-Ban or Meta
         if let metaInput = available.first(where: { input in
             let name = input.portName.lowercased()
-            return name.contains("ray-ban") || name.contains("meta") || name.contains("rb meta")
+            return name.contains("ray-ban") || name.contains("meta") || name.contains("rb") || name.contains("stories")
         }) {
             return metaInput
         }
-        // Priority 2: standard Bluetooth HFP or Bluetooth LE input port
-        return available.first(where: { input in
-            input.portType == .bluetoothHFP || input.portType == .bluetoothLE
-        })
+        // Priority 3: standard Bluetooth LE input port
+        return available.first(where: { $0.portType == .bluetoothLE })
     }
 
     /// Check if Bluetooth HFP / glasses microphone is currently the active input route

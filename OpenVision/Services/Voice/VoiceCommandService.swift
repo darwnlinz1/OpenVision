@@ -6,45 +6,6 @@ import Speech
 import AVFoundation
 import QuartzCore
 
-// MARK: - Concurrency Trackers (Top-level Module Scope)
-
-final class RouteChangeTracker: @unchecked Sendable {
-    static let shared = RouteChangeTracker()
-    private let lock = NSLock()
-    private var _lastTime: TimeInterval = 0
-
-    func mark() {
-        lock.lock()
-        _lastTime = CACurrentMediaTime()
-        lock.unlock()
-    }
-
-    func isWithinStabilizationWindow(duration: TimeInterval = 1.0) -> Bool {
-        lock.lock()
-        let elapsed = CACurrentMediaTime() - _lastTime
-        lock.unlock()
-        return elapsed < duration
-    }
-}
-
-final class VoiceCaptureTracker: @unchecked Sendable {
-    static let shared = VoiceCaptureTracker()
-    private let lock = NSLock()
-    private var _isCapturing: Bool = false
-
-    func set(_ val: Bool) {
-        lock.lock()
-        _isCapturing = val
-        lock.unlock()
-    }
-
-    func get() -> Bool {
-        lock.lock()
-        let val = _isCapturing
-        lock.unlock()
-        return val
-    }
-}
 
 /// Voice command service with wake word detection
 ///
@@ -175,13 +136,9 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Route change and stabilization tracking
 
-    nonisolated func markRouteChange() {
-        RouteChangeTracker.shared.mark()
-    }
+    nonisolated func markRouteChange() {}
 
-    nonisolated func isInStabilizationWindow() -> Bool {
-        RouteChangeTracker.shared.isWithinStabilizationWindow()
-    }
+    nonisolated func isInStabilizationWindow() -> Bool { return false }
 
     nonisolated static func isSilentOrZeroBuffer(_ buffer: AVAudioPCMBuffer) -> Bool {
         if let channels = buffer.floatChannelData {
@@ -210,7 +167,7 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Wake Word Variations & Stripping
 
-    static let wakeWordVariations: [String] = [
+        static let wakeWordVariations: [String] = [
         // English
         "ok vision", "okay vision", "o.k. vision", "o k vision",
         "hey vision", "hi vision",
@@ -354,13 +311,7 @@ final class VoiceCommandService: ObservableObject {
         markRouteChange()
         let detector = speechDetector
         if let reason = OVCatchException({
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                // Discard initial silence / zero buffers during the first 1,000ms after route changes
-                // to allow Bluetooth SCO link baseband stabilization without triggering false silence timeouts.
-                if let self, self.isInStabilizationWindow() && Self.isSilentOrZeroBuffer(buffer) {
-                    return
-                }
-
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
                 recognitionRequest.append(buffer)
                 detector.feed(buffer)
                 SessionRecorder.shared.appendMicAudio(buffer)
@@ -562,13 +513,7 @@ final class VoiceCommandService: ObservableObject {
         speechDetector.reset()
         let detector = speechDetector
         if let reason = OVCatchException({
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                // Discard initial silence / zero buffers during the first 1,000ms after route changes
-                // to allow Bluetooth SCO link baseband stabilization without triggering false silence timeouts.
-                if let self, self.isInStabilizationWindow() && Self.isSilentOrZeroBuffer(buffer) {
-                    return
-                }
-
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
                 recognitionRequest.append(buffer)
                 detector.feed(buffer)
                 SessionRecorder.shared.appendMicAudio(buffer)
@@ -696,13 +641,22 @@ final class VoiceCommandService: ObservableObject {
             }
 
         case .processing:
-            // Check for wake word to interrupt TTS (e.g., "ok vision stop")
-            let allowInterrupt = shouldAllowInterrupt?() ?? false
+            // When TTS is speaking (isBargeInPaused is true), NEVER allow acoustic echo or casual speech to interrupt.
+            // ONLY explicit stop phrases ("stop", "dừng lại", "ok vision stop") are allowed to halt playback.
+            if isBargeInPaused {
+                if isStopPhrase(transcription) {
+                    print("[VoiceCommand] Explicit stop command during speech — halting")
+                    onStopCommand?()
+                    currentTranscription = ""
+                    hasSpokenThisTurn = false
+                    silenceTimer?.invalidate(); silenceTimer = nil
+                    state = isWakeWordEnabled ? .idle : .listening
+                    restartRecognition()
+                }
+                return
+            }
 
-            // "Ok Vision stop" / "stop" during TTS → FULL STOP. Handle this before the general
-            // barge-in: halt everything and go quiet. Critically, reset recognition to clear the
-            // buffer — the transcript still starts with "ok vision", so without a reset it would
-            // re-match this branch on every partial result and churn listening/processing forever.
+            let allowInterrupt = shouldAllowInterrupt?() ?? false
             if allowInterrupt && isStopPhrase(transcription) {
                 print("[VoiceCommand] Stop phrase during TTS — halting")
                 onStopCommand?()

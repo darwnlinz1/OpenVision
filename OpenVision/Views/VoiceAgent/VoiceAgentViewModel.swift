@@ -16,7 +16,7 @@ struct CapturedPhotoContext {
     let data: Data
     let timestamp: Date = Date()
     var isConsumed: Bool = false
-    var isFresh: Bool { !isConsumed && Date().timeIntervalSince(timestamp) < 60.0 }
+    var isFresh: Bool { Date().timeIntervalSince(timestamp) < 120.0 }
 }
 
 @MainActor
@@ -380,13 +380,14 @@ final class VoiceAgentViewModel: ObservableObject {
     /// pre-checking availability (which can't see HFP until it's allowed). Returns true on glasses.
     @discardableResult
     private func applyPreferredAudioRoute() -> Bool {
-        // "Click & Go" architecture shuts down camera stream after photo capture anyway, so glasses mic can be used.
-        if settingsManager.settings.preferGlassesMic,
-           (try? AudioSessionManager.shared.configureForGlasses()) == true {
-            return true
+        if settingsManager.settings.preferGlassesMic {
+            if (try? AudioSessionManager.shared.configureForGlasses()) == true {
+                return true
+            }
+            // Even if glasses HFP isn't enumerated yet, keep category allowing Bluetooth open
+            try? AudioSessionManager.shared.configureCategoryAllowingBluetooth()
+            return false
         }
-        // Glasses mic off, glasses not connected as audio, or no HFP input available → phone.
-        // Loud speaker so spoken replies are audible (not the quiet earpiece).
         print("[VoiceAgent] Using iPhone mic + speaker (glasses mic off or unavailable)")
         try? AudioSessionManager.shared.configureForPhone()
         return false
@@ -1043,13 +1044,20 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Check if this is a vision-related command
         // Keywords for "take a photo" - capture and send to active backend (supports Vietnamese & English)
-        let photoKeywords = ["take a photo", "take a picture", "take photo", "take picture",
-                            "capture a photo", "capture photo", "snap a photo", "snap a picture",
-                            "what do you see", "what are you looking at", "look at this",
-                            "what's in front of me", "describe what you see", "what is this",
-                            "what am i looking at", "can you see",
-                            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "xem bài này",
-                            "đọc bài này", "bài này làm sao", "nhìn cái này", "tính cái này", "bài toán"]
+                let photoKeywords = [
+            "take a photo", "take a picture", "take photo", "take picture",
+            "capture a photo", "capture photo", "snap a photo", "snap a picture",
+            "what do you see", "what are you looking at", "look at this",
+            "what's in front of me", "describe what you see", "what is this",
+            "what am i looking at", "can you see", "solve this", "solve problem",
+            // Vietnamese visual & STEM homework phrases
+            "chụp ảnh", "chụp hình", "giải bài này", "giải giúp", "giải hộ",
+            "giải câu này", "giải câu", "giải đề", "xem bài này", "đọc bài này",
+            "bài này làm sao", "nhìn cái này", "tính cái này", "tính câu này",
+            "làm câu này", "chọn đáp án", "đáp án là gì", "đáp án",
+            "đây là gì", "cái này là gì", "đề bài", "bài toán", "phương trình",
+            "tích phân", "đạo hàm", "hệ phương trình", "toán", "hóa", "lý", "câu này"
+        ]
 
         let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
 

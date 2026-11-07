@@ -90,9 +90,7 @@ final class SessionRecorder: ObservableObject {
     private var micConverter: AVAudioConverter?
     private var micSourceFormat: AVAudioFormat?
 
-    private var isVoiceCommandCapturing: Bool {
-        VoiceCaptureTracker.shared.get()
-    }
+    private var isVoiceCommandCapturing: Bool { return true }
 
     /// Recreated (not just restarted) on every mic re-arm: a stopped engine keeps reporting the
     /// pre-route-change input format, and installing a tap with that stale format fails forever.
@@ -579,26 +577,12 @@ final class SessionRecorder: ObservableObject {
     }
 
     private func startMic() throws {
-        // If VoiceCommandService is already capturing, share its microphone tap directly
-        // rather than spawning a conflicting second AVAudioEngine instance.
-        if isVoiceCommandCapturing {
-            isSharingVoiceCommandTap = true
-            NSLog("[Recorder] Sharing active VoiceCommandService mic tap — secondary AVAudioEngine omitted")
-            return
-        }
-
-        isSharingVoiceCommandTap = false
-        do {
-            try installMicTap()
-            registerConfigObserver()
-        } catch {
-            NSLog("[Recorder] Warning: installMicTap failed: %@ — session recording will continue without standalone mic", error.localizedDescription)
-            // Soft failure: do not throw to avoid aborting the entire recording session
-        }
+        // VoiceCommandService already taps the mic and forwards buffers via appendMicAudio.
+        // Starting a second AVAudioEngine on the same microphone crashes or deadlocks CoreAudio.
+        isSharingVoiceCommandTap = true
+        NSLog("[Recorder] Using shared microphone tap from VoiceCommandService — secondary AVAudioEngine disabled to prevent CoreAudio deadlock")
     }
 
-    /// Observe configuration changes on the CURRENT engine instance. Must be re-registered every
-    /// time the engine is recreated, since the notification is delivered per engine object.
     private func registerConfigObserver() {
         if let observer = configObserver { NotificationCenter.default.removeObserver(observer) }
         // When another audio consumer (e.g. a live-video backend) starts or the route changes, the
