@@ -189,7 +189,7 @@ final class GeminiVisionService: ObservableObject {
                         Every response MUST follow this exact structure:
 
                         SPOKEN:
-                        [Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker. Maximum 250 characters. Natural spoken tone (Vietnamese if the question or problem is in Vietnamese, English otherwise). NEVER use LaTeX symbols ($ or \frac) or Markdown formatting (* or #) in this section. State the final answer directly, e.g.: "Câu 1 chọn đáp án A, kết quả là pi trên 4. Lời giải chi tiết đã hiển thị trên màn hình điện thoại."]
+                        [Ultra-concise spoken summary for the Ray-Ban Meta glasses speaker. Maximum 250 characters. Natural spoken tone (Vietnamese if the question or problem is in Vietnamese, English otherwise). NEVER use LaTeX formulas, backslashes, or math symbols (no dollar signs, frac, sqrt, power, subscripts). NEVER use Markdown formatting (no asterisks, hashes, backticks) in this section. State the final answer directly, e.g.: "Cau 1 chon dap an A, ket qua la pi tren 4. Loi giai chi tiet da hien thi tren man hinh dien thoai."]
 
                         DISPLAY:
                         [Full step-by-step solution for the iPhone screen:
