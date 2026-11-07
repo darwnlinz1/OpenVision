@@ -240,7 +240,7 @@ final class GeminiLiveService: ObservableObject {
                     onOutputTranscription?(spoken)
                 }
                 onTextReceived?(rawText)
-                onTurnComplete?()
+                // Note: For REST calls, turn completion does NOT occur here; it occurs after TTS playback completes.
                 return
 
             } catch {
