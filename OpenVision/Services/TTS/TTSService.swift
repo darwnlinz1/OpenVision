@@ -41,6 +41,22 @@ final class TTSService: NSObject, ObservableObject {
 
     private var selectedVoice: AVSpeechSynthesisVoice? { Self.userVoice }
 
+    /// Auto-detect Vietnamese characters in the text
+    static func containsVietnamese(_ text: String) -> Bool {
+        let vietnamesePattern = "[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]"
+        return text.range(of: vietnamesePattern, options: .regularExpression) != nil
+    }
+
+    /// Select voice dynamically based on text content: auto-detects Vietnamese and chooses vi-VN
+    private func voice(for text: String) -> AVSpeechSynthesisVoice? {
+        if Self.containsVietnamese(text) {
+            if let viVoice = AVSpeechSynthesisVoice(language: "vi-VN") {
+                return viVoice
+            }
+        }
+        return selectedVoice
+    }
+
     /// The Apple voice chosen in Settings, or the default English voice. Also used by the cloud
     /// voices' Apple fallback, so the choice lives in one place.
     static var userVoice: AVSpeechSynthesisVoice? {
@@ -133,7 +149,7 @@ final class TTSService: NSObject, ObservableObject {
     /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = selectedVoice
+        utterance.voice = voice(for: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
