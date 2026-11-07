@@ -90,7 +90,9 @@ final class SessionRecorder: ObservableObject {
     private var micConverter: AVAudioConverter?
     private var micSourceFormat: AVAudioFormat?
 
-    private var isVoiceCommandCapturing: Bool { return true }
+    private var isVoiceCommandCapturing: Bool {
+        VoiceCaptureTracker.shared.get()
+    }
 
     /// Recreated (not just restarted) on every mic re-arm: a stopped engine keeps reporting the
     /// pre-route-change input format, and installing a tap with that stale format fails forever.
@@ -153,7 +155,11 @@ final class SessionRecorder: ObservableObject {
 
         try startMic()
 
-        DispatchQueue.main.async { self.isRecording = true }
+        if Thread.isMainThread {
+            self.isRecording = true
+        } else {
+            DispatchQueue.main.async { self.isRecording = true }
+        }
         NSLog("[Recorder] Started → %@", url.lastPathComponent)
     }
 
@@ -174,7 +180,11 @@ final class SessionRecorder: ObservableObject {
             audioEngine.stop()
         }
 
-        DispatchQueue.main.async { self.isRecording = false }
+        if Thread.isMainThread {
+            self.isRecording = false
+        } else {
+            DispatchQueue.main.async { self.isRecording = false }
+        }
 
         writerQueue.async {
             guard let writer = self.writer, !self.finished else {
@@ -580,9 +590,16 @@ final class SessionRecorder: ObservableObject {
         // VoiceCommandService already taps the mic and forwards buffers via appendMicAudio.
         // Starting a second AVAudioEngine on the same microphone crashes or deadlocks CoreAudio.
         isSharingVoiceCommandTap = true
-        NSLog("[Recorder] Using shared microphone tap from VoiceCommandService — secondary AVAudioEngine disabled to prevent CoreAudio deadlock")
+        if !isVoiceCommandCapturing {
+            DispatchQueue.main.async {
+                try? VoiceCommandService.shared.startListening()
+            }
+        }
+        NSLog("[Recorder] Using shared microphone tap from VoiceCommandService — secondary AVAudioEngine disabled to prevent deadlock")
     }
 
+    /// Observe configuration changes on the CURRENT engine instance. Must be re-registered every
+    /// time the engine is recreated, since the notification is delivered per engine object.
     private func registerConfigObserver() {
         if let observer = configObserver { NotificationCenter.default.removeObserver(observer) }
         // When another audio consumer (e.g. a live-video backend) starts or the route changes, the
