@@ -22,16 +22,12 @@ final class GeminiLiveService: ObservableObject {
     @Published var isModelSpeaking: Bool = false
     @Published var lastError: String?
 
-    // MARK: - API Key Pool (6 Verified Keys)
+    // MARK: - API Key Pool
 
-    private static let rawKeyPool: [String] = [
-        "QVEuQWI4Uk42TDhyNzVHbFhob2RodC1ING55WDJkSk1TbURuYWNvVWppSlpSMlEyQW9sYmc=",
-        "QVEuQWI4Uk42SWR0OXBKaE1YSERVNzR0d2FHcm91Tms5bm9rVVp1VEZZS2ZrQXgwZ2ZmcHc=",
-        "QVEuQWI4Uk42S3VvckJ4TDFHZ3dacHlDRWV5bmh0ektQbU1pNWowNFlybXpxTHZxT2pYdmc=",
-        "QVEuQWI4Uk42S2ViaFJwa0tYYXRGbTRLUktzc3ZoaklieVk1VEZvWmNyRkNsQmlaVXg2Q3c=",
-        "QVEuQWI4Uk42SzBTVFdMNV92S01YclFlOWpkZmNSQ0tlNE5HS1k2RGhIWThWLVlBcEdwa1E=",
-        "QVEuQWI4Uk42S2ZXSzhzUEhvZDZQeDNISU5WWEZZUXRHOTVmVThWRkc1YW5TcjdRU19waFE="
-    ]
+    // No keys are compiled into the app: this repository is public and the six keys that used to
+    // be here (base64, trivially decoded) were exposed — they must be revoked in Google AI Studio.
+    // Enter your own key in Settings → Gemini (stored in the Keychain).
+    private static let rawKeyPool: [String] = []
 
     static var defaultAPIKeyPool: [String] {
         rawKeyPool.compactMap { b64 in
