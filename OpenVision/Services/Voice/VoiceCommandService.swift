@@ -133,22 +133,54 @@ final class VoiceCommandService: ObservableObject {
 
     private var activationSound: AVAudioPlayer?
 
-    // MARK: - Route change and stabilization tracking
+// MARK: - Concurrency Trackers
 
-    private let routeChangeLock = NSLock()
-    private var _lastRouteChangeTime: TimeInterval = 0
+final class RouteChangeTracker: @unchecked Sendable {
+    static let shared = RouteChangeTracker()
+    private let lock = NSLock()
+    private var _lastTime: TimeInterval = 0
+
+    func mark() {
+        lock.lock()
+        _lastTime = CACurrentMediaTime()
+        lock.unlock()
+    }
+
+    func isWithinStabilizationWindow(duration: TimeInterval = 1.0) -> Bool {
+        lock.lock()
+        let elapsed = CACurrentMediaTime() - _lastTime
+        lock.unlock()
+        return elapsed < duration
+    }
+}
+
+final class VoiceCaptureTracker: @unchecked Sendable {
+    static let shared = VoiceCaptureTracker()
+    private let lock = NSLock()
+    private var _isCapturing: Bool = false
+
+    func set(_ val: Bool) {
+        lock.lock()
+        _isCapturing = val
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        let val = _isCapturing
+        lock.unlock()
+        return val
+    }
+}
+
+// MARK: - Route change and stabilization tracking
 
     nonisolated func markRouteChange() {
-        routeChangeLock.lock()
-        _lastRouteChangeTime = CACurrentMediaTime()
-        routeChangeLock.unlock()
+        RouteChangeTracker.shared.mark()
     }
 
     nonisolated func isInStabilizationWindow() -> Bool {
-        routeChangeLock.lock()
-        let elapsed = CACurrentMediaTime() - _lastRouteChangeTime
-        routeChangeLock.unlock()
-        return elapsed < 1.0
+        RouteChangeTracker.shared.isWithinStabilizationWindow()
     }
 
     nonisolated static func isSilentOrZeroBuffer(_ buffer: AVAudioPCMBuffer) -> Bool {
@@ -368,6 +400,7 @@ final class VoiceCommandService: ObservableObject {
         }
 
         isListening = true
+        VoiceCaptureTracker.shared.set(true)
         state = isWakeWordEnabled ? .idle : .listening
         print("[VoiceCommand] Started listening - audio engine running")
     }
@@ -451,6 +484,7 @@ final class VoiceCommandService: ObservableObject {
         conversationTimeoutTimer = nil
 
         isListening = false
+        VoiceCaptureTracker.shared.set(false)
         state = .idle
         currentTranscription = ""
         hasSpokenThisTurn = false
