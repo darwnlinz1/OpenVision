@@ -15,14 +15,14 @@
    - Apple Mobile Device Service (AMDS) và dịch vụ `usbmuxd` đang chạy.
 2. **Thiết bị Di động Đích (Target iPhone):**
    - Thiết bị: iPhone 15 Pro (Mã nhận diện phần cứng: `iPhone16,2`).
-   - Mã UDID: `00008130-001E5CA43EE8001C`.
+   - Mã UDID: `<UDID>`.
    - Phiên bản hệ điều hành: iOS 18.x / 26.6.1.
    - Chế độ Developer Mode: Đã bật trong **Cài đặt -> Quyền riêng tư & Bảo mật -> Chế độ nhà phát triển (Developer Mode)**.
 3. **Kính Thông minh (Smart Glasses):**
-   - Model: Ray-Ban Meta Gen 2 (BLE MAC: `80:AA:1C:F9:87:2E`).
+   - Model: Ray-Ban Meta Gen 2 (BLE MAC: `<BLE_MAC>`).
    - Ứng dụng đồng hành Meta View đã cài đặt trên iPhone, tài khoản Meta Developer đã bật Developer Mode.
    - Meta App ID: `306760944872162`.
-   - Meta Client Token: `AR|306760944872162|a919421a55a8ea18080ab2f10f57f1be`.
+   - Meta Client Token: `AR|<META_APP_ID>|<CLIENT_TOKEN>`.
 4. **Hạ tầng CI/CD Đám mây (Cloud Builder):**
    - GitHub Repository: `darwnlinz1/OpenVision` (hoặc kho mã nguồn fork của bạn).
    - Runner: `macos-26` (chạy macOS Sequoia với Xcode 26.6 chính thức).
@@ -39,7 +39,7 @@ Tạo file `Config.xcconfig` tại thư mục gốc của repository với nội
 DEVELOPMENT_TEAM = 
 PRODUCT_BUNDLE_IDENTIFIER = com.minh.openvision
 META_APP_ID = 306760944872162
-CLIENT_TOKEN = AR|306760944872162|a919421a55a8ea18080ab2f10f57f1be
+CLIENT_TOKEN = AR|<META_APP_ID>|<CLIENT_TOKEN>
 APP_LINK_URL_SCHEME = openvision
 ```
 
@@ -68,7 +68,7 @@ Vì file IPA sinh ra từ GitHub Actions là **Unsigned IPA** (chưa ký chứng
    ```powershell
    python -m pymobiledevice3 usbmux list
    ```
-   Xác nhận màn hình terminal hiển thị UDID `00008130-001E5CA43EE8001C`.
+   Xác nhận màn hình terminal hiển thị UDID `<UDID>`.
 
 2. **Ký nhanh với chứng chỉ cá nhân miễn phí (Ad-Hoc / Apple Free Developer Account):**
    - Bạn có thể sử dụng công cụ mã nguồn mở `zsign` hoặc `AltServer` / `Sideloadly` để ký file `OpenVision.ipa` bằng tài khoản Apple ID miễn phí của mình.

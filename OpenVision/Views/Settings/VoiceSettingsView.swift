@@ -1,5 +1,5 @@
 // OpenVision - VoiceSettingsView.swift
-// Voice control settings: wake word, conversation timeout
+// Voice: wake word, microphone, listening language, answer voices (one per language), speed.
 
 import SwiftUI
 import AVFoundation
@@ -9,242 +9,125 @@ struct VoiceSettingsView: View {
 
     @EnvironmentObject var settingsManager: SettingsManager
 
+    // MARK: - Helpers
 
-    // MARK: - Computed Properties
-
-    private var selectedVoiceName: String {
-        guard let identifier = settingsManager.settings.selectedVoiceIdentifier,
-              let voice = AVSpeechSynthesisVoice(identifier: identifier) else {
-            return "System Default"
+    private func voiceName(_ identifier: String?, language: String) -> String {
+        if let identifier, let voice = AVSpeechSynthesisVoice(identifier: identifier) {
+            return voice.name
         }
-        return voice.name
+        return TTSService.bestVoice(for: language).map { "Tự động · \($0.name)" } ?? "Tự động"
     }
 
     // MARK: - Body
 
-    /// A "Voice" row that opens a voice list, styled like the Apple Voice row.
-    private func voiceRow<Destination: View>(_ title: String, value: String,
-                                             @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink(destination: destination) {
-            HStack {
-                Text(title)
-                Spacer()
-                Text(value).foregroundColor(.secondary)
-            }
-        }
-    }
-
-    /// Shortcut to the credential a cloud voice uses, with its status.
-    private func accountRow<Destination: View>(_ title: String, icon: String, connected: Bool,
-                                               @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink(destination: destination) {
-            HStack {
-                Label(title, systemImage: icon)
-                Spacer()
-                Text(connected ? "Connected" : "Set Up")
-                    .font(.caption)
-                    .foregroundColor(connected ? .green : .orange)
-            }
-        }
-    }
-
     var body: some View {
         Form {
-            // Wake Word Section
+            // Wake word
             Section {
                 Toggle(isOn: $settingsManager.settings.wakeWordEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Enable Wake Word")
-                        Text("Only listen after wake phrase")
+                        Text("Từ đánh thức")
+                        Text("Chỉ nghe sau khi bạn gọi tên")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                 }
 
                 if settingsManager.settings.wakeWordEnabled {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Wake Phrase")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        TextField("Ok Vision", text: $settingsManager.settings.wakeWord)
-                            .autocorrectionDisabled()
-                    }
+                    TextField("Ok Vision", text: $settingsManager.settings.wakeWord)
+                        .autocorrectionDisabled()
                 }
             } header: {
-                Text("Wake Word")
+                Text("Gọi trợ lý")
             } footer: {
-                if settingsManager.settings.wakeWordEnabled {
-                    Text("Say \"\(settingsManager.settings.wakeWord)\" to activate the assistant. This protects your privacy by only listening after the wake phrase.")
-                } else {
-                    Text("Wake word is disabled. The app will always be listening when active (Gemini Live mode behavior).")
-                }
+                Text("Nói \"\(settingsManager.settings.wakeWord)\" rồi hỏi tự do, tiếng Việt hay tiếng Anh. Các cách đọc như \"ô kê vi dơn\" cũng được nhận.")
             }
 
-            // Microphone Section
+            // Listening
             Section {
                 Toggle(isOn: $settingsManager.settings.preferGlassesMic) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Use Glasses Mic")
-                        Text("Listen through the glasses when worn")
+                        Text("Dùng mic của kính")
+                        Text("Rảnh tay hoàn toàn khi đang đeo kính")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                 }
+
+                Picker("Ngôn ngữ nghe", selection: $settingsManager.settings.recognitionLanguage) {
+                    Text("Tự động (theo iPhone)").tag("auto")
+                    Text("Tiếng Việt").tag("vi-VN")
+                    Text("English").tag("en-US")
+                }
+
+                Picker("Tự kết thúc khi im lặng", selection: $settingsManager.settings.conversationTimeout) {
+                    Text("15 giây").tag(TimeInterval(15))
+                    Text("30 giây").tag(TimeInterval(30))
+                    Text("1 phút").tag(TimeInterval(60))
+                    Text("2 phút").tag(TimeInterval(120))
+                }
             } header: {
-                Text("Microphone")
+                Text("Nghe")
             } footer: {
-                Text("When on, voice input uses the glasses' Bluetooth microphone for true hands-free use, and falls back to the phone mic automatically when the glasses aren't the audio device. Uses more battery. Turn off to always use the phone mic.")
+                Text("iOS chỉ nhận dạng một ngôn ngữ một lúc: chọn ngôn ngữ bạn hỏi nhiều nhất. Câu trả lời luôn theo ngôn ngữ của câu hỏi. Đổi ngôn ngữ nghe có hiệu lực ở lần gọi tiếp theo.")
             }
 
-            // Conversation Section
+            // Answer voices
             Section {
-                Picker("Auto-End Timeout", selection: $settingsManager.settings.conversationTimeout) {
-                    Text("15 seconds").tag(TimeInterval(15))
-                    Text("30 seconds").tag(TimeInterval(30))
-                    Text("1 minute").tag(TimeInterval(60))
-                    Text("2 minutes").tag(TimeInterval(120))
-                    Text("Never").tag(TimeInterval(0))
+                NavigationLink {
+                    VoiceSelectionView(languagePrefix: "vi", title: "Giọng tiếng Việt",
+                                       sample: "Xin chào, đáp án câu này là x bằng 2.",
+                                       selection: $settingsManager.settings.selectedVietnameseVoiceIdentifier)
+                } label: {
+                    HStack {
+                        Text("Giọng tiếng Việt")
+                        Spacer()
+                        Text(voiceName(settingsManager.settings.selectedVietnameseVoiceIdentifier, language: "vi-VN"))
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                NavigationLink {
+                    VoiceSelectionView(languagePrefix: "en", title: "English voice",
+                                       sample: "Hello! The answer to this question is x equals 2.",
+                                       selection: $settingsManager.settings.selectedVoiceIdentifier)
+                } label: {
+                    HStack {
+                        Text("Giọng tiếng Anh")
+                        Spacer()
+                        Text(voiceName(settingsManager.settings.selectedVoiceIdentifier, language: "en-US"))
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Tốc độ đọc")
+                        Spacer()
+                        Text(String(format: "%.0f%%", settingsManager.settings.speechRate / 0.5 * 100))
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: $settingsManager.settings.speechRate, in: 0.35...0.6, step: 0.025)
+                        .tint(Theme.accent)
                 }
             } header: {
-                Text("Conversation")
+                Text("Giọng đọc câu trả lời")
             } footer: {
-                Text("Automatically end the conversation after this period of silence.")
+                Text("Mỗi câu được đọc bằng giọng đúng ngôn ngữ của nó. Công thức được đọc thành lời (\"x bình phương\", \"bằng\", \"phần\").")
             }
 
-            // TTS Voice Section
-            Section {
-                Picker("Speech Engine", selection: $settingsManager.settings.ttsEngine) {
-                    ForEach(TTSEngineType.allCases) { engine in
-                        Text(engine.displayName).tag(engine)
-                    }
-                }
-
-                switch settingsManager.settings.ttsEngine {
-                case .appleSystem:
-                    NavigationLink {
-                        VoiceSelectionView()
-                    } label: {
-                        HStack {
-                            Text("Apple Voice")
-                            Spacer()
-                            Text(selectedVoiceName).foregroundColor(.secondary)
-                        }
-                    }
-                case .kokoro:
-                    voiceRow("Kokoro Voice", value: settingsManager.settings.kokoroVoice) {
-                        NeuralVoiceListView(
-                            engine: .kokoro,
-                            title: "Kokoro Voice",
-                            selection: $settingsManager.settings.kokoroVoice,
-                            voices: KokoroTTSService.voices.map { CloudVoice(id: $0, name: $0, gender: "") },
-                            preview: { await KokoroTTSService.shared.speak(NeuralVoiceListView.sampleText, voice: $0) }
-                        )
-                    }
-                    NavigationLink {
-                        KokoroSettingsView()
-                    } label: {
-                        HStack {
-                            Label("Kokoro Model", systemImage: "waveform")
-                            Spacer()
-                            Text(KokoroTTSService.shared.isModelReady ? "Ready" : "Download")
-                                .font(.caption)
-                                .foregroundColor(KokoroTTSService.shared.isModelReady ? .green : .orange)
-                        }
-                    }
-                case .grok:
-                    voiceRow("Grok Voice", value: settingsManager.settings.grokVoice.capitalized) {
-                        NeuralVoiceListView(
-                            engine: .grok,
-                            title: "Grok Voice",
-                            selection: $settingsManager.settings.grokVoice,
-                            loadVoices: { try await CloudTTSService.fetchGrokVoices() },
-                            preview: { await CloudTTSService.grok.speak(NeuralVoiceListView.sampleText, voice: $0) }
-                        )
-                    }
-                    accountRow("Grok Account", icon: "bolt", connected: settingsManager.settings.isGrokConfigured) {
-                        GrokSettingsView()
-                    }
-                case .openAI:
-                    voiceRow("OpenAI Voice", value: settingsManager.settings.openAITTSVoice.capitalized) {
-                        NeuralVoiceListView(
-                            engine: .openAI,
-                            title: "OpenAI Voice",
-                            selection: $settingsManager.settings.openAITTSVoice,
-                            voices: CloudTTSService.openAIVoices,
-                            preview: { await CloudTTSService.openAI.speak(NeuralVoiceListView.sampleText, voice: $0) }
-                        )
-                    }
-                    accountRow("OpenAI API Key", icon: "key", connected: settingsManager.settings.isOpenAIAPIAvailable) {
-                        OpenAISettingsView()
-                    }
-                }
-            } header: {
-                Text("Output Voice")
-            } footer: {
-                switch settingsManager.settings.ttsEngine {
-                case .kokoro:
-                    Text("Kokoro is a natural, on-device neural voice — private and offline. Download its model (~600 MB) under Kokoro Model, then it runs entirely on-device.")
-                case .grok:
-                    Text("Grok is xAI's natural cloud voice. It uses your Grok sign-in (SuperGrok or API key), follows the language of each reply, and needs an internet connection. Replies are sent to xAI to be spoken.")
-                case .openAI:
-                    Text("OpenAI's natural cloud voice (\(CloudTTSService.openAITTSModel)). It needs an OpenAI API key with credits — a ChatGPT subscription doesn't cover speech. Replies are sent to OpenAI to be spoken.")
-                case .appleSystem:
-                    Text("Apple's built-in system voice. For higher quality, download a Premium/Enhanced voice in iOS Settings → Accessibility → Spoken Content.")
-                }
-            }
-
-            // Feedback Section
+            // Feedback
             Section {
                 Toggle(isOn: $settingsManager.settings.playActivationSound) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Activation Sound")
-                        Text("Play chime on wake word")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                    Text("Âm báo khi gọi trợ lý")
                 }
             } header: {
-                Text("Feedback")
-            }
-
-            // Info Section
-            Section {
-                HStack {
-                    Text("Supported Phrases")
-                    Spacer()
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(samplePhrases, id: \.self) { phrase in
-                        HStack {
-                            Image(systemName: "quote.bubble")
-                                .foregroundColor(.secondary)
-                            Text(phrase)
-                                .font(.subheadline)
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-            } header: {
-                Text("Examples")
-            } footer: {
-                Text("The wake word detection is flexible and will recognize variations like \"OK Vision\" or \"Okay Vision\".")
+                Text("Phản hồi")
             }
         }
-        .navigationTitle("Voice Control")
+        .navigationTitle("Giọng nói")
         .navigationBarTitleDisplayMode(.inline)
-    }
-
-    // MARK: - Sample Phrases
-
-    private var samplePhrases: [String] {
-        let wake = settingsManager.settings.wakeWord
-        return [
-            "\(wake), what's the weather?",
-            "\(wake), take a photo",
-            "\(wake), remind me to...",
-            "\(wake), search for..."
-        ]
     }
 }
 

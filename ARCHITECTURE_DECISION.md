@@ -9,12 +9,12 @@
 
 ## 1. BỐI CẢNH VÀ BÀI TOÁN
 
-Dự án yêu cầu một hệ thống hoàn chỉnh kết nối kính thông minh **Ray-Ban Meta Gen 2** với **iPhone 15 Pro** (UDID: `00008130-001E5CA43EE8001C`, iOS 18/26) để chụp ảnh bài tập từ camera của kính, gửi sang **Google Gemini API** giải đề theo System Prompt chuyên sâu, và trả kết quả chính xác, ngắn gọn qua loa kính đồng thời hiển thị chi tiết bài giải trên màn hình điện thoại.
+Dự án yêu cầu một hệ thống hoàn chỉnh kết nối kính thông minh **Ray-Ban Meta Gen 2** với **iPhone 15 Pro** (UDID: `<UDID>`, iOS 18/26) để chụp ảnh bài tập từ camera của kính, gửi sang **Google Gemini API** giải đề theo System Prompt chuyên sâu, và trả kết quả chính xác, ngắn gọn qua loa kính đồng thời hiển thị chi tiết bài giải trên màn hình điện thoại.
 
 ### Ràng buộc phần cứng & hạ tầng:
 - Thiết bị cá nhân: iPhone 15 Pro, kết nối USB với máy host Windows 11. Đã kiểm chứng nhận dạng tốt qua `pymobiledevice3`.
-- Phần cứng kính: Ray-Ban Meta Gen 2 (BLE MAC: `80:AA:1C:F9:87:2E`).
-- Meta Developer Credentials: App ID `306760944872162`, Client Token `AR|306760944872162|a919421a55a8ea18080ab2f10f57f1be`.
+- Phần cứng kính: Ray-Ban Meta Gen 2 (BLE MAC: `<BLE_MAC>`).
+- Meta Developer Credentials: App ID `306760944872162`, Client Token `AR|<META_APP_ID>|<CLIENT_TOKEN>`.
 - Môi trường build iOS: Runner đám mây GitHub Actions `macos-26` với Xcode 26.6, công cụ XcodeGen tự động tạo file `.xcodeproj`.
 
 ---

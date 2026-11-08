@@ -1,99 +1,75 @@
 # Architecture
 
-How OpenVision is organized, and the seams to use when extending it.
+OpenVision does one thing: a Ray-Ban Meta photo + a free-form question (Vietnamese or English) →
+Gemini → a spoken answer on the glasses and a rendered step-by-step solution on the phone. Why it
+is built this way: [ADR-001](architecture/ADR-001-solver-pipeline.md).
 
 ```
 OpenVision/
-├── App/                 App entry (OpenVisionApp)
-├── Config/              Constants + xcconfig-backed configuration (zero hardcoding)
-├── Managers/            App-wide state: SettingsManager (API keys in the Keychain), GlassesManager
-├── Models/              Value types & settings enums (AIBackendType, TTSEngineType, …)
-├── Services/            One folder per domain — the backbone of the app
-│   ├── AIBackend/       AIBackend protocol + registry + conformances, OpenAIService,
-│   │                    ChatGPTSubscription (ChatGPT plan backend), GrokService,
-│   │                    HermesService (your Hermes Agent server),
-│   │                    CloudChat (prompt + tools + loop shared by cloud chat backends)
-│   ├── AppleFoundation/ Apple Intelligence backend (+ its native Tool wrappers)
-│   ├── Audio/           Audio session, capture, playback, sounds
-│   ├── GeminiLive/      Gemini Live websocket backend + Gemini vision
-│   ├── GemmaLocal/      On-device MLX models (Gemma 4, SmolVLM2, FastVLM, Qwen)
-│   ├── LocalAgent/      Shared routing brain for on-device models (JSON-in-text)
-│   ├── NativeTools/     Productivity tools (timer, reminder, calendar, note, …)
-│   ├── OAuth/           Subscription sign-in: PKCE, loopback redirect, Keychain tokens
-│   ├── OpenAIRealtime/  OpenAI Realtime (live audio/video)
-│   ├── OpenClaw/        OpenClaw agentic backend
-│   ├── TTS/             Apple TTS, Kokoro (on-device) and cloud voices (Grok, OpenAI)
-│   ├── Voice/           Wake word + speech recognition (VoiceCommandService)
-│   ├── Vision/          Face recognition (Apple Vision)
-│   └── Web/             Web search (Tavily / DuckDuckGo)
-├── Views/               SwiftUI. MVVM: Views render; ViewModels orchestrate.
-│   └── VoiceAgent/      VoiceAgentView (UI) + VoiceAgentViewModel (all orchestration)
-└── Utilities/           Small helpers
-OpenVisionTests/         Unit tests (pure logic: date resolution, routing, chunking)
+├── App/                 App entry (OpenVisionApp): DAT SDK configure, URL callback
+├── Config/              Constants (voice, storage)
+├── Managers/            SettingsManager (+ SettingsSecrets: API key in the Keychain),
+│                        GlassesManager (DAT session, capture button, full-res stills, stream),
+│                        ConversationManager (History)
+├── Models/              AppSettings, conversation models
+├── Resources/           Info.plist, SolutionRenderer/ (offline KaTeX + marked page)
+├── Services/
+│   ├── GeminiLive/      GeminiLiveService — REST streaming solver, retries, agent loop, prompt
+│   ├── TTS/             TTSService — Apple voices per language, SpokenMath
+│   ├── Voice/           VoiceCommandService — wake word, recognition, barge-in
+│   ├── Audio/           AudioSessionManager (HFP routing to the glasses), SoundService
+│   ├── Recording/       SessionRecorder — POV demo recording
+│   ├── Telemetry/       Local latency metrics (no network)
+│   └── AIBackend/       Connection state / error types
+└── Views/
+    ├── VoiceAgent/      VoiceAgentView + VoiceAgentViewModel (all orchestration),
+    │                    RecentPhotoScanner, PhotoPayload, SolverIntent, TextChunking
+    ├── Components/      Theme, SolutionView (rendered DISPLAY), bubbles, onboarding
+    ├── History/         Conversations, "Continue" (seeds Gemini's context)
+    └── Settings/        Gemini keys, glasses (button, photo quality), voices
+OpenVisionTests/         Pure logic + scripted-network E2E (see docs/testing)
 ```
+
+## One question, end to end
+
+1. **Photo.** The glasses' capture button reaches the app through DAT Inputs
+   (`GlassesManager.onCaptureButton`). Short press = photo for the next question, hold = photo
+   and solve now, double press = repeat the last answer (configurable). The photo is a
+   standalone still at full sensor resolution (`Camera.photo`); fallbacks are the 720p stream
+   still and a glasses photo already in Camera Roll (`VoiceAgentViewModel.acquireGlassesPhoto`).
+   It stays the context for 120 s / 5 questions.
+2. **Question.** "Ok Vision …" → `VoiceCommandService` (recognizer language from Settings) →
+   `VoiceAgentViewModel.sendCommand`, which sends the words verbatim with the photo.
+3. **Gemini.** `GeminiLiveService.sendRESTMessage` streams the reply, retrying by failure type
+   inside a 120 s deadline. If the model must see and has no photo it answers `[[CAPTURE]]`
+   and the app takes one (`onCaptureRequested`).
+4. **Answer.** The `SPOKEN:` channel is spoken sentence by sentence while it streams
+   (`onPartialSpoken` → `TTSService`), in the question's language; `DISPLAY:` opens in
+   `SolutionSheet` (KaTeX, offline). Both go to History.
 
 ## Patterns
 
-- **MVVM** on the main screen: `VoiceAgentView` is rendering + interaction forwarding only;
-  `VoiceAgentViewModel` (a `@MainActor ObservableObject`) owns session lifecycle, command
-  routing, live-video modes, TTS streaming, and history. Service callbacks capture the
-  ViewModel weakly — services are app-lifetime singletons and must not pin it.
-- **Protocol seams, not concrete types**, wherever behavior varies:
-  - `AIBackend` — every conversational backend (see below).
-  - `LocalTextLLM` — the on-device routing brain (Gemma, Apple Intelligence), including a
-    `routeCommandStreaming` capability with a non-streaming default.
-  - `NativeTool` — one productivity tool; the registry adapts it to every backend's
-    function-calling format ([docs/native-tools.md](native-tools.md)).
-  - `LiveVideoService` — realtime audio/video backends (Gemini Live, OpenAI Realtime).
-  - `NeuralSpeechEngine` — Kokoro and the cloud voices (`CloudTTSService`); the ViewModel
-    talks to `NeuralSpeech.active(settings)` instead of naming an engine.
-- **Subscription sign-in** (`Services/OAuth`) is provider-agnostic: an `OAuthProvider` value
-  holds the client id, endpoints and loopback redirect, `OAuthSignIn.signIn(_:)` runs the flow,
-  and `OAuthTokenStore.shared.freshCredentials(for:)` hands back a refreshed token. A backend
-  that supports a subscription only needs its provider config.
-- **Services are singletons** (`Service.shared`) orchestrated from the ViewModel. Pure logic
-  that needs testing lives in enums/free functions (`NativeToolSupport`, `LocalAgent`,
-  `TextChunking`) so tests never touch hardware, network, or models.
-
-## The AIBackend seam
-
-`Services/AIBackend/AIBackendProtocol.swift` defines the contract; the voice agent drives
-whichever backend the user selected through it — no downcasts, no per-backend switches:
-
-```swift
-@MainActor protocol AIBackend: AnyObject {
-    var backendType: AIBackendType { get }
-    var onAgentMessage: ((String) -> Void)? { get set }
-    var onProcessingChanged: ((Bool) -> Void)? { get set }
-    func sendMessage(_ text: String, imageData: Data?) async throws
-    // Capabilities (defaulted):
-    var localLLM: LocalTextLLM? { get }        // on-device routing brain
-    var supportsImageInput: Bool { get }       // photo commands attach a glasses frame
-}
-```
-
-**Adding a backend:**
-1. Write your service (any shape you like internally).
-2. Conform it to `AIBackend` in `AIBackendConformances.swift` (thin adapter if names differ).
-3. Add a case to `AIBackendType` (Models/AppSettings.swift) and one line to `AIBackendRegistry`.
-4. If it should run the productivity tools, wire its function-calling loop to
-   `NativeToolRegistry.shared` (see how OpenAI/Gemini do it). An OpenAI-compatible Chat
-   Completions API can call `CloudChat.chatCompletionsReply` and get the prompt, history,
-   photos, web search and tools for free; `GrokService` is the smallest example. For an agent
-   that runs its own tools, pass `offerTools: false`, `maxTokens: nil` and its own `system`
-   prompt, as `HermesService` does.
-
-**Adding a native tool:** see [docs/native-tools.md](native-tools.md) — implement `NativeTool`,
-register it, add the Apple `Tool` wrapper, and mention it in the backend prompts.
+- **MVVM on the main screen.** `VoiceAgentView` renders; `VoiceAgentViewModel`
+  (`@MainActor ObservableObject`) owns session lifecycle, routing, speech streaming and History.
+  Service callbacks capture the view model weakly.
+- **Singleton services** (`Service.shared`), orchestrated from the view model.
+- **Pure logic in enums/static functions** (`SolverIntent`, `TextChunking`, `PhotoPayload`,
+  `SpokenMath`, `GeminiLiveService.parseDualChannel` / `classifyHTTPError` / `parseSSELine`) so
+  tests never need hardware or network.
+- **Audio invariants** (do not regress): one shared mic tap, a stable audio session, HFP routing
+  to the glasses, a 350 ms echo guard, barge-in paused *before* speech starts.
 
 ## Tests
 
-`OpenVisionTests` runs via the standard test action:
-
 ```bash
-xcodebuild test -project OpenVision.xcodeproj -scheme OpenVision -destination "id=<device-udid>"
+xcodebuild test -project OpenVision.xcodeproj -scheme OpenVision -destination "platform=iOS Simulator,name=iPhone 16 Pro"
 ```
 
-Current coverage is the pure logic where silent regressions hurt: tool date resolution
-("remind me at 6 PM" → exactly 6:00 PM), the local model's JSON router, and TTS sentence
-chunking. New pure logic should come with tests; hardware/model paths are verified on-device.
+- `BlueprintSolverTests` — parsing, language, voices, keys, photo sizing, SpokenMath.
+- `BlueprintGeminiE2ETests` — a scripted Gemini endpoint (URLProtocol): retries, model fallback,
+  media-resolution step-down, agent loop, stale signatures, streamed speech.
+- `GeminiLiveSmokeTests` — one real call when `OPENVISION_GEMINI_API_KEYS` is set (CI secret).
+- `scripts/blueprint/verify_blueprint.py` — static guard run before every IPA build, including
+  a check that no Gemini key is in the repository.
+
+Glasses-only paths (capture button, full-resolution transfer) are verified on hardware.

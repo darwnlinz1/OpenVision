@@ -1,5 +1,5 @@
 // OpenVision - OnboardingView.swift
-// Beautiful onboarding experience for first-time users
+// First-run walkthrough, in the app's emerald theme.
 
 import SwiftUI
 
@@ -50,12 +50,12 @@ struct OnboardingView: View {
                 // Navigation buttons
                 HStack {
                     if currentPage > 0 {
-                        Button("Back") {
+                        Button("Quay lại") {
                             withAnimation {
                                 currentPage -= 1
                             }
                         }
-                        .foregroundColor(.white.opacity(0.7))
+                        .foregroundColor(Theme.textSecondary)
                     }
 
                     Spacer()
@@ -67,19 +67,15 @@ struct OnboardingView: View {
                             }
                         } label: {
                             HStack {
-                                Text("Next")
+                                Text("Tiếp")
                                 Image(systemName: "arrow.right")
                             }
-                            .foregroundColor(.white)
+                            .foregroundColor(.black.opacity(0.9))
                             .padding(.horizontal, 24)
                             .padding(.vertical, 12)
                             .background(
                                 Capsule()
-                                    .fill(LinearGradient(
-                                        colors: [.blue, .purple],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    ))
+                                    .fill(Theme.buttonGradient)
                             )
                         }
                     }
@@ -109,7 +105,7 @@ private struct WelcomePage: View {
                     Circle()
                         .stroke(
                             LinearGradient(
-                                colors: [.blue.opacity(0.3), .purple.opacity(0.3)],
+                                colors: [Theme.accentBright.opacity(0.3), Theme.accentDeep.opacity(0.3)],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             ),
@@ -121,15 +117,9 @@ private struct WelcomePage: View {
 
                 // Main logo circle
                 Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [.blue, .purple],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
+                    .fill(Theme.buttonGradient)
                     .frame(width: 100, height: 100)
-                    .shadow(color: .blue.opacity(0.5), radius: 20)
+                    .shadow(color: Theme.glow.opacity(0.5), radius: 20)
 
                 // Glasses icon
                 Image(systemName: "eyeglasses")
@@ -145,7 +135,7 @@ private struct WelcomePage: View {
                     .font(.system(size: 42, weight: .bold))
                     .foregroundColor(.white)
 
-                Text("Your glasses. Your AI. Your rules.")
+                Text("Chụp bài, hỏi, nghe đáp án ngay trên kính.")
                     .font(.title3)
                     .foregroundColor(.white.opacity(0.7))
             }
@@ -170,38 +160,34 @@ private struct FeaturesPage: View {
         VStack(spacing: 32) {
             Spacer()
 
-            Text("Powerful Features")
+            Text("Làm được gì")
                 .font(.title)
                 .fontWeight(.bold)
                 .foregroundColor(.white)
 
             VStack(spacing: 24) {
                 FeatureRow(
+                    icon: "camera.shutter.button",
+                    title: "Ảnh thẳng từ kính",
+                    description: "Bấm nút chụp: ảnh nét gửi ngay cho Gemini, không chờ Thư viện."
+                )
+
+                FeatureRow(
                     icon: "mic.fill",
-                    color: .blue,
-                    title: "Voice Control",
-                    description: "Say \"Ok Vision\" to activate. Hands-free interaction."
+                    title: "Hỏi tự do, Việt hoặc Anh",
+                    description: "Nói \"Ok Vision\" rồi hỏi gì cũng được. Hỏi tiếng nào, đáp tiếng đó."
                 )
 
                 FeatureRow(
-                    icon: "camera.fill",
-                    color: .purple,
-                    title: "Smart Vision",
-                    description: "AI sees what you see through your glasses."
-                )
-
-                FeatureRow(
-                    icon: "bolt.fill",
-                    color: .orange,
-                    title: "56+ Tools",
-                    description: "From web search to smart home control."
+                    icon: "function",
+                    title: "Lời giải có công thức",
+                    description: "Kính đọc đáp án; iPhone hiện từng bước với công thức toán."
                 )
 
                 FeatureRow(
                     icon: "lock.shield.fill",
-                    color: .green,
-                    title: "Privacy First",
-                    description: "Wake word means you control when AI listens."
+                    title: "Key của riêng bạn",
+                    description: "API key nằm trong Keychain của máy, không bao giờ trong mã nguồn."
                 )
             }
             .padding(.horizontal, 24)
@@ -214,7 +200,6 @@ private struct FeaturesPage: View {
 
 private struct FeatureRow: View {
     let icon: String
-    let color: Color
     let title: String
     let description: String
 
@@ -223,12 +208,12 @@ private struct FeatureRow: View {
             // Icon
             ZStack {
                 Circle()
-                    .fill(color.opacity(0.2))
+                    .fill(Theme.accent.opacity(0.2))
                     .frame(width: 50, height: 50)
 
                 Image(systemName: icon)
                     .font(.system(size: 22))
-                    .foregroundColor(color)
+                    .foregroundColor(Theme.accent)
             }
 
             // Text
@@ -264,7 +249,7 @@ private struct SetupPage: View {
         VStack(spacing: 32) {
             Spacer()
 
-            Text("Quick Setup")
+            Text("Thiết lập nhanh")
                 .font(.title)
                 .fontWeight(.bold)
                 .foregroundColor(.white)
@@ -272,26 +257,26 @@ private struct SetupPage: View {
             VStack(spacing: 20) {
                 SetupStep(
                     number: 1,
-                    title: "Choose AI Backend",
-                    description: "OpenClaw for tools & tasks, or Gemini Live for conversation"
+                    title: "Dán API key Gemini",
+                    description: "Cài đặt → Gemini. Lấy key miễn phí ở Google AI Studio"
                 )
 
                 SetupStep(
                     number: 2,
-                    title: "Add Credentials",
-                    description: "Enter your gateway URL or API key in Settings"
+                    title: "Kết nối kính",
+                    description: "Đăng ký kính Ray-Ban Meta qua ứng dụng Meta AI"
                 )
 
                 SetupStep(
                     number: 3,
-                    title: "Connect Glasses",
-                    description: "Register your Meta Ray-Bans (or use iPhone camera)"
+                    title: "Chụp và hỏi",
+                    description: "Bấm nút chụp trên gọng kính, rồi nói \"Ok Vision\" + câu hỏi"
                 )
 
                 SetupStep(
                     number: 4,
-                    title: "Start Talking",
-                    description: "Say \"Ok Vision\" and ask anything"
+                    title: "Nghe và xem",
+                    description: "Kính đọc đáp án; iPhone hiện lời giải chi tiết có công thức"
                 )
             }
             .padding(.horizontal, 24)
@@ -312,18 +297,12 @@ private struct SetupStep: View {
             // Number badge
             ZStack {
                 Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [.blue, .purple],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
+                    .fill(Theme.buttonGradient)
                     .frame(width: 36, height: 36)
 
                 Text("\(number)")
                     .font(.headline)
-                    .foregroundColor(.white)
+                    .foregroundColor(.black.opacity(0.9))
             }
 
             // Text
@@ -357,7 +336,7 @@ private struct GetStartedPage: View {
                 Circle()
                     .fill(
                         RadialGradient(
-                            colors: [.green.opacity(0.3), .clear],
+                            colors: [Theme.glow.opacity(0.3), .clear],
                             center: .center,
                             startRadius: 0,
                             endRadius: 100
@@ -366,27 +345,21 @@ private struct GetStartedPage: View {
                     .frame(width: 200, height: 200)
 
                 Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [.green, .green.opacity(0.8)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
+                    .fill(Theme.buttonGradient)
                     .frame(width: 100, height: 100)
-                    .shadow(color: .green.opacity(0.5), radius: 20)
+                    .shadow(color: Theme.glow.opacity(0.5), radius: 20)
 
                 Image(systemName: "checkmark")
                     .font(.system(size: 44, weight: .bold))
                     .foregroundColor(.white)
             }
 
-            Text("You're All Set!")
+            Text("Sẵn sàng!")
                 .font(.title)
                 .fontWeight(.bold)
                 .foregroundColor(.white)
 
-            Text("Configure your AI backend in Settings and start your first conversation.")
+            Text("Dán API key Gemini trong Cài đặt, đăng ký kính, rồi nói \"Ok Vision\".")
                 .font(.body)
                 .foregroundColor(.white.opacity(0.7))
                 .multilineTextAlignment(.center)
@@ -400,22 +373,13 @@ private struct GetStartedPage: View {
                     hasCompletedOnboarding = true
                 }
             } label: {
-                Text("Get Started")
+                Text("Bắt đầu")
                     .font(.headline)
-                    .foregroundColor(.white)
+                    .foregroundColor(.black.opacity(0.9))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 16)
-                    .background(
-                        Capsule()
-                            .fill(
-                                LinearGradient(
-                                    colors: [.blue, .purple],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                    )
-                    .shadow(color: .blue.opacity(0.3), radius: 10)
+                    .background(Capsule().fill(Theme.buttonGradient))
+                    .shadow(color: Theme.glow.opacity(0.3), radius: 10)
             }
             .scaleEffect(buttonScale)
             .padding(.horizontal, 32)

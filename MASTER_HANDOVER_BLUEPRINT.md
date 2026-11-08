@@ -54,13 +54,14 @@ sequenceDiagram
 ### 2.1. Luồng Người Dùng Chính (Primary Shutter Workflow):
 1. Người dùng nhìn vào đề bài / trang sách / màn hình máy tính.
 2. Bấm nút chụp trên gọng kính phải. Ứng dụng Meta View tự động đồng bộ ảnh 12MP về Camera Roll của iPhone.
-3. Người dùng nói vào mic kính: *"Giải câu này"* hoặc *"Đáp án là gì"*.
-4. `RecentPhotoScanner` (`PHPhotoLibrary`) tự động phát hiện ảnh vừa chụp trong vòng 120 giây, gán vào ngữ cảnh đàm thoại (`CapturedPhotoContext`).
-5. `VoiceAgentViewModel` gửi ảnh + câu hỏi lên Google Gemini 3.5 Flash Lite qua REST API.
+3. Người dùng gọi *"Ok Vision"* rồi nói **tự do, tiếng Việt hoặc tiếng Anh** (*"Giải câu này"*, *"Câu 3 chọn gì?"*, *"What does this say?"*…). **Không có danh sách câu cố định** — Gemini nhận nguyên văn và tự hiểu ý.
+4. `RecentPhotoScanner` (`PHPhotoLibrary`) đã **tải trước** ảnh ngay khi Meta View đồng bộ về (ảnh **gốc 12MP**, ngoài main thread), gán vào ngữ cảnh đàm thoại (`CapturedPhotoContext`, 120 giây / 5 câu hỏi).
+5. `VoiceAgentViewModel` gửi ảnh + câu hỏi nguyên văn lên Google Gemini 3.5 Flash Lite qua REST **streaming (SSE)**; kính bắt đầu đọc ngay khi câu SPOKEN đầu tiên về tới.
 6. Gemini phân tích và trả về định dạng **Kênh Đôi (Dual-Channel)**:
    - **Kênh SPOKEN**: 2 đến 4 câu văn tiếng Việt có dấu, đọc to rõ ràng phương pháp, bước tính chính và đáp án qua loa thái dương của kính.
    - **Kênh DISPLAY**: Lời giải chi tiết từng bước có công thức toán học LaTeX chuẩn (`$...$`, `$$...$$`) hiển thị trên màn hình iPhone.
-7. Người dùng có thể hỏi tiếp các câu nối tiếp (*"Tại sao lại ra x = 2?"*, *"Còn câu 2 thì sao?"*) trong vòng 120 giây mà không cần chụp lại ảnh (`conversationHistory` giữ ngữ cảnh).
+7. Người dùng có thể hỏi tiếp các câu nối tiếp (*"Tại sao lại ra x = 2?"*, *"Còn câu 2 thì sao?"*) trong vòng 120 giây mà không cần chụp lại ảnh (`conversationHistory` giữ ngữ cảnh, ảnh không bị upload lại). Câu hỏi không liên quan tới ảnh (*"Thủ đô của Pháp?"*) được trả lời bình thường.
+8. Trả lời luôn theo **ngôn ngữ người hỏi**; giọng đọc tự chọn theo ngôn ngữ câu trả lời. Nếu mạng lỗi sau khi đã retry, **kính nói ra lỗi** (không im lặng).
 
 ---
 
@@ -116,6 +117,8 @@ Bất kỳ AI nào tiếp quản **BẮT BUỘC** phải đọc kỹ 7 bài họ
 | `OpenVision/Services/TTS/TTSService.swift` | **Dịch vụ Giọng nói**: Quản lý `AVSpeechSynthesizer`, bộ lọc `cleanSpokenAudio` (loại bỏ LaTeX và markdown), cờ `isSpeaking` đồng bộ, bộ đếm `pendingUtterances`, callback `onSpeechEnded`. |
 | `OpenVision/Services/Audio/AudioSessionManager.swift` | **Quản lý Audio Session**: Cố định category `.playAndRecord`, chống giật Volume HUD, định tuyến mic Bluetooth HFP kính Ray-Ban Meta. |
 | `OpenVision/Services/Voice/VoiceCommandService.swift` | **Nhận diện Giọng nói & Wake Word**: Sở hữu duy nhất tap Bus 0 trên `AVAudioEngine`, từ khóa tiếng Việt (`ô kê vi dơn`, `dừng lại`). |
+| `PhotoPayload` / `SolverIntent` (trong `VoiceAgentViewModel.swift`) | Ảnh full-res (JPEG gốc đi nguyên byte; HEIC/xoay EXIF mã hóa lại 1 lần), bản 2048px cho lịch sử; các quy tắc thuần: TTL ảnh, lệnh dừng song ngữ, thông báo lỗi theo ngôn ngữ, backend nào tự hiểu ý (`modelDecidesIntent`). |
+| `GeminiLiveService` – tầng mạng | SSE streaming, retry theo loại lỗi (429 → đổi key; key hỏng → loại 1 giờ; 5xx → backoff + jitter; rớt mạng → thử lại hoặc giữ phần đã nhận), deadline tổng 120s, `mediaResolution: HIGH` (tự bỏ nếu model không hỗ trợ), `maxOutputTokens` 8192. |
 | `OpenVision/Resources/Info.plist` | **Quyền Hệ thống**: `NSPhotoLibraryUsageDescription`, `NSMicrophoneUsageDescription`, `NSCameraUsageDescription`, `NSBluetoothAlwaysUsageDescription`. |
 
 ---
@@ -126,6 +129,13 @@ Khi giao tiếp với Google Gemini, System Prompt phải luôn tuân thủ cấ
 
 ```
 You are an expert AI professor and STEM/math solver integrated directly into Ray-Ban Meta Gen 2 smart glasses and iPhone. You can see what the user sees through their camera (textbooks, math problems, exams, computer screens, code).
+
+HOW THE USER TALKS TO YOU: free speech in Vietnamese or English (from speech recognition — expect typos).
+ALWAYS answer in the language the user used in their latest message.
+
+PHOTOS: an attached image is the photo just taken with the glasses' capture button. Use it when the
+question could be about it; ignore it for clearly unrelated questions; if the user asks about what they
+see and there is no image in the conversation, say no photo was found and ask them to press the capture button.
 
 When solving problems or answering questions, you MUST strictly follow the DUAL-CHANNEL RESPONSE FORMAT:
 
@@ -152,7 +162,7 @@ Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ 
 1. Cắm cáp kết nối iPhone 15 Pro với máy tính Windows/Mac.
 2. Mở phần mềm **Sideloadly**.
 3. Kéo thả file `OpenVision.ipa` vào Sideloadly.
-4. Nhập Apple ID (`thanhnguyen208215@gmail.com`).
+4. Nhập Apple ID (`<Apple ID của bạn>`).
 5. Bấm **Start** để ký chứng chỉ cá nhân và cài đặt ứng dụng vào máy.
 6. Trên iPhone, vào **Cài đặt -> Cài đặt chung -> Quản lý VPN & Thiết bị** -> Bấm Tin cậy nhà phát triển.
 
@@ -160,11 +170,15 @@ Complete step-by-step solution for the iPhone screen. Use standard LaTeX ($...$ 
 
 ## 7. CHECKLIST KIỂM THỬ CHO KỸ SƯ KẾ NHIỆM
 
+> **Tự động hóa:** phần lớn checklist này giờ chạy tự động — `make blueprint-check` (guard tĩnh, vài giây), `make e2e` (XCTest trên Simulator iOS 18+), `make e2e-live` (Gemini thật), và Test 6 trong workflow *Build Unsigned IPA*. Ma trận truy vết đầy đủ và quy trình trên phần cứng thật (H1–H8): [`docs/testing/E2E_TEST_PLAN.md`](docs/testing/E2E_TEST_PLAN.md).
+
 Khi tiếp quản và phát triển tính năng mới, bắt buộc phải kiểm tra qua 6 bài test này trước khi giao sản phẩm:
 
 - [ ] **Test 1**: Bấm nút chụp vật lý trên gọng kính phải -> Đợi 2 giây -> Nói "Giải câu này" -> App phải tự lấy ảnh từ Photos gửi Gemini, không được báo lỗi thiếu ảnh.
 - [ ] **Test 2**: AI đọc đáp số qua loa gọng kính trong 5-10 giây liên tục không bị ngắt giữa chừng.
 - [ ] **Test 3**: Nút âm lượng trên iPhone không bị giật, loa kính không phát tiếng click lặp đi lặp lại.
 - [ ] **Test 4**: Nói câu hỏi tiếp nối ("Tại sao lại ra kết quả đó?") trong vòng 60 giây -> Gemini phải trả lời dựa trên ngữ cảnh bài toán trước.
-- [ ] **Test 5**: Cố tình hỏi câu hỏi thị giác khi che camera hoặc chưa chụp ảnh -> App phải nói: "Không tìm thấy ảnh chụp...", không được gửi text chay lên Gemini.
-- [ ] **Test 6**: File IPA sau khi build xong phải trích xuất kiểm tra binary Mach-O có đầy đủ các symbol: `RecentPhotoScanner`, `cleanSpokenAudio`, `conversationHistory`.
+- [ ] **Test 5**: Cố tình hỏi câu hỏi thị giác khi chưa chụp ảnh -> Kính phải nói không tìm thấy ảnh và nhắc bấm nút chụp (bằng ngôn ngữ người hỏi). *(Cập nhật: do Gemini tự nhận biết, không còn dựa vào danh sách câu cố định; câu hỏi không liên quan tới ảnh vẫn được trả lời bình thường.)*
+- [ ] **Test 6**: File IPA sau khi build xong phải trích xuất kiểm tra binary Mach-O có đầy đủ các symbol: `RecentPhotoScanner`, `cleanSpokenAudio`, `conversationHistory` (+ `PhotoPayload`, `streamGenerateContent`, `SolverIntent`). Tự động: `scripts/blueprint/verify_ipa_symbols.sh`.
+- [ ] **Test 7**: Hỏi bằng tiếng Anh sau khi chụp -> trả lời và đọc bằng tiếng Anh.
+- [ ] **Test 8**: Mạng yếu -> hoặc có câu trả lời, hoặc kính nói "Mạng đang chậm…" trong ≤ 2 phút; không bao giờ treo "Thinking…".

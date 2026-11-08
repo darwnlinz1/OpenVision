@@ -35,7 +35,7 @@ struct ConversationListView: View {
                         // Fresh conversation: next exchange starts a new History entry with
                         // no carried-over model context.
                         conversationManager.startNewConversation()
-                        ConversationContext.shared.clear()
+                        GeminiLiveService.shared.clearConversationHistory()
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -163,7 +163,7 @@ struct ConversationDetailView: View {
                     // and reload its recent exchanges as the model's live context, so the next
                     // "Ok Vision" follow-up picks up where it left off.
                     ConversationManager.shared.resumeConversation(conversation)
-                    ConversationContext.shared.seed(from: conversation)
+                    GeminiLiveService.shared.seedHistory(from: conversation.messages.map { ($0.role == .user, $0.content) })
                     resumed = true
                 } label: {
                     Label(resumed ? "Resumed" : "Continue", systemImage: resumed ? "checkmark.circle" : "arrow.right.circle")
@@ -178,6 +178,14 @@ struct ConversationDetailView: View {
 
 struct MessageBubble: View {
     let message: Message
+    @State private var openSolution: SolutionItem?
+
+    /// Assistant replies with formulas or structure open in the rendered solution view.
+    private var hasRichSolution: Bool {
+        message.role == .assistant
+            && (message.content.contains("$") || message.content.contains("\\(") || message.content.contains("\\[")
+                || message.content.contains("```") || message.content.contains("\n|"))
+    }
 
     var body: some View {
         HStack {
@@ -194,9 +202,23 @@ struct MessageBubble: View {
                     .foregroundColor(message.role == .user ? Color.black.opacity(0.9) : .primary)
                     .cornerRadius(16)
 
-                Text(message.timestamp.formatted(date: .omitted, time: .shortened))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                HStack(spacing: 10) {
+                    Text(message.timestamp.formatted(date: .omitted, time: .shortened))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if hasRichSolution {
+                        Button {
+                            openSolution = SolutionItem(markdown: message.content)
+                        } label: {
+                            Label("Xem công thức", systemImage: "function")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundColor(Theme.accent)
+                    }
+                }
+            }
+            .sheet(item: $openSolution) { item in
+                SolutionSheet(markdown: item.markdown)
             }
 
             if message.role == .assistant {

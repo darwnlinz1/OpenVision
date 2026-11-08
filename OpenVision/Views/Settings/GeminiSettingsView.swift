@@ -12,7 +12,6 @@ struct GeminiSettingsView: View {
     // MARK: - State
 
     @State private var apiKey: String = ""
-    @State private var videoFPS: Int = 1
 
     // MARK: - Body
 
@@ -21,102 +20,52 @@ struct GeminiSettingsView: View {
             // API Key
             Section {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("API Key")
+                    Text("API key")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    SecureField("Your Gemini API key", text: $apiKey)
+                    SecureField("AQ.… hoặc AIza…  (nhiều key: cách nhau bằng dấu phẩy)", text: $apiKey)
                         .autocapitalization(.none)
                         .autocorrectionDisabled()
                 }
             } header: {
-                Text("Authentication")
+                Text("Xác thực")
             } footer: {
-                if apiKey.isEmpty {
+                let count = GeminiLiveService.parseKeys(apiKey).count
+                VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        Text("Chưa có API key — dán key Gemini của bạn vào ô trên")
-                            .foregroundColor(.orange)
+                        Image(systemName: count > 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundColor(count > 0 ? Theme.success : Theme.warning)
+                        Text(count > 0 ? "\(count) key — lưu trong Keychain của máy, không nằm trong mã nguồn" : "Chưa có key: app không thể gọi Gemini")
+                            .foregroundColor(count > 0 ? Theme.success : Theme.warning)
                     }
-                    .font(.caption)
-                } else {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("API key đã cấu hình (lưu trong Keychain)")
-                            .foregroundColor(.green)
-                    }
-                    .font(.caption)
+                    Text("Quota tính theo PROJECT và theo model, không theo key: chỉ thêm key từ các project Google Cloud khác nhau mới tăng quota. Khi model chính hết quota, app tự chuyển sang \(GeminiLiveService.modelChain.dropFirst().joined(separator: ", ")).")
+                        .foregroundColor(.secondary)
                 }
-            }
-
-            // Video Settings
-            Section {
-                Picker("Video Frame Rate", selection: $videoFPS) {
-                    Text("1 FPS (Recommended)").tag(1)
-                    Text("2 FPS").tag(2)
-                    Text("5 FPS").tag(5)
-                }
-            } header: {
-                Text("Video Streaming")
-            } footer: {
-                Text("Higher frame rates use more bandwidth and API quota. 1 FPS is recommended for most use cases.")
+                .font(.caption)
             }
 
             // Help
             Section {
                 Link(destination: URL(string: "https://aistudio.google.com/app/apikey")!) {
                     HStack {
-                        Text("Get API Key")
+                        Text("Lấy API key (Google AI Studio)")
                         Spacer()
                         Image(systemName: "arrow.up.right.square")
                             .foregroundColor(.secondary)
                     }
                 }
 
-                Link(destination: URL(string: "https://ai.google.dev/gemini-api/docs/live-api")!) {
-                    HStack {
-                        Text("Gemini Live Documentation")
-                        Spacer()
-                        Image(systemName: "arrow.up.right.square")
-                            .foregroundColor(.secondary)
-                    }
-                }
             } header: {
-                Text("Help")
+                Text("Trợ giúp")
             } footer: {
-                Text("Gemini Live provides real-time voice and vision AI with native audio responses.")
+                Text("Model: \(GeminiLiveService.modelChain.joined(separator: " → ")). Câu trả lời được truyền dần (streaming): kính đọc câu đầu tiên ngay khi có.")
             }
 
-            // Info
-            Section {
-                HStack {
-                    Text("Input Audio")
-                    Spacer()
-                    Text("16kHz PCM")
-                        .foregroundColor(.secondary)
-                }
-                HStack {
-                    Text("Output Audio")
-                    Spacer()
-                    Text("24kHz PCM")
-                        .foregroundColor(.secondary)
-                }
-                HStack {
-                    Text("Video Format")
-                    Spacer()
-                    Text("JPEG @ \(videoFPS) FPS")
-                        .foregroundColor(.secondary)
-                }
-            } header: {
-                Text("Technical Details")
-            }
         }
-        .navigationTitle("Gemini Live")
+        .navigationTitle("Gemini")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             apiKey = settingsManager.settings.geminiAPIKey
-            videoFPS = settingsManager.settings.geminiVideoFPS
         }
         .onDisappear {
             saveSettings()
@@ -134,8 +83,8 @@ struct GeminiSettingsView: View {
     // MARK: - Methods
 
     private func saveSettings() {
-        settingsManager.settings.geminiAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        settingsManager.settings.geminiVideoFPS = videoFPS
+        // Normalised to "key1, key2" — GeminiLiveService.parseKeys reads any separator.
+        settingsManager.settings.geminiAPIKey = GeminiLiveService.parseKeys(apiKey).joined(separator: ", ")
         settingsManager.saveNow()
     }
 }

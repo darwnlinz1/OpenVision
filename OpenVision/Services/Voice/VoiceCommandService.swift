@@ -125,7 +125,25 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Speech Recognition
 
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    /// Recognizer for the language chosen in Settings → Voice ("auto" = the iPhone's language).
+    /// Re-created when the choice changes; a new recognition task picks it up.
+    private var speechRecognizer: SFSpeechRecognizer? {
+        let identifier = Self.recognitionLocaleIdentifier(SettingsManager.shared.settings.recognitionLanguage)
+        if let cached = cachedRecognizer, cached.identifier == identifier { return cached.recognizer }
+        let recognizer = SFSpeechRecognizer(locale: Locale(identifier: identifier)) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        cachedRecognizer = (identifier, recognizer)
+        print("[VoiceCommand] Speech recognizer locale: \(identifier)")
+        return recognizer
+    }
+    private var cachedRecognizer: (identifier: String, recognizer: SFSpeechRecognizer?)?
+
+    /// "auto" → the device language (vi-VN on a Vietnamese iPhone), else the explicit choice.
+    static func recognitionLocaleIdentifier(_ setting: String) -> String {
+        switch setting {
+        case "vi-VN", "en-US": return setting
+        default: return Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+        }
+    }
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
 
@@ -627,7 +645,10 @@ final class VoiceCommandService: ObservableObject {
     /// Start conversation timeout (auto-exit after silence)
     private func startConversationTimeout() {
         conversationTimeoutTimer?.invalidate()
-        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: Constants.Voice.conversationTimeout, repeats: false) { [weak self] _ in
+        // The Settings → Voice "auto-end" choice (it used to be ignored: the constant always won).
+        let configured = SettingsManager.shared.settings.conversationTimeout
+        let timeout = configured > 0 ? configured : Constants.Voice.conversationTimeout
+        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.handleConversationTimeout()
             }

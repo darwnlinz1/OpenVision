@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">
+<!-- Offline only: nothing may be fetched from the network, no inline event handlers. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:">
+<link rel="stylesheet" href="katex.min.css">
+<script src="katex.min.js"></script>
+<script src="marked.umd.js"></script>
+<style>
+  :root { color-scheme: dark; --fg: #F2FFF6; --muted: rgba(255,255,255,.62); --accent: #29D978; --card: rgba(255,255,255,.05); --rule: rgba(255,255,255,.10); }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--fg); }
+  body { font: -apple-system-body; font-family: -apple-system, system-ui, sans-serif; line-height: 1.55; padding: 4px 18px 40px; -webkit-text-size-adjust: 100%; word-wrap: break-word; }
+  h1, h2, h3 { color: #9EFAA8; line-height: 1.3; margin: 1.1em 0 .4em; }
+  h1 { font-size: 1.35em; } h2 { font-size: 1.2em; } h3 { font-size: 1.08em; }
+  p { margin: .55em 0; }
+  strong { color: #fff; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background: var(--card); padding: .1em .35em; border-radius: 6px; }
+  pre { background: var(--card); border: 1px solid var(--rule); border-radius: 12px; padding: 12px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8em 0; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--rule); padding: 6px 10px; text-align: left; }
+  th { background: var(--card); }
+  blockquote { margin: .8em 0; padding: .2em 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+  ol, ul { padding-left: 1.4em; }
+  .katex { font-size: 1.12em; }
+  .katex-display { overflow-x: auto; overflow-y: hidden; padding: 6px 0; margin: .7em 0; }
+  .math-error { color: #FFB4A8; font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<div id="content"></div>
+<script>
+  // Render the model's DISPLAY channel: Markdown with $…$ / $$…$$ / \(…\) / \[…\] math.
+  // Math is cut out BEFORE Markdown (which would eat backslashes and underscores), raw HTML from
+  // the model is escaped (no script can be injected), then each formula goes through KaTeX.
+  function escapeHTML(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function renderMath(tex, display) {
+    try {
+      return katex.renderToString(tex, { displayMode: display, throwOnError: false, strict: "ignore", trust: false, output: "html" });
+    } catch (e) {
+      return '<span class="math-error">' + escapeHTML(tex) + '</span>';
+    }
+  }
+  function render(source) {
+    var math = [];
+    function stash(tex, display) { math.push({ tex: tex, display: display }); return "\u0000M" + (math.length - 1) + "\u0000"; }
+    var text = String(source || "");
+    // Code (fenced and inline) is set aside first: "$" inside code stays literal, and Markdown
+    // escapes code itself, so it must not be pre-escaped here.
+    var code = [];
+    function keepCode(m) { code.push(m); return "\u0000C" + (code.length - 1) + "\u0000"; }
+    text = text.replace(/```[\s\S]*?```/g, keepCode).replace(/`[^`\n]+`/g, keepCode);
+    text = text
+      .replace(/\$\$([\s\S]+?)\$\$/g, function (_, t) { return stash(t, true); })
+      .replace(/\\\[([\s\S]+?)\\\]/g, function (_, t) { return stash(t, true); })
+      .replace(/\\\(([\s\S]+?)\\\)/g, function (_, t) { return stash(t, false); })
+      .replace(/(^|[^\\$])\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/g, function (_, pre, t) { return pre + stash(t, false); });
+    // Escape raw HTML from the model (">" is left alone: Markdown quotes), put code back, then Markdown.
+    text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    text = text.replace(/\u0000C(\d+)\u0000/g, function (_, i) { return code[+i]; });
+    var html = marked.parse(text, { gfm: true, breaks: true });
+    html = html.replace(/\u0000M(\d+)\u0000/g, function (_, i) { var m = math[+i]; return renderMath(m.tex, m.display); });
+    document.getElementById("content").innerHTML = html;
+    window.scrollTo(0, 0);
+  }
+</script>
+</body>
+</html>

@@ -162,7 +162,7 @@ final class SettingsManager: ObservableObject {
             let seconds = self?.debounceInterval ?? 0.5
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            await self?.performSave()
+            self?.performSave()
             self?.onSettingsChanged?(self?.settings ?? AppSettings())
         }
     }
@@ -245,13 +245,7 @@ final class SettingsManager: ObservableObject {
     private static func createDefaultSettings() -> AppSettings {
         var settings = AppSettings()
 
-        // Apply any build-time defaults from Config
-        if !Config.defaultOpenClawGatewayURL.isEmpty {
-            settings.openClawGatewayURL = Config.defaultOpenClawGatewayURL
-        }
-        if !Config.defaultOpenClawAuthToken.isEmpty {
-            settings.openClawAuthToken = Config.defaultOpenClawAuthToken
-        }
+        // A build-time key from the gitignored Config.swift (never committed: the repo is public).
         if !Config.defaultGeminiAPIKey.isEmpty {
             settings.geminiAPIKey = Config.defaultGeminiAPIKey
         }

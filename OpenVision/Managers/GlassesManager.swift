@@ -1,5 +1,13 @@
 // OpenVision - GlassesManager.swift
-// Singleton manager for Meta Ray-Ban glasses via DAT SDK
+// Singleton manager for Meta Ray-Ban glasses via the Meta Wearables DAT SDK 1.0.
+//
+// Three things ride on one DeviceSession:
+//  • the capture-button link (MWDATInputs) — the glasses' own shutter reaches the app directly,
+//    so a photo goes to Gemini without waiting for the Meta AI app to import it to Camera Roll;
+//  • full-resolution stills (Camera.photo, up to the sensor's ~12 MP) — "Click & Go";
+//  • the video stream (POV recording, and the 720p fallback still via stream.capturePhoto).
+// Inputs and Camera.photo are experimental in DAT 1.0: they need the glasses in Developer Mode
+// (MetaAppID 0) or Developer Center approval. Every path here falls back to the next one.
 
 import Foundation
 import SwiftUI
@@ -7,8 +15,16 @@ import CoreMedia
 import OSLog
 import MWDATCore
 import MWDATCamera
+import MWDATInputs
 
-/// Manages Meta Ray-Ban glasses registration, connection, and camera streaming
+/// A press of the glasses' capture button.
+enum GlassesButtonPress: String {
+    case shortPress
+    case hold
+    case doublePress
+}
+
+/// Manages Meta Ray-Ban glasses registration, connection, camera and capture button.
 @MainActor
 final class GlassesManager: ObservableObject {
     // MARK: - Singleton
@@ -32,23 +48,58 @@ final class GlassesManager: ObservableObject {
     /// Last captured video frame
     @Published var lastFrame: UIImage?
 
-    /// When `lastFrame` was received. Lets the live loop tell a fresh frame from a stale one when
-    /// the Bluetooth stream throttles under head motion (so it doesn't describe an old view).
+    /// When `lastFrame` was received.
     private(set) var lastFrameTime: Date = .distantPast
 
-    /// Last captured photo data
+    /// Last photo captured through the video stream (stream.capturePhoto)
     @Published var lastPhotoData: Data?
 
     /// Error message for UI display
     @Published var errorMessage: String?
 
+    /// True while the capture button is routed to the app (Inputs capability active).
+    @Published private(set) var isButtonLinkActive: Bool = false
+
+    /// Human-readable state of the capture-button link, for Settings.
+    @Published private(set) var buttonLinkStatus: String = "Tắt"
+
+    /// True while a full-resolution photo is being taken / transferred from the glasses.
+    @Published private(set) var isTakingPhoto: Bool = false
+
     // MARK: - Private Properties
 
     private let wearables = Wearables.shared
-    // 0.9.0 camera lifecycle: DeviceSession owns the device link, Camera owns the camera
-    // hardware, camera.stream carries frames. Stopping the camera cascades to the stream.
+
+    // Session: one per link to the glasses. Camera and Inputs are its children.
     private var deviceSession: DeviceSession?
+    private var sessionStarted = false
+    private var sessionGeneration = 0
+    private var sessionStartTask: Task<DeviceSession?, Never>?
+    private var sessionMonitorTask: Task<Void, Never>?
+    private var sessionErrorTask: Task<Void, Never>?
+
+    // Camera: attached once per session; the stream and the still shutter compete for it.
     private var camera: Camera?
+    private var photoTokens: [any AnyListenerToken] = []
+    private var photoStarted = false
+    private var pendingPhoto: CheckedContinuation<Data?, Never>?
+    private var pendingPhotoID = UUID()
+    /// Consecutive full-resolution failures; after two the app stops trying for this session
+    /// (Camera.photo not approved / not supported) and goes straight to the stream still.
+    private var fullPhotoFailures = 0
+
+    // Capture-button link (MWDATInputs)
+    private var wantsButtonLink = false
+    private var linkIncludesTouchpad = false
+    private var inputs: Inputs?
+    private var inputsDrainTask: Task<Void, Never>?
+    private var inputsStateToken: (any AnyListenerToken)?
+    private var inputsErrorToken: (any AnyListenerToken)?
+    private var inputsHasActivated = false
+    private var inputsPermissionDenied = false
+    private var inputsRevivalTask: Task<Void, Never>?
+    private var linkRetryTask: Task<Void, Never>?
+    private var linkRetryDelay: UInt64 = 5
 
     // Listener tokens (retained to keep subscriptions active)
     private var registrationTask: Task<Void, Never>?
@@ -63,12 +114,14 @@ final class GlassesManager: ObservableObject {
     /// Called when a video frame is received
     var onVideoFrame: ((UIImage) -> Void)?
 
-    /// Called with the raw sample buffer for every video frame — used by SessionRecorder to mux
-    /// the glasses POV into a movie file without going through UIImage. Independent of `onVideoFrame`.
+    /// Raw sample buffer for every video frame — SessionRecorder muxes the POV video from it.
     var onVideoSampleBuffer: ((CMSampleBuffer) -> Void)?
 
-    /// Called when a photo is captured
+    /// Called when a photo arrives through the video stream (stream.capturePhoto)
     var onPhotoCaptured: ((Data) -> Void)?
+
+    /// Called when the wearer presses the glasses' capture button (button link active).
+    var onCaptureButton: ((GlassesButtonPress) -> Void)?
 
     // MARK: - Initialization
 
@@ -84,7 +137,6 @@ final class GlassesManager: ObservableObject {
     func register() async throws {
         print("[GlassesManager] Starting registration")
 
-        // Check if already registered
         for await state in wearables.registrationStateStream() {
             if case .registered = state {
                 print("[GlassesManager] Already registered")
@@ -94,7 +146,6 @@ final class GlassesManager: ObservableObject {
             break
         }
 
-        // Start registration flow
         try await wearables.startRegistration()
         print("[GlassesManager] Registration initiated, waiting for Meta AI callback")
     }
@@ -102,11 +153,9 @@ final class GlassesManager: ObservableObject {
     /// Unregister app from Meta AI
     func unregister() async {
         print("[GlassesManager] Starting unregistration")
-
-        // Stop streaming first if active
-        if isStreaming {
-            await stopStreaming()
-        }
+        wantsButtonLink = false
+        linkRetryTask?.cancel()
+        endSession()
 
         do {
             try await wearables.startUnregistration()
@@ -116,8 +165,181 @@ final class GlassesManager: ObservableObject {
             errorMessage = nil
             print("[GlassesManager] Unregistration successful")
         } catch {
-            errorMessage = "Unregister failed: \(error.localizedDescription)"
+            errorMessage = "Huỷ đăng ký thất bại: \(error.localizedDescription)"
             print("[GlassesManager] Unregistration error: \(error)")
+        }
+    }
+
+    // MARK: - Session
+
+    /// The started session for the connected glasses — reused when one is up, otherwise created
+    /// and started (≤ 15 s). Concurrent callers share one start attempt.
+    /// `reportErrors: false` for background work (the button link's retries): failures go to the
+    /// log and the link status, not to an alert the wearer didn't ask for.
+    private func ensureSession(reportErrors: Bool = true) async -> DeviceSession? {
+        if let session = deviceSession, sessionStarted { return session }
+        if let task = sessionStartTask { return await task.value }
+        let task = Task { @MainActor [weak self] () -> DeviceSession? in
+            guard let self else { return nil }
+            return await self.startSession(reportErrors: reportErrors)
+        }
+        sessionStartTask = task
+        let session = await task.value
+        sessionStartTask = nil
+        return session
+    }
+
+    private func startSession(reportErrors: Bool) async -> DeviceSession? {
+        func report(_ message: String) {
+            print("[GlassesManager] \(message)")
+            if reportErrors { errorMessage = message }
+        }
+        guard isRegistered else {
+            report("Chưa đăng ký với Meta AI")
+            return nil
+        }
+        guard let deviceId = connectedDevice else {
+            report("Chưa kết nối kính")
+            return nil
+        }
+
+        // The SDK's own verdict on whether it can drive this hardware — surfaces firmware/SDK
+        // mismatches that otherwise fail as an opaque "Device unavailable" at session start.
+        if let device = wearables.deviceForIdentifier(deviceId) {
+            print("[GlassesManager] Device \(device.nameOrId()): type=\(device.deviceType()) link=\(device.linkState) compatibility=\(device.compatibility())")
+            if device.compatibility() == .deviceUpdateRequired {
+                report("Kính cần cập nhật firmware — cập nhật trong app Meta AI")
+            } else if device.compatibility() == .sdkUpdateRequired {
+                report("Kính mới hơn phiên bản SDK của app")
+            }
+        }
+
+        // Tear down whatever is left of an old session first.
+        endSession()
+
+        do {
+            // SpecificDeviceSelector stays the more reliable choice over AutoDeviceSelector
+            let session = try wearables.createSession(deviceSelector: SpecificDeviceSelector(device: deviceId))
+            sessionGeneration += 1
+            let generation = sessionGeneration
+            deviceSession = session
+            sessionStarted = false
+
+            // Subscribe before start() so the .started transition can't be missed.
+            let stateStream = session.stateStream()
+            sessionMonitorTask = Task { @MainActor [weak self] in
+                for await state in stateStream {
+                    print("[GlassesManager] Device session state: \(state)")
+                    guard let self, generation == self.sessionGeneration else { return }
+                    if state == .started {
+                        self.sessionStarted = true
+                    } else if state == .stopped {
+                        self.sessionDidStop(generation: generation)
+                        return
+                    }
+                }
+            }
+            // The session can abort during startup with the reason only on its error stream.
+            let errorStream = session.errorStream()
+            sessionErrorTask = Task { @MainActor [weak self] in
+                for await error in errorStream {
+                    print("[GlassesManager] Device session error: \(error) — \(error.description)")
+                    if reportErrors, UIApplication.shared.applicationState == .active {
+                        self?.errorMessage = "Lỗi phiên kính: \(error.description)"
+                    }
+                }
+            }
+
+            print("[GlassesManager] Starting device session...")
+            try session.start()
+
+            let deadline = Date().addingTimeInterval(15)
+            while !sessionStarted, Date() < deadline, deviceSession != nil, generation == sessionGeneration {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard sessionStarted, generation == sessionGeneration else {
+                report("Không mở được phiên kết nối kính (hết thời gian)")
+                dumpSDKLogs(since: 30)
+                if generation == sessionGeneration { endSession() }
+                return nil
+            }
+            print("[GlassesManager] Device session started")
+            return session
+        } catch {
+            report("Không mở được phiên kết nối kính: \(error.localizedDescription)")
+            endSession()
+            return nil
+        }
+    }
+
+    /// The glasses ended the session (folded, out of range, another app took them…).
+    private func sessionDidStop(generation: Int) {
+        guard generation == sessionGeneration else { return }
+        print("[GlassesManager] Device session stopped by the device")
+        endSession()
+        scheduleLinkRetry()
+    }
+
+    /// Stop the session and forget every child (camera, photo, inputs, stream listeners).
+    private func endSession() {
+        sessionGeneration += 1
+        resolvePendingPhoto(nil)
+        teardownInputs(removeFromSession: false)
+        camera?.stop()
+        deviceSession?.stop()
+        sessionMonitorTask?.cancel()
+        sessionErrorTask?.cancel()
+        sessionMonitorTask = nil
+        sessionErrorTask = nil
+        cleanupStreamListeners()
+        photoTokens = []
+        photoStarted = false
+        camera = nil
+        deviceSession = nil
+        sessionStarted = false
+        isStreaming = false
+        lastFrame = nil
+        lastFrameTime = .distantPast
+    }
+
+    private func ensureCameraPermission() async -> Bool {
+        do {
+            var status = try await wearables.checkPermissionStatus(.camera)
+            if status != .granted {
+                print("[GlassesManager] Requesting camera permission...")
+                status = try await wearables.requestPermission(.camera)
+            }
+            guard status == .granted else {
+                errorMessage = "Chưa cấp quyền camera kính"
+                return false
+            }
+            return true
+        } catch {
+            errorMessage = "Lỗi quyền camera kính: \(error.localizedDescription)"
+            print("[GlassesManager] Permission error: \(error)")
+            return false
+        }
+    }
+
+    /// The session's camera, attached once per session (the stream configuration is fixed at
+    /// attach time: 720p raw, which the POV recording and the fallback still both use).
+    private func cameraForSession(_ session: DeviceSession) -> Camera? {
+        if let camera { return camera }
+        do {
+            let config = StreamConfiguration(videoCodec: .raw, resolution: .high, frameRate: 30)
+            // Order matters: the session must be STARTED before addCamera, else nil.
+            guard let cam = try session.addCamera(config: config) else {
+                errorMessage = "Không gắn được camera vào phiên kính"
+                print("[GlassesManager] addCamera returned nil")
+                return nil
+            }
+            camera = cam
+            observePhoto(cam)
+            return cam
+        } catch {
+            errorMessage = "Không gắn được camera: \(error.localizedDescription)"
+            print("[GlassesManager] addCamera error: \(error)")
+            return nil
         }
     }
 
@@ -125,172 +347,413 @@ final class GlassesManager: ObservableObject {
 
     /// Start camera streaming from glasses
     func startStreaming() async {
-        guard isRegistered else {
-            errorMessage = "Not registered with Meta AI"
-            print("[GlassesManager] Cannot start streaming - not registered")
-            return
-        }
-
         guard !isStreaming else {
             print("[GlassesManager] Already streaming")
             return
         }
-
-        // Check for connected device
-        guard let deviceId = connectedDevice else {
-            errorMessage = "No glasses connected"
-            print("[GlassesManager] Cannot start streaming - no device connected")
+        // A still is crossing: starting the stream now would take the sensor from it.
+        guard !isTakingPhoto else {
+            print("[GlassesManager] Not starting the stream — a photo is being taken")
             return
         }
-
-        print("[GlassesManager] Starting camera stream for device: \(deviceId)")
-
-        // Diagnostic (issue #55 follow-up): the SDK's own verdict on whether it can drive
-        // this hardware — surfaces firmware/SDK mismatches that otherwise fail as an opaque
-        // "Device unavailable" at session start.
-        if let device = wearables.deviceForIdentifier(deviceId) {
-            print("[GlassesManager] Device \(device.nameOrId()): type=\(device.deviceType()) link=\(device.linkState) compatibility=\(device.compatibility())")
-            if device.compatibility() == .deviceUpdateRequired {
-                errorMessage = "Glasses firmware update required — update in the Meta AI app"
-            } else if device.compatibility() == .sdkUpdateRequired {
-                errorMessage = "Glasses too new for this SDK version"
-            }
-        } else {
-            print("[GlassesManager] deviceForIdentifier returned nil")
-        }
-
-        // Request camera permission first (like xmeta does)
-        do {
-            var status = try await wearables.checkPermissionStatus(.camera)
-            print("[GlassesManager] Camera permission status: \(status)")
-
-            if status != .granted {
-                print("[GlassesManager] Requesting camera permission...")
-                status = try await wearables.requestPermission(.camera)
-                print("[GlassesManager] After request, status: \(status)")
-            }
-
-            guard status == .granted else {
-                errorMessage = "Camera permission denied"
-                print("[GlassesManager] Camera permission not granted")
-                return
-            }
-        } catch {
-            errorMessage = "Permission error: \(error.localizedDescription)"
-            print("[GlassesManager] Permission error: \(error)")
+        guard isRegistered else {
+            errorMessage = "Chưa đăng ký với Meta AI"
             return
         }
-
-        // SpecificDeviceSelector stays the more reliable choice over AutoDeviceSelector
-        let specificSelector = SpecificDeviceSelector(device: deviceId)
-
-        let config = StreamConfiguration(
-            videoCodec: .raw,
-            resolution: .high,
-            frameRate: 30
-        )
-
-        do {
-            let session = try wearables.createSession(deviceSelector: specificSelector)
-            deviceSession = session
-
-            // Order matters (SDK docs): the session must be STARTED before addCamera —
-            // attaching the camera to an idle session returns nil (issue #55, Blayzer test).
-            // Subscribe to state before start() so the .started transition can't be missed.
-            let stateStream = session.stateStream()
-            // The session can abort during startup (starting -> stopping -> stopped) with the
-            // reason only on its error stream — log it or we debug blind (seen on Gen 1/2).
-            let sessionErrorTask = Task {
-                for await error in session.errorStream() {
-                    print("[GlassesManager] Device session error: \(error) — \(error.description)")
-                    await MainActor.run { self.errorMessage = "Session error: \(error.description)" }
-                }
-            }
-            defer { sessionErrorTask.cancel() }
-            print("[GlassesManager] Starting device session...")
-            try session.start()
-
-            let started = await withTaskGroup(of: Bool.self) { group in
-                group.addTask {
-                    for await state in stateStream {
-                        print("[GlassesManager] Device session state: \(state)")
-                        if state == .started { return true }
-                        if state == .stopped { return false }
-                    }
-                    return false
-                }
-                group.addTask {
-                    try? await Task.sleep(nanoseconds: 15_000_000_000)
-                    return false
-                }
-                let first = await group.next() ?? false
-                group.cancelAll()
-                return first
-            }
-            guard started else {
-                errorMessage = "Device session did not start (timeout)"
-                print("[GlassesManager] Device session failed to reach .started")
-                dumpSDKLogs(since: 30)
-                session.stop()
-                deviceSession = nil
-                return
-            }
-
-            guard let cam = try session.addCamera(config: config) else {
-                errorMessage = "Failed to attach camera to device session"
-                print("[GlassesManager] addCamera returned nil")
-                session.stop()
-                deviceSession = nil
-                return
-            }
-            camera = cam
-
-            setupStreamListeners(stream: cam.stream)
-            cam.stream.start()
-            isStreaming = true
-            print("[GlassesManager] Streaming started successfully")
-        } catch {
-            errorMessage = "Stream start failed: \(error.localizedDescription)"
-            print("[GlassesManager] Stream start error: \(error)")
-            cleanupStreamListeners()
-            camera = nil
-            deviceSession = nil
-        }
+        guard await ensureCameraPermission() else { return }
+        print("[GlassesManager] Starting camera stream")
+        isStreaming = await wakeCamera() != nil
+        reviveInputsIfNeeded()
     }
 
-    /// Stop camera streaming
+    /// Start the camera's video stream and wait until frames flow. A camera switched off after
+    /// an earlier capture is started again through its stream; if it will not come back, the
+    /// session is rebuilt once with a fresh camera.
+    private func wakeCamera() async -> Camera? {
+        for attempt in 1...2 {
+            guard let session = await ensureSession(), let cam = cameraForSession(session) else { return nil }
+            setupStreamListeners(stream: cam.stream)
+            cam.stream.start()
+            if await waitUntil(seconds: 8, { cam.stream.state == .streaming }) { return cam }
+            print("[GlassesManager] Camera stream did not start (attempt \(attempt)) — rebuilding the session")
+            endSession()
+        }
+        errorMessage = "Camera kính không khởi động được"
+        return nil
+    }
+
+    /// Stop camera streaming. The session stays up while the capture button is linked (the
+    /// button needs it); otherwise it is closed too.
     func stopStreaming() async {
         guard isStreaming || camera != nil || deviceSession != nil else { return }
-
         print("[GlassesManager] Stopping camera stream")
+        guard !isTakingPhoto else { return }   // the photo path stops the camera itself
 
-        camera?.stop()          // cascades to the stream
-        deviceSession?.stop()
-
-        cleanupStreamListeners()
-        camera = nil
-        deviceSession = nil
-        isStreaming = false
-        lastFrame = nil
-        lastFrameTime = .distantPast
-
+        if wantsButtonLink, deviceSession != nil {
+            stopCameraKeepingSession()
+        } else {
+            endSession()
+        }
         print("[GlassesManager] Streaming stopped")
     }
 
-    /// Capture a photo from the glasses camera
+    /// Camera off (LED off, battery), session and button link kept.
+    private func stopCameraKeepingSession() {
+        if photoStarted {
+            camera?.photo.stop()
+            // Cleared now, not on the async .stopped event: a capture right after must start
+            // the shutter again instead of firing on one that is going down (PhotoError.notReady).
+            photoStarted = false
+        }
+        camera?.stream.stop()
+        camera?.stop()
+        cleanupStreamListeners()
+        isStreaming = false
+        lastFrame = nil
+        lastFrameTime = .distantPast
+    }
+
+    /// Capture a 720p still from the running video stream (fallback path).
     func capturePhoto() async {
         guard isStreaming, let stream = camera?.stream else {
-            errorMessage = "Streaming must be active to capture photos"
+            errorMessage = "Camera kính phải đang bật để chụp"
+            return
+        }
+        print("[GlassesManager] Capturing photo from stream")
+        // Failures surface as StreamError.photoCaptureFailed on the error publisher.
+        if !stream.capturePhoto(format: .jpeg) {
+            errorMessage = "Không chụp được ảnh"
+            print("[GlassesManager] capturePhoto returned false")
+        }
+    }
+
+    // MARK: - Full-resolution photo (Camera.photo, DAT 1.0, experimental)
+
+    /// Take a standalone still at full sensor resolution (or 1080p) and return its JPEG bytes,
+    /// or nil so the caller can fall back to the stream still / Camera Roll.
+    ///
+    /// The SDK's camera does not power itself: the video stream is started only to wake the
+    /// sensor, the still shutter is started once frames prove it is awake, the stream is then
+    /// stopped (a running stream makes the still fail), and the capture is fired. The camera
+    /// is switched off again afterwards — "Click & Go" — and the button link, which a still
+    /// takes down (it crosses on the file-transfer channel), is attached again.
+    func captureFullResolutionPhoto(fullResolution: Bool, timeout: TimeInterval = 25) async -> Data? {
+        guard !isTakingPhoto else { return nil }
+        guard isRegistered, connectedDevice != nil else { return nil }
+        // A recording owns the stream; the stream still is the right tool then.
+        guard !isStreaming else { return nil }
+        guard fullPhotoFailures < 2 else { return nil }
+
+        isTakingPhoto = true
+        let startedAt = Date()
+        defer {
+            isTakingPhoto = false
+            reviveInputsIfNeeded()
+        }
+
+        guard await ensureCameraPermission() else { return nil }
+
+        // 1. Wake the sensor with the stream.
+        guard let cam = await wakeCamera() else {
+            print("[GlassesManager] Full photo: the camera never woke")
+            noteFullPhotoFailure()
+            stopCameraAfterPhoto()
+            return nil
+        }
+
+        // 2. Start the still shutter while the sensor is awake.
+        if !photoStarted { cam.photo.start() }
+        guard await waitUntil(seconds: 6, { [weak self] in self?.photoStarted == true }) else {
+            print("[GlassesManager] Full photo: the shutter never reached .started")
+            noteFullPhotoFailure()
+            stopCameraAfterPhoto()
+            return nil
+        }
+
+        // 3. Put the stream down and wait until it has really let go of the sensor.
+        cam.stream.stop()
+        _ = await waitUntil(seconds: 2, { cam.stream.state == .stopped })
+
+        // 4. Fire and wait for the bytes (they arrive on photoDataPublisher).
+        let captureID = UUID()
+        pendingPhotoID = captureID
+        let data: Data? = await withCheckedContinuation { continuation in
+            pendingPhoto = continuation
+            cam.photo.capturePhoto(resolution: fullResolution ? .full : .large, quality: .high)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard let self, self.pendingPhotoID == captureID else { return }
+                print("[GlassesManager] Full photo: timed out after \(Int(timeout)) s")
+                self.resolvePendingPhoto(nil)
+            }
+        }
+
+        stopCameraAfterPhoto()
+
+        guard let data, !data.isEmpty else {
+            noteFullPhotoFailure()
+            return nil
+        }
+        fullPhotoFailures = 0
+        let isJPEG = data.count > 2 && data[data.startIndex] == 0xFF && data[data.startIndex + 1] == 0xD8
+        let seconds = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+        print("[GlassesManager] Full photo: \(data.count) bytes in \(seconds) s (jpeg: \(isJPEG))")
+        return data
+    }
+
+    private func noteFullPhotoFailure() {
+        fullPhotoFailures += 1
+        if fullPhotoFailures >= 2 {
+            print("[GlassesManager] Full photo disabled for this session after repeated failures")
+        }
+    }
+
+    /// Shutter and camera off after a still (the session and button link stay).
+    private func stopCameraAfterPhoto() {
+        if photoStarted {
+            camera?.photo.stop()
+            // Cleared now, not on the async .stopped event: a capture right after must start
+            // the shutter again instead of firing on one that is going down (PhotoError.notReady).
+            photoStarted = false
+        }
+        camera?.stream.stop()
+        camera?.stop()
+        isStreaming = false
+        if !wantsButtonLink { endSession() }
+    }
+
+    private func resolvePendingPhoto(_ data: Data?) {
+        guard let continuation = pendingPhoto else { return }
+        pendingPhoto = nil
+        pendingPhotoID = UUID()
+        continuation.resume(returning: data)
+    }
+
+    /// Subscribe to the still shutter once per camera: photoDataPublisher replays nothing, so a
+    /// listener registered per capture could miss the arrival.
+    private func observePhoto(_ cam: Camera) {
+        let photo = cam.photo
+        photoTokens = []
+        photoStarted = false
+
+        photoTokens.append(photo.statePublisher.listen { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                print("[GlassesManager] Photo state: \(state)")
+                if case .started = state {
+                    self.photoStarted = true
+                } else if case .stopped = state {
+                    self.photoStarted = false
+                    self.resolvePendingPhoto(nil)   // a still cannot outlive its shutter
+                }
+            }
+        })
+        photoTokens.append(photo.photoDataPublisher.listen { [weak self] capture in
+            let data = capture.imageData
+            Task { @MainActor in
+                self?.resolvePendingPhoto(data)
+            }
+        })
+        photoTokens.append(photo.errorPublisher.listen { [weak self] error in
+            let detail = String(describing: error)
+            Task { @MainActor in
+                print("[GlassesManager] Photo error: \(detail)")
+                self?.resolvePendingPhoto(nil)
+            }
+        })
+        photoTokens.append(photo.transferProgressPublisher.listen { progress in
+            print("[GlassesManager] Photo transfer: \(progress.bytesReceived)/\(progress.totalBytes) bytes")
+        })
+    }
+
+    private func waitUntil(seconds: TimeInterval, _ condition: @escaping () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return condition()
+    }
+
+    // MARK: - Capture-button link (MWDATInputs, experimental)
+
+    /// Apply the capture-button settings (Settings screen and app start share this).
+    func applySettings(_ settings: AppSettings) async {
+        await configureButtonLink(enabled: settings.captureButtonEnabled,
+                                  includeTouchpad: settings.captureButtonIncludeTouchpad)
+    }
+
+    /// Route the glasses' capture button to the app (or give it back to the glasses).
+    /// `includeTouchpad` widens the request to the temple touchpad — only for glasses whose
+    /// button presses never arrive otherwise; the touchpad then stops controlling media.
+    func configureButtonLink(enabled: Bool, includeTouchpad: Bool) async {
+        let changed = includeTouchpad != linkIncludesTouchpad
+        wantsButtonLink = enabled
+        linkIncludesTouchpad = includeTouchpad
+        linkRetryTask?.cancel()
+        linkRetryDelay = 5
+
+        guard enabled else {
+            teardownInputs(removeFromSession: true)
+            buttonLinkStatus = "Tắt"
+            if !isStreaming && !isTakingPhoto { endSession() }
+            return
+        }
+        if changed { teardownInputs(removeFromSession: true) }
+        await startButtonLink()
+    }
+
+    private func startButtonLink() async {
+        guard wantsButtonLink, inputs == nil, !inputsPermissionDenied else { return }
+        guard isRegistered else { buttonLinkStatus = "Chưa đăng ký kính"; return }
+        guard connectedDevice != nil else { buttonLinkStatus = "Chờ kính kết nối…"; return }
+
+        buttonLinkStatus = "Đang kết nối…"
+        guard let session = await ensureSession(reportErrors: false) else {
+            buttonLinkStatus = "Không mở được phiên kính"
+            scheduleLinkRetry()
+            return
+        }
+        // Attached straight after .started, Inputs can fail once with deviceDisconnected:
+        // give the link a beat to settle (Meta's BirdSpotter sample hit this on hardware).
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        guard wantsButtonLink, inputs == nil, deviceSession != nil else { return }
+        attachInputs(to: session)
+    }
+
+    private func attachInputs(to session: DeviceSession) {
+        // `sources` is a request to the glasses (they route those surfaces to the app instead
+        // of their own handler), not a filter. Without the touchpad, back keeps its system role.
+        let configuration = linkIncludesTouchpad
+            ? InputsConfiguration(sources: [.captouch, .captureButton, .actionButton], consumeBack: true)
+            : InputsConfiguration(sources: [.captureButton], consumeBack: false)
+
+        let attached: Inputs?
+        do {
+            attached = try session.addInputs(configuration: configuration)
+        } catch {
+            print("[GlassesManager] addInputs failed: \(error)")
+            buttonLinkStatus = "Không gắn được nút chụp — thử lại…"
+            scheduleLinkRetry()
+            return
+        }
+        guard let attached else {
+            print("[GlassesManager] addInputs returned nil")
+            buttonLinkStatus = "Kính này không gửi nút chụp cho app"
             return
         }
 
-        print("[GlassesManager] Capturing photo")
+        inputs = attached
+        inputsHasActivated = false
+        buttonLinkStatus = "Đang kích hoạt…"
 
-        // Non-throwing since 0.9.0; failures surface as StreamError.photoCaptureFailed
-        // on the error publisher, which setupStreamListeners already routes to errorMessage.
-        if !stream.capturePhoto(format: .jpeg) {
-            errorMessage = "Failed to start photo capture"
-            print("[GlassesManager] capturePhoto returned false")
+        // The event stream has room for exactly one reader.
+        let events = attached.events
+        inputsDrainTask = Task { @MainActor [weak self] in
+            for await event in events {
+                self?.receive(event)
+            }
+            print("[GlassesManager] Inputs event stream ended")
+        }
+
+        inputsStateToken = attached.statePublisher.listen { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                print("[GlassesManager] Inputs state: \(state)")
+                if case .active = state {
+                    self.inputsHasActivated = true
+                    self.isButtonLinkActive = true
+                    self.buttonLinkStatus = "Đang hoạt động"
+                    self.linkRetryDelay = 5
+                } else if case .inactive = state {
+                    // `inactive` is also the state Inputs is born in: only a link that was
+                    // active and went quiet (a still crossed, the link blinked) is revived.
+                    guard self.inputsHasActivated else { return }
+                    self.isButtonLinkActive = false
+                    self.buttonLinkStatus = "Đang kết nối lại…"
+                    self.reviveInputsIfNeeded()
+                }
+            }
+        }
+        inputsErrorToken = attached.errorPublisher.listen { [weak self] error in
+            let detail = String(describing: error)
+            Task { @MainActor in
+                guard let self else { return }
+                print("[GlassesManager] Inputs error: \(detail)")
+                if detail.localizedCaseInsensitiveContains("permissionDenied") {
+                    // Not fixable with requestPermission: the capability isn't enabled for the app.
+                    self.inputsPermissionDenied = true
+                    self.isButtonLinkActive = false
+                    self.buttonLinkStatus = "Meta chưa cho phép app nhận nút chụp — bật Developer Mode trong Meta AI"
+                }
+            }
+        }
+    }
+
+    private func receive(_ event: InputEvent) {
+        switch event {
+        case let .capture(pressType, source, _):
+            let press: GlassesButtonPress
+            switch pressType {
+            case .shortPress: press = .shortPress
+            case .hold: press = .hold
+            case .doublePress: press = .doublePress
+            @unknown default:
+                print("[GlassesManager] Ignored capture press \(pressType)")
+                return
+            }
+            print("[GlassesManager] Capture button: \(press.rawValue) from \(source)")
+            onCaptureButton?(press)
+        default:
+            print("[GlassesManager] Ignored input \(event)")
+        }
+    }
+
+    /// Remove a dead Inputs and attach a fresh one (it has no start() of its own). Waits until
+    /// no still is crossing — a still is what takes the button down in the first place.
+    private func reviveInputsIfNeeded() {
+        guard wantsButtonLink, !inputsPermissionDenied, inputsRevivalTask == nil else { return }
+        guard inputs == nil || !isButtonLinkActive else { return }
+        inputsRevivalTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.inputsRevivalTask = nil }
+            while self.isTakingPhoto {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard self.wantsButtonLink, !self.isButtonLinkActive else { return }
+            self.teardownInputs(removeFromSession: true)
+            if let session = self.deviceSession, self.sessionStarted {
+                self.attachInputs(to: session)
+            } else {
+                await self.startButtonLink()
+            }
+        }
+    }
+
+    private func teardownInputs(removeFromSession: Bool) {
+        inputsDrainTask?.cancel()
+        inputsDrainTask = nil
+        inputsStateToken = nil
+        inputsErrorToken = nil
+        if removeFromSession, inputs != nil {
+            try? deviceSession?.removeInputs()
+        }
+        inputs = nil
+        inputsHasActivated = false
+        isButtonLinkActive = false
+    }
+
+    /// Try the link again later (glasses folded, out of range, session refused). Backs off to 60 s.
+    private func scheduleLinkRetry() {
+        guard wantsButtonLink, !inputsPermissionDenied else { return }
+        linkRetryTask?.cancel()
+        let delay = linkRetryDelay
+        linkRetryDelay = min(linkRetryDelay * 2, 60)
+        linkRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            guard let self, !Task.isCancelled, self.wantsButtonLink, self.inputs == nil else { return }
+            await self.startButtonLink()
         }
     }
 
@@ -316,34 +779,37 @@ final class GlassesManager: ObservableObject {
         devicesTask = Task {
             for await devices in wearables.devicesStream() {
                 await MainActor.run {
+                    let hadDevice = self.connectedDevice != nil
                     self.connectedDeviceCount = devices.count
                     self.connectedDevice = devices.first
                     print("[GlassesManager] Devices updated: \(devices.count) connected")
+                    // Glasses came (back) into range: bring the capture button back.
+                    if !hadDevice, self.connectedDevice != nil, self.wantsButtonLink, self.inputs == nil {
+                        self.linkRetryDelay = 5
+                        Task { await self.startButtonLink() }
+                    }
                 }
             }
         }
     }
 
     private func setupStreamListeners(stream: MWDATCamera.Stream) {
-        // State listener
         stateListenerToken = stream.statePublisher.listen { [weak self] state in
             Task { @MainActor in
+                guard let self, !self.isTakingPhoto else { return }   // the photo path drives the stream itself
                 switch state {
                 case .streaming:
-                    self?.isStreaming = true
+                    self.isStreaming = true
                 case .stopped:
-                    self?.isStreaming = false
+                    self.isStreaming = false
                 default:
                     break
                 }
             }
         }
 
-        // Video frame listener
         videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] frame in
             Task { @MainActor in
-                // Hand the raw sample buffer to the recorder (if any). SessionRecorder immediately
-                // hops it onto its own writer queue, so this stays cheap even at 30fps.
                 self?.onVideoSampleBuffer?(frame.sampleBuffer)
                 if let image = frame.makeUIImage() {
                     self?.lastFrame = image
@@ -353,23 +819,19 @@ final class GlassesManager: ObservableObject {
             }
         }
 
-        // Photo data listener
         photoDataListenerToken = stream.photoDataPublisher.listen { [weak self] photoData in
             Task { @MainActor in
                 let data = photoData.data
                 self?.lastPhotoData = data
                 self?.onPhotoCaptured?(data)
-                print("[GlassesManager] Photo captured: \(data.count) bytes")
+                print("[GlassesManager] Stream photo captured: \(data.count) bytes")
             }
         }
 
-        // Error listener
         errorListenerToken = stream.errorPublisher.listen { [weak self] error in
             Task { @MainActor in
-                // The raw video codec pauses by design when the app leaves the foreground
-                // (screen lock, app switch) and the SDK reports that as a scary-sounding
-                // error ("Critical error, the stream should end" — issue #55). Only alert
-                // for errors that happen while the user is actually looking at the app.
+                // The raw codec pauses by design when the app leaves the foreground and the SDK
+                // reports that as a scary error — only surface errors seen in the foreground.
                 if UIApplication.shared.applicationState == .active {
                     self?.errorMessage = error.localizedDescription
                 }
@@ -378,9 +840,8 @@ final class GlassesManager: ObservableObject {
         }
     }
 
-    /// TEMP DIAGNOSTIC (issue #55 follow-up): the DAT SDK logs its teardown reasons via OSLog,
-    /// which `devicectl --console` can't see. The app CAN read its own process's entries, so on
-    /// session failure dump every non-Apple subsystem line from the last `seconds` to stdout.
+    /// The DAT SDK logs its teardown reasons via OSLog; on session failure dump every
+    /// non-Apple subsystem line from the last `seconds` to stdout.
     private func dumpSDKLogs(since seconds: TimeInterval) {
         do {
             let store = try OSLogStore(scope: .currentProcessIdentifier)

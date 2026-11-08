@@ -7,6 +7,7 @@
 <!-- On-device? Which iPhone / iOS? Which backend/model? Steps you ran. -->
 - [ ] Built and ran on a physical device (simulator can't do Bluetooth / on-device MLX)
 - [ ] Verified the specific behavior this PR changes
+- [ ] `make blueprint-check` passes; touched the solver/voice/photo flow → ran `make e2e` and the relevant hardware steps (H1–H8) in `docs/testing/E2E_TEST_PLAN.md`
 
 ## Checklist
 

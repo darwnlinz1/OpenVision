@@ -22,10 +22,10 @@ struct VoiceAgentView: View {
 
     @StateObject private var voiceCommandService = VoiceCommandService.shared
     @StateObject private var ttsService = TTSService.shared
-    @StateObject private var kokoroTTS = KokoroTTSService.shared
-    @StateObject private var grokTTS = CloudTTSService.grok
-    @StateObject private var openAITTS = CloudTTSService.openAI
-    @StateObject private var documentFocus = DocumentFocus.shared
+    @StateObject private var photoScanner = RecentPhotoScanner.shared
+
+    /// The solution open in the sheet — frozen when opened, so a new question doesn't blank it.
+    @State private var openSolution: SolutionItem?
 
     // MARK: - Body
 
@@ -43,22 +43,6 @@ struct VoiceAgentView: View {
             VStack(spacing: 0) {
                 topBar
                     .padding(.top, 8)
-                // Document-focus pill: visible whenever a document is "open" so the mode is never
-                // silently steering answers. Tap to release focus.
-                if let doc = documentFocus.activeDocument {
-                    HStack(spacing: 6) {
-                        Image(systemName: "book.fill").font(.caption2)
-                        Text(doc.title).font(.caption.bold()).lineLimit(1)
-                        Image(systemName: "xmark.circle.fill").font(.caption2).opacity(0.7)
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.indigo.opacity(0.8)))
-                    .padding(.top, 8)
-                    .onTapGesture { documentFocus.deactivate() }
-                    .transition(.opacity)
-                }
                 Spacer()
                 centerContent
                 Spacer()
@@ -87,30 +71,26 @@ struct VoiceAgentView: View {
         .animation(.easeInOut(duration: 0.3), value: viewModel.agentState)
         .animation(.easeInOut(duration: 0.35), value: viewModel.userTranscript.isEmpty)
         .animation(.easeInOut(duration: 0.35), value: viewModel.aiTranscript.isEmpty)
+        // Attached to the root (not the transcript, which comes and goes) so the solution stays
+        // open after the session ends.
+        .sheet(item: $openSolution) { item in
+            SolutionSheet(markdown: item.markdown)
+        }
         .onAppear { viewModel.onAppear() }
         .onDisappear { viewModel.onDisappear() }
         .task {
             await viewModel.requestSpeechAuthorization()
         }
         // Observe TTS state changes
-        .onChange(of: ttsService.isSpeaking) { isSpeaking in
+        .onChange(of: ttsService.isSpeaking) { _, isSpeaking in
             viewModel.ttsSpeakingChanged(isSpeaking)
         }
-        .onChange(of: kokoroTTS.isSpeaking) { speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
-        .onChange(of: grokTTS.isSpeaking) { _, speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
-        .onChange(of: openAITTS.isSpeaking) { _, speaking in
-            viewModel.neuralSpeakingChanged(speaking)
-        }
         // Control thinking sound based on agent state
-        .onChange(of: viewModel.agentState) { newState in
+        .onChange(of: viewModel.agentState) { _, newState in
             viewModel.agentStateChanged(newState)
         }
         // Observe VoiceCommandService state changes
-        .onChange(of: voiceCommandService.state) { newState in
+        .onChange(of: voiceCommandService.state) { _, newState in
             viewModel.voiceStateChanged(newState)
         }
     }
@@ -119,39 +99,11 @@ struct VoiceAgentView: View {
 
     private var topBar: some View {
         HStack {
-            // AI Backend status (or Live Video indicator)
-            if viewModel.isLiveVideoMode {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(.red)
-                        .frame(width: 10, height: 10)
-                        .overlay(
-                            Circle()
-                                .stroke(.red.opacity(0.5), lineWidth: 2)
-                                .scaleEffect(1.5)
-                        )
-
-                    Text("LIVE")
-                        .font(.caption.bold())
-                        .foregroundColor(.white)
-
-                    Image(systemName: "video.fill")
-                        .font(.caption)
-                        .foregroundColor(.white)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(
-                    Capsule()
-                        .fill(.red.opacity(0.8))
-                )
-            } else {
-                StatusPill(
-                    status: settingsManager.settings.backendDisplayName,
-                    color: viewModel.agentState == .idle ? .gray : .green,
-                    isConnected: viewModel.agentState != .idle && viewModel.agentState != .connecting
-                )
-            }
+            StatusPill(
+                status: settingsManager.settings.backendDisplayName,
+                color: viewModel.agentState == .idle ? Theme.inactive : Theme.success,
+                isConnected: viewModel.agentState != .idle && viewModel.agentState != .connecting
+            )
 
             Spacer()
 
@@ -173,49 +125,31 @@ struct VoiceAgentView: View {
                 } label: {
                     Image(systemName: viewModel.isRecording ? "stop.circle.fill" : "record.circle")
                         .font(.title2)
-                        .foregroundColor(viewModel.isRecording ? .red : .white)
+                        .foregroundColor(viewModel.isRecording ? Theme.danger : Theme.textPrimary)
                         .padding(.horizontal, 4)
                 }
                 .accessibilityLabel(viewModel.isRecording ? "Stop recording" : "Record point of view")
             }
 
-            // Manual Shutter/Camera button (Capture First, Ask Later)
+            // Photo readiness: the glasses photo the next question will use (temple shutter →
+            // Camera Roll, or the SDK camera). Tap to take one with the glasses camera.
             Button {
-                Task {
-                    await viewModel.snapPhotoFromGlasses()
-                }
+                Task { await viewModel.snapPhotoFromGlasses() }
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: viewModel.activePhotoContext?.isFresh == true ? "camera.fill" : "camera")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(viewModel.activePhotoContext?.isFresh == true ? .green : .white)
-                    if viewModel.activePhotoContext?.isFresh == true {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 6, height: 6)
-                    }
+                TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                    photoBadge(now: timeline.date)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(
-                    Capsule()
-                        .fill(.ultraThinMaterial)
-                        .overlay(
-                            Capsule()
-                                .stroke(viewModel.activePhotoContext?.isFresh == true ? Color.green.opacity(0.6) : Color.white.opacity(0.15), lineWidth: 1)
-                        )
-                )
             }
-            .accessibilityLabel("Snap photo from glasses")
+            .accessibilityLabel("Chụp ảnh bằng kính")
 
             // Glasses status
             HStack(spacing: 8) {
                 Image(systemName: "eyeglasses")
-                    .foregroundColor(glassesManager.isRegistered ? .green : .gray)
+                    .foregroundColor(glassesManager.isRegistered ? Theme.success : Theme.inactive)
 
                 if glassesManager.isStreaming {
                     Circle()
-                        .fill(.red)
+                        .fill(Theme.danger)
                         .frame(width: 8, height: 8)
                 }
             }
@@ -240,8 +174,8 @@ struct VoiceAgentView: View {
         switch viewModel.agentState {
         case .listening: return .listening
         case .speaking: return .speaking
-        case .thinking, .toolRunning, .connecting: return .thinking
-        case .idle, .liveVideo: return .idle
+        case .thinking, .connecting: return .thinking
+        case .idle: return .idle
         }
     }
 
@@ -249,28 +183,19 @@ struct VoiceAgentView: View {
         VStack(spacing: 28) {
             // Heading / status prompt
             Group {
-                if viewModel.agentState == .liveVideo {
-                    VStack(spacing: 6) {
-                        Text(settingsManager.settings.backendDisplayName)
-                            .font(.headline)
-                            .foregroundColor(Theme.heading)
-                        Text("Say \"stop video\" to exit")
-                            .font(.caption)
-                            .foregroundColor(Theme.textSecondary)
-                    }
-                } else if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
+                if viewModel.agentState == .idle && settingsManager.settings.wakeWordEnabled {
                     VStack(spacing: 8) {
-                        Text("What can I see?")
+                        Text("Hỏi gì cũng được")
                             .font(.system(size: 30, weight: .bold, design: .rounded))
                             .foregroundColor(Theme.heading)
                         if viewModel.isVoiceReady {
-                            Text("Say \"\(settingsManager.settings.wakeWord)\" or tap the orb")
+                            Text("Bấm nút chụp trên kính, rồi nói \"\(settingsManager.settings.wakeWord)\" + câu hỏi")
                                 .font(.subheadline)
                                 .foregroundColor(Theme.textSecondary)
                         } else {
                             HStack(spacing: 8) {
                                 ProgressView().tint(Theme.accent).scaleEffect(0.8)
-                                Text("Initializing voice…")
+                                Text("Đang khởi động giọng nói…")
                                     .font(.subheadline)
                                     .foregroundColor(Theme.textSecondary)
                             }
@@ -289,12 +214,6 @@ struct VoiceAgentView: View {
                 .font(.title3)
                 .fontWeight(.medium)
                 .foregroundColor(Theme.textPrimary)
-
-            // Tool status
-            if let tool = viewModel.currentToolName, viewModel.agentState == .toolRunning {
-                ToolStatusView(toolName: tool, isRunning: true)
-                    .transition(.scale.combined(with: .opacity))
-            }
         }
     }
 
@@ -303,12 +222,59 @@ struct VoiceAgentView: View {
     // Bubbles float directly over the background (no outer card box — the old GlassCard wrapper
     // was a mostly-empty gray slab).
     private var transcriptArea: some View {
-        TranscriptView(
-            userText: viewModel.userTranscript,
-            aiText: viewModel.aiTranscript,
-            isAIStreaming: viewModel.agentState == .speaking
-        )
+        VStack(alignment: .leading, spacing: 10) {
+            TranscriptView(
+                userText: viewModel.userTranscript,
+                aiText: viewModel.aiTranscript,
+                isAIStreaming: viewModel.agentState == .speaking
+            )
+            if let solution = viewModel.latestSolution {
+                SolutionButton { openSolution = SolutionItem(markdown: solution) }
+                    .transition(.opacity)
+            }
+        }
         .padding(.horizontal, 20)
+        .animation(.easeInOut(duration: 0.25), value: viewModel.latestSolution == nil)
+    }
+
+    // MARK: - Photo badge
+
+    /// The photo the next question will use: a thumbnail and how long ago it was taken, or a plain
+    /// camera when there is none. Green while it is still within the 120 s window.
+    @ViewBuilder
+    private func photoBadge(now: Date) -> some View {
+        let contextAge = viewModel.activePhotoContext.map { now.timeIntervalSince($0.timestamp) }
+        let libraryAge = photoScanner.latestPhotoDate.map { now.timeIntervalSince($0) }
+        let age = [contextAge, libraryAge].compactMap { $0 }.filter { $0 >= 0 }.min()
+        let ready = (age ?? .infinity) < SolverIntent.recentPhotoWindow
+            && (viewModel.activePhotoContext?.isFresh(at: now) ?? true)
+        HStack(spacing: 6) {
+            if ready, let thumbnail = photoScanner.latestThumbnail, libraryAge == age {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 22, height: 22)
+                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            } else {
+                Image(systemName: ready ? "camera.fill" : "camera")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(ready ? Theme.success : Theme.textPrimary)
+            }
+            if ready, let age {
+                Text("\(Int(age))s")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundColor(Theme.success)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            Capsule()
+                .fill(.ultraThinMaterial)
+                .overlay(Capsule().stroke(ready ? Theme.success.opacity(0.6) : Theme.bgElevatedStroke, lineWidth: 1))
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(ready ? "Có ảnh từ kính, chụp \(Int(age ?? 0)) giây trước" : "Chưa có ảnh")
     }
 
     // MARK: - Error Overlay
@@ -319,7 +285,7 @@ struct VoiceAgentView: View {
 
             HStack {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
+                    .foregroundColor(Theme.warning)
 
                 Text(message)
                     .font(.subheadline)
@@ -337,7 +303,7 @@ struct VoiceAgentView: View {
             .padding()
             .background(
                 RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.red.opacity(0.8))
+                    .fill(Theme.danger.opacity(0.8))
                     .overlay(
                         RoundedRectangle(cornerRadius: 16)
                             .stroke(Color.white.opacity(0.2), lineWidth: 1)

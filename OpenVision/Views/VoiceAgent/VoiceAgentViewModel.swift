@@ -1,5 +1,6 @@
 import Photos
 import UIKit
+import ImageIO
 // OpenVision - VoiceAgentViewModel.swift
 // MVVM: all voice-session orchestration for the main screen lives here — session lifecycle,
 // command routing, live video, face intents, photo capture, TTS streaming, and history.
@@ -14,25 +15,160 @@ import Speech
 
 /// Pre-captured photo context for Visor "Capture First, Ask Later" workflow
 struct CapturedPhotoContext {
+    /// How long a captured photo stays attached to follow-up questions (Blueprint §2.1 step 7).
+    static let ttl: TimeInterval = 120.0
+    /// How many questions may reuse one photo before a fresh capture is required.
+    static let maxUses = 5
+
     let id: UUID = UUID()
     let data: Data
-    let timestamp: Date = Date()
-    var useCount: Int = 0
-    var isFresh: Bool { Date().timeIntervalSince(timestamp) < 120.0 && useCount < 5 }
+    let timestamp: Date
+    var useCount: Int
+
+    init(data: Data, timestamp: Date = Date(), useCount: Int = 0) {
+        self.data = data
+        self.timestamp = timestamp
+        self.useCount = useCount
+    }
+
+    var isFresh: Bool { isFresh(at: Date()) }
+
+    /// Freshness at an explicit instant — lets tests check the TTL boundary without sleeping.
+    func isFresh(at now: Date) -> Bool {
+        now.timeIntervalSince(timestamp) < Self.ttl && useCount < Self.maxUses
+    }
+}
+
+// MARK: - Solver intent (pure, unit-testable)
+
+/// Pure command classification for the solver flow. Kept free of state so the Blueprint
+/// end-to-end suite can pin the routing rules that protect against the "fatal pitfalls"
+/// (MASTER_HANDOVER_BLUEPRINT.md §3 and checklist §7).
+enum SolverIntent {
+    /// Window in which a photo synced to Camera Roll by the temple shutter counts as "the
+    /// photo the user is asking about" (Visor `hasRecentShutterPhoto`, Blueprint lesson 6).
+    static let recentPhotoWindow: TimeInterval = 120.0
+
+    /// Delay after the last TTS utterance before the mic may barge in again, so the temple
+    /// speaker's echo is not heard as a new command (Blueprint lesson 4).
+    static let ttsEchoSettleNanoseconds: UInt64 = 350_000_000
+
+    /// "Stop" detection. Matched on WORDS, not substrings: `.contains("stop")` treated
+    /// "what's on the desktop" as a stop command and killed the session mid-question.
+    /// Phrases mentioning video/stream are left to the live-video stop handling.
+    static func isStopCommand(_ command: String) -> Bool {
+        let lowerCommand = command.lowercased()
+        let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
+        let stopExact: Set<String> = ["stop", "quiet", "silence", "enough", "dừng", "thôi", "ngừng"]
+        let stopPhrases = [
+            "be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it",
+            "dừng lại", "dừng đi", "thôi đi", "ngừng lại", "ngừng đi"
+        ]
+        let isExactStop = stopExact.contains(lowerCommand.trimmingCharacters(in: .whitespacesAndNewlines))
+        return (isExactStop
+                || !commandWords.isDisjoint(with: stopSingleWords)
+                || stopPhrases.contains { lowerCommand.contains($0) })
+                && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
+    }
+
+    /// What the glasses say when no Gemini API key is set (keys are never compiled into the app).
+    @MainActor
+    static func missingKeyMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Chưa có API key Gemini. Bạn mở Cài đặt, chọn Gemini và dán key vào nhé."
+            : "There is no Gemini API key yet. Open Settings, Gemini, and paste your key."
+    }
+
+    /// What the glasses say when the AI could not be reached even after retries.
+    @MainActor
+    static func networkFailureMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Mạng đang chậm nên mình chưa nhận được câu trả lời. Bạn hỏi lại giúp mình nhé."
+            : "The connection is slow and I didn't get an answer. Please ask again."
+    }
+
+    /// Language for what the app says on its own, when there is no question to answer in kind
+    /// (a capture-button press): the listening-language setting, or the iPhone's language on "auto".
+    @MainActor
+    static var speaksVietnamese: Bool {
+        switch SettingsManager.shared.settings.recognitionLanguage {
+        case "vi-VN": return true
+        case "en-US": return false
+        default: return Locale.preferredLanguages.first?.lowercased().hasPrefix("vi") ?? false
+        }
+    }
+
+    /// The question sent for "capture and solve" (hold on the glasses' capture button).
+    @MainActor
+    static var solvePhotoQuestion: String {
+        speaksVietnamese ? "Giải bài trong ảnh này." : "Solve the problem in this photo."
+    }
+
+    /// Spoken after a capture-button photo, so the wearer knows it is ready for a question.
+    @MainActor
+    static var photoReadyMessage: String {
+        speaksVietnamese ? "Đã chụp. Bạn hỏi đi." : "Got the photo. Go ahead."
+    }
+
+    /// Spoken when the glasses' photo could not be taken or transferred.
+    @MainActor
+    static var photoFailedMessage: String {
+        speaksVietnamese
+            ? "Chưa lấy được ảnh từ kính. Bạn bấm nút chụp lại giúp mình nhé."
+            : "I couldn't get the photo from the glasses. Please press the capture button again."
+    }
+
+    /// Spoken for "repeat the answer" when nothing has been answered yet.
+    @MainActor
+    static var nothingToRepeatMessage: String {
+        speaksVietnamese ? "Chưa có câu trả lời nào để đọc lại." : "There's no answer to repeat yet."
+    }
+
+    /// What the glasses say when a visual question arrives and no photo can be found
+    /// (checklist test 5) — in the language the question was asked in.
+    @MainActor
+    static func missingPhotoMessage(for prompt: String) -> String {
+        TTSService.containsVietnamese(prompt)
+            ? "Không tìm thấy ảnh chụp bài tập từ kính Ray-Ban. Bạn hãy bấm nút chụp trên gọng kính rồi hỏi lại nhé."
+            : "No photo found from Ray-Ban glasses. Please press the temple capture button and ask again."
+    }
 }
 
 // MARK: - Recent Photo Scanner (Visor Parity)
 
+/// Fallback for when the capture button is not linked to the app: finds a glasses photo that
+/// the Meta AI app imported into Camera Roll. That import is NOT real-time (it typically happens
+/// when the glasses are folded or charging), which is why the direct DAT capture is tried first;
+/// when a photo does land, it is prefetched so its bytes are ready when the question comes.
+///
+/// Everything heavy (PhotoKit fetch, image decode/encode) runs OFF the main thread — the previous
+/// synchronous 2048 px decode on the main actor stalled the UI on every library change.
 @MainActor
 final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     static let shared = RecentPhotoScanner()
 
     @Published private(set) var lastScannedPhotoData: Data?
     @Published private(set) var lastScannedTimestamp: Date?
+    /// True when the user granted "Selected Photos" only: new glasses photos are then invisible
+    /// to the app and the shutter workflow cannot work. Surfaced to the UI as a warning.
+    @Published private(set) var isLimitedAccess = false
+    /// When the newest glasses photo was TAKEN (asset creation date) and a small preview, for the
+    /// "photo ready" indicator. Also shows on a real device how long Camera Roll import takes.
+    @Published private(set) var latestPhotoDate: Date?
+    @Published private(set) var latestThumbnail: UIImage?
+
+    /// Full-resolution bytes of the newest asset we loaded, keyed by its local identifier.
+    private var cache: (assetID: String, created: Date, data: Data)?
+    private var prefetchTask: Task<Void, Never>?
+    /// A load already running (usually the prefetch), so a question asked meanwhile joins it
+    /// instead of decoding the same photo twice.
+    private var inFlight: (assetID: String, task: Task<Data?, Never>)?
 
     private override init() {
         super.init()
         PHPhotoLibrary.shared().register(self)
+        isLimitedAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited
     }
 
     deinit {
@@ -40,19 +176,20 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
     }
 
     func requestAuthorizationIfNeeded() async -> Bool {
-        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        switch status {
-        case .authorized, .limited:
-            return true
-        case .notDetermined:
-            let granted = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-            return granted == .authorized || granted == .limited
-        default:
-            return false
+        var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status == .notDetermined {
+            status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         }
+        isLimitedAccess = status == .limited
+        if status == .limited {
+            NSLog("[RecentPhotoScanner] Limited photo access — new glasses photos will NOT be visible. Ask for Full Access.")
+        }
+        return status == .authorized || status == .limited
     }
 
-    func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = 120.0) -> Data? {
+    /// The newest photo created within `seconds`, prepared for upload (see
+    /// `PhotoPayload.uploadJPEG`), or nil when there is none / no permission.
+    func fetchMostRecentPhoto(withinSeconds seconds: TimeInterval = SolverIntent.recentPhotoWindow) async -> Data? {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard status == .authorized || status == .limited else {
             NSLog("[RecentPhotoScanner] Photo library not authorized (%d)", status.rawValue)
@@ -60,45 +197,202 @@ final class RecentPhotoScanner: NSObject, ObservableObject, PHPhotoLibraryChange
         }
 
         let cutoffDate = Date().addingTimeInterval(-seconds)
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        fetchOptions.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@", PHAssetMediaType.image.rawValue, cutoffDate as NSDate)
-        fetchOptions.fetchLimit = 1
-
-        let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
-        guard let asset = assets.firstObject else {
+        guard let newest = await Self.newestImageAsset(since: cutoffDate) else {
             NSLog("[RecentPhotoScanner] No photos found created after %@", cutoffDate.description)
             return nil
         }
 
-        NSLog("[RecentPhotoScanner] Found asset created at: %@", asset.creationDate?.description ?? "unknown")
-
-        var resultData: Data?
-        let options = PHImageRequestOptions()
-        options.isSynchronous = true
-        options.deliveryMode = .highQualityFormat
-        options.isNetworkAccessAllowed = true
-
-        let targetSize = CGSize(width: 2048, height: 2048)
-        PHImageManager.default().requestImage(for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options) { image, _ in
-            if let image = image {
-                resultData = image.jpegData(compressionQuality: 0.88)
-            }
+        if let cached = cache, cached.assetID == newest.id {
+            NSLog("[RecentPhotoScanner] Using prefetched photo (%d bytes)", cached.data.count)
+            return cached.data
         }
 
-        if let data = resultData {
-            NSLog("[RecentPhotoScanner] Successfully loaded photo (%d bytes)", data.count)
-            self.lastScannedPhotoData = data
-            self.lastScannedTimestamp = Date()
+        let load: Task<Data?, Never>
+        if let running = inFlight, running.assetID == newest.id {
+            load = running.task
+        } else {
+            NSLog("[RecentPhotoScanner] Found asset created at: %@", newest.created.description)
+            let assetID = newest.id
+            load = Task.detached(priority: .userInitiated) { await Self.loadFullResolution(assetID: assetID) }
+            inFlight = (assetID: assetID, task: load)
         }
-
-        return resultData
+        let loaded = await load.value
+        if inFlight?.assetID == newest.id { inFlight = nil }
+        guard let data = loaded else {
+            NSLog("[RecentPhotoScanner] Could not load image data for newest asset")
+            return nil
+        }
+        NSLog("[RecentPhotoScanner] Loaded photo (%ld bytes), taken %.1fs ago", data.count, Date().timeIntervalSince(newest.created))
+        cache = (assetID: newest.id, created: newest.created, data: data)
+        lastScannedPhotoData = data
+        lastScannedTimestamp = Date()
+        latestPhotoDate = newest.created
+        let thumbnail = await Task.detached(priority: .utility) {
+            PhotoPayload.renderJPEG(from: data, maxPixelSize: 180, quality: 0.7)
+        }.value
+        if cache?.assetID == newest.id {
+            latestThumbnail = thumbnail.flatMap { UIImage(data: $0) }
+        }
+        return data
     }
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
         Task { @MainActor in
-            _ = self.fetchMostRecentPhoto(withinSeconds: 60.0)
+            // Coalesce bursts of change notifications (iCloud, Meta View writing metadata).
+            self.prefetchTask?.cancel()
+            self.prefetchTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                _ = await self.fetchMostRecentPhoto(withinSeconds: 60.0)
+            }
         }
+    }
+
+    // MARK: - Background PhotoKit work
+
+    /// Newest image asset created at/after `cutoff` — (localIdentifier, creationDate).
+    private nonisolated static func newestImageAsset(since cutoff: Date) async -> (id: String, created: Date)? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(id: String, created: Date)?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fetchOptions = PHFetchOptions()
+                fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                fetchOptions.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@",
+                                                     PHAssetMediaType.image.rawValue, cutoff as NSDate)
+                fetchOptions.fetchLimit = 1
+                let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+                if let asset = assets.firstObject {
+                    continuation.resume(returning: (id: asset.localIdentifier, created: asset.creationDate ?? Date()))
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// The asset's original image (12 MP on Ray-Ban Meta Gen 2), prepared for upload once, in the
+    /// background: upright, long edge <= 3072 px (see `PhotoPayload`).
+    private nonisolated static func loadFullResolution(assetID: String) async -> Data? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
+                guard let asset = assets.firstObject else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let options = PHImageRequestOptions()
+                options.isSynchronous = true
+                options.deliveryMode = .highQualityFormat
+                options.isNetworkAccessAllowed = true
+                options.version = .current
+                // Synchronous request: the handler runs before this returns. A box (not a captured
+                // var) carries the result out, which is safe in any concurrency-checking mode.
+                let box = DataBox()
+                PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                    box.value = data
+                }
+                continuation.resume(returning: box.value.flatMap { PhotoPayload.uploadJPEG(from: $0) })
+            }
+        }
+    }
+}
+
+/// Result carrier for synchronous PhotoKit callbacks on a background queue.
+private final class DataBox: @unchecked Sendable {
+    var value: Data?
+}
+
+// MARK: - Photo payload (pure, unit-testable)
+
+/// Image bytes sent to the AI.
+///
+/// Gemini 3 gives each image a FIXED token budget (HIGH ~1120, ULTRA_HIGH ~2240 tokens) whatever
+/// its pixel count, so a 12 MP upload carries no more detail than ~3000 px — it only costs
+/// 4-5x the bytes (seconds on mobile uplink). Detail is requested with media resolution instead
+/// (GeminiLiveService), and the photo is sent upright, long edge <= `uploadMaxDimension`.
+enum PhotoPayload {
+    /// Long edge of the uploaded photo.
+    static let uploadMaxDimension = 3072
+    static let uploadQuality: CGFloat = 0.85
+
+    /// Long edge of the copy kept in conversation history: follow-up questions re-send the
+    /// whole history, so they carry this lighter copy.
+    static let historyMaxDimension: CGFloat = 1536
+
+    static func isJPEG(_ data: Data) -> Bool {
+        let bytes = [UInt8](data.prefix(3))
+        return bytes.count == 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+    }
+
+    /// MIME type from the magic bytes (Gemini accepts JPEG, PNG, WEBP, HEIC, HEIF).
+    static func mimeType(for data: Data) -> String {
+        let bytes = [UInt8](data.prefix(12))
+        if bytes.count >= 3, bytes[0] == 0xFF, bytes[1] == 0xD8, bytes[2] == 0xFF { return "image/jpeg" }
+        if bytes.count >= 4, bytes[0] == 0x89, bytes[1] == 0x50, bytes[2] == 0x4E, bytes[3] == 0x47 { return "image/png" }
+        if bytes.count >= 12, bytes[0] == 0x52, bytes[1] == 0x49, bytes[2] == 0x46, bytes[3] == 0x46,
+           bytes[8] == 0x57, bytes[9] == 0x45, bytes[10] == 0x42, bytes[11] == 0x50 { return "image/webp" }
+        if bytes.count >= 12, bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {   // "ftyp"
+            let brand = String(decoding: bytes[8..<12], as: UTF8.self)
+            return brand.hasPrefix("hei") || brand.hasPrefix("hev") ? "image/heic" : "image/heif"
+        }
+        return "image/jpeg"
+    }
+
+    /// Pixel size and EXIF orientation (1 = upright) read from the header, without decoding.
+    static func imageInfo(_ data: Data) -> (width: Int, height: Int, orientation: Int)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        let orientation = props[kCGImagePropertyOrientation] as? Int ?? 1
+        return (width, height, orientation)
+    }
+
+    /// Upload JPEG: an upright JPEG already within `uploadMaxDimension` passes through
+    /// byte-for-byte; anything else (12 MP originals, HEIC, EXIF-rotated) is decoded once with
+    /// the rotation applied — the model may ignore EXIF orientation — and re-encoded.
+    static func uploadJPEG(from original: Data) -> Data? {
+        guard let info = imageInfo(original) else { return nil }
+        if isJPEG(original), info.orientation == 1, max(info.width, info.height) <= uploadMaxDimension {
+            return original
+        }
+        let target = min(max(info.width, info.height), uploadMaxDimension)
+        return renderJPEG(from: original, maxPixelSize: target, quality: uploadQuality)
+    }
+
+    /// Lighter copy for conversation history (longest edge `historyMaxDimension`, JPEG 0.8).
+    /// Returns the input unchanged if it is already that small or cannot be decoded.
+    static func historyCopy(of data: Data) -> Data {
+        guard let info = imageInfo(data), max(info.width, info.height) > Int(historyMaxDimension) else { return data }
+        return renderJPEG(from: data, maxPixelSize: Int(historyMaxDimension), quality: 0.8) ?? data
+    }
+
+    /// Decode (EXIF rotation applied, longest edge `maxPixelSize`) and encode as JPEG with ImageIO —
+    /// thread-safe and memory-light, so it runs on background queues.
+    static func renderJPEG(from data: Data, maxPixelSize: Int, quality: CGFloat) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output as CFMutableData, "public.jpeg" as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
+
+    /// Cheap identity for "is this the same photo the model already has?" checks.
+    static func fingerprint(_ data: Data) -> Int {
+        var hasher = Hasher()
+        hasher.combine(data.count)
+        hasher.combine(data.prefix(256))
+        hasher.combine(data.suffix(256))
+        return hasher.finalize()
     }
 }
 
@@ -110,13 +404,9 @@ final class VoiceAgentViewModel: ObservableObject {
     let settingsManager = SettingsManager.shared
     let glassesManager = GlassesManager.shared
     let voiceCommandService = VoiceCommandService.shared
-    let geminiVision = GeminiVisionService.shared
-    let geminiLive = GeminiLiveService.shared
-    let openAIRealtime = OpenAIRealtimeService.shared
+    let gemini = GeminiLiveService.shared
     let ttsService = TTSService.shared
     let soundService = SoundService.shared
-    let audioCapture = AudioCaptureService()
-    let audioPlayback = AudioPlaybackService()
     let sessionRecorder = SessionRecorder.shared
 
     // MARK: - Published UI state
@@ -125,18 +415,18 @@ final class VoiceAgentViewModel: ObservableObject {
     @Published var agentState: AgentState = .idle
     @Published var userTranscript = ""
     @Published var aiTranscript = ""
-    @Published var currentToolName: String?
     @Published var errorMessage: String?
-    /// Live Video Mode - uses Gemini Live or OpenAI Realtime for real-time audio + video
-    @Published var isLiveVideoMode = false
     /// True when voice recognition is ready (audio engine running)
     @Published var isVoiceReady = false
     /// True while a POV demo recording (glasses video + mic audio) is in progress.
     @Published var isRecording = false
     /// Transient status shown after a recording finishes ("Saved to Photos" / a failure). Auto-clears.
     @Published var recordingStatus: String?
-    /// Active pre-captured photo context (60s TTL, Capture First, Ask Later)
+    /// The photo the next question uses (120 s / 5 questions; "Capture First, Ask Later").
     @Published var activePhotoContext: CapturedPhotoContext?
+    /// The DISPLAY channel of the latest answer (Markdown + LaTeX), rendered by SolutionSheet.
+    /// The transcript bubble shows the SPOKEN text; this is the step-by-step derivation.
+    @Published var latestSolution: String?
 
     // MARK: - Internal state
 
@@ -145,34 +435,23 @@ final class VoiceAgentViewModel: ObservableObject {
     private var lastProcessedAt = Date.distantPast
     private var hasRequestedSpeechAuth = false
 
-    /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
-    /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
-    private var activeLiveService: (any LiveVideoService)?
-
-    /// Sentence-streaming TTS (Apple only): how many characters of the streamed reply have
-    /// already been handed to the speech queue, and whether a streamed utterance is open.
+    /// Sentence-streaming TTS: how many characters of the streamed reply have already been handed
+    /// to the speech queue, and whether a streamed utterance is open.
     private var ttsStreamSpokenChars = 0
-    private var ttsStreaming = false {
-        didSet { if !ttsStreaming { streamingNeuralTTS = nil } }
-    }
-    /// The neural engine the open streamed reply started on (nil = Apple TTS). Captured once at
-    /// beginStreaming so a Speech Engine change mid-reply can't send endStreaming to a different
-    /// engine and leave the first one stuck speaking.
-    private var streamingNeuralTTS: NeuralSpeechEngine?
+    private var ttsStreaming = false
 
     /// History: true after a user command was recorded, until its reply is recorded. Keeps
-    /// system utterances ("Live video mode active", error prompts) out of the History tab.
+    /// system utterances (error prompts) out of the History tab.
     private var historyAwaitingReply = false
-    /// A question put to the user mid-turn (a Hermes approval or clarifying question). The next
-    /// captured utterance answers it instead of starting a new command.
-    private var pendingAnswer: (id: UUID, continuation: CheckedContinuation<String?, Never>)?
-    /// Starts the neural voice reading the open question; cancelled with the question.
-    private var questionPrompt: Task<Void, Never>?
-    /// History (live modes): last streamed AI turn already recorded, to dedupe turn-complete events.
-    private var historyLastLiveReply = ""
 
-    /// Frame counter for logging
-    private var videoFrameCount: Int = 0
+    /// The SPOKEN channel of the last answer, for "read it again" (double press on the glasses).
+    private var lastSpokenAnswer = ""
+
+    /// The wearer said goodbye ([[END]] from the model): close the session once the reply is spoken.
+    private var endSessionAfterSpeaking = false
+
+    /// True while a capture-button photo is being taken (extra presses are ignored meanwhile).
+    @Published private(set) var isCapturingFromButton = false
 
     // MARK: - Agent State
 
@@ -182,30 +461,14 @@ final class VoiceAgentViewModel: ObservableObject {
         case listening
         case thinking
         case speaking
-        case toolRunning
-        case liveVideo  // Live video mode - Gemini handles audio + video
 
         var displayText: String {
             switch self {
-            case .idle: return "Tap to start"
-            case .connecting: return "Connecting..."
-            case .listening: return "Listening..."
-            case .thinking: return "Thinking..."
-            case .speaking: return "Speaking..."
-            case .toolRunning: return "Running tool..."
-            case .liveVideo: return "Live Video"
-            }
-        }
-
-        var accentColor: Color {
-            switch self {
-            case .idle: return .gray
-            case .connecting: return .orange
-            case .listening: return .blue
-            case .thinking: return .purple
-            case .speaking: return .green
-            case .toolRunning: return .orange
-            case .liveVideo: return .red  // Red for live video recording indicator
+            case .idle: return "Chạm để bắt đầu"
+            case .connecting: return "Đang kết nối…"
+            case .listening: return "Đang nghe…"
+            case .thinking: return "Đang suy nghĩ…"
+            case .speaking: return "Đang trả lời…"
             }
         }
     }
@@ -215,7 +478,18 @@ final class VoiceAgentViewModel: ObservableObject {
     func onAppear() {
         setupVoiceCommandService()
         setupGlassesCallbacks()
-        preloadLocalModelIfNeeded()
+        applyButtonLinkSetting()
+        // The temple-shutter workflow reads glasses photos from Camera Roll: ask for Photos access
+        // up front (it was never requested before, so the scanner silently found nothing), and
+        // warn when only "Selected Photos" is granted — new glasses photos are invisible then.
+        Task { @MainActor in
+            let granted = await RecentPhotoScanner.shared.requestAuthorizationIfNeeded()
+            if !granted {
+                errorMessage = "OpenVision cần quyền Ảnh (Toàn bộ ảnh) để đọc ảnh chụp từ kính Ray-Ban. Vào Cài đặt → OpenVision → Ảnh."
+            } else if RecentPhotoScanner.shared.isLimitedAccess {
+                errorMessage = "Quyền Ảnh đang ở chế độ Giới hạn nên app không thấy ảnh mới từ kính. Vào Cài đặt → OpenVision → Ảnh → chọn Toàn bộ ảnh."
+            }
+        }
         // Resume wake-word listening when returning to this screen. onDisappear stops it
         // (e.g. when navigating to Settings), and the one-time .task doesn't re-run on return —
         // so without this, the wake word stayed dead until you tapped the mic button.
@@ -239,40 +513,15 @@ final class VoiceAgentViewModel: ObservableObject {
         } else {
             // Playback finished — closes the turn and publishes it to the metrics sinks.
             MetricsCollector.shared.markSpokeDone()
-            commandTurnActive = false   // reply fully played; ambient narration may resume
 
             // Resume barge-in detection
             voiceCommandService.isBargeInPaused = false
 
-            if isSessionActive {
-                agentState = .listening
-                resumeListeningAfterSpeaking()
-            } else {
-                agentState = .idle
-            }
-        }
-    }
-
-    // Neural voices (Kokoro, Grok) drive the same speaking-state flow as Apple TTS: keep the recognizer running
-    // (in .processing) with barge-in paused so it stays in the conversation loop, then enter
-    // conversation mode when playback finishes. (Don't stopListening — that trips the .idle
-    // session-teardown observer and ends the conversation after every reply.)
-    func neuralSpeakingChanged(_ speaking: Bool) {
-        // Each neural engine reports separately. One finishing (say a Kokoro preview, or an ambient
-        // line) mustn't end the turn while another is still speaking a reply.
-        if !speaking && NeuralSpeech.isAnySpeaking { return }
-        if speaking {
-            agentState = .speaking
-            voiceCommandService.isBargeInPaused = true
-        } else {
-            // Neural engines have their OWN speaking-state callback, so instrumenting only
-            // ttsSpeakingChanged left every Kokoro/Grok turn unpublished — device metrics kept
-            // flowing while turn metrics silently vanished whenever Kokoro was selected.
-            MetricsCollector.shared.markSpokeDone()
-            commandTurnActive = false   // reply fully played; ambient narration may resume
-
-            voiceCommandService.isBargeInPaused = false
-            if isSessionActive {
+            if isSessionActive && endSessionAfterSpeaking {
+                endSessionAfterSpeaking = false
+                print("[VoiceAgent] Goodbye spoken — ending the session")
+                stopSession()
+            } else if isSessionActive {
                 agentState = .listening
                 resumeListeningAfterSpeaking()
             } else {
@@ -283,7 +532,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
     /// Control thinking sound based on agent state.
     func agentStateChanged(_ newState: AgentState) {
-        if newState == .thinking || newState == .toolRunning {
+        if newState == .thinking {
             soundService.startThinkingSound()
         } else {
             soundService.stopThinkingSound()
@@ -294,53 +543,19 @@ final class VoiceAgentViewModel: ObservableObject {
         print("[VoiceAgent] VoiceCommandService state changed to: \(newState)")
         switch newState {
         case .idle:
-            // In live video mode, a silence timeout must NOT end the mode — the user expects
-            // to keep asking questions (camera stays on) until they say "stop video". Re-arm
-            // conversation mode so the next question is heard without a fresh wake word.
-            if isLiveVideoMode {
-                print("[VoiceAgent] Idle during live video — re-arming conversation mode")
-                voiceCommandService.enterConversationMode()
-                agentState = .liveVideo
-                return
-            }
             // A real conversation end is the recognizer going idle *while we were listening*
             // for the user (silence timeout). An .idle in any other state (.connecting startup,
-            // .thinking/.toolRunning command processing, .speaking a reply) is a transient from
-            // our own stop/restart — e.g. the camera capture restarts the recognizer mid-command
-            // — and must NOT tear the session down. (This is what left the wake word dead after a
-            // face/camera command: the restart flipped to .idle during .thinking and killed the
-            // session, so the post-reply audio rebuild never ran.)
+            // .thinking command processing, .speaking a reply) is a transient from our own
+            // stop/restart — e.g. the camera capture restarts the recognizer mid-command — and
+            // must NOT tear the session down.
             if isSessionActive && agentState == .listening {
                 print("[VoiceAgent] Voice service idle, stopping session")
-                cancelPendingAnswer()
                 isSessionActive = false
                 agentState = .idle
-                // Disconnect AI backend
-                Task {
-                    switch settingsManager.settings.aiBackend {
-                    case .openClaw:
-                        await OpenClawService.shared.disconnect()
-                    case .geminiLive:
-                        await GeminiLiveService.shared.disconnect()
-                    case .openAI, .grok, .hermes:
-                        break   // stateless HTTP — nothing to disconnect
-                    case .appleFoundation:
-                        break   // OS-managed — nothing to disconnect
-                    case .localGemma:
-                        // Keep the on-device model LOADED so the next "Ok Vision" is instant.
-                        // Unloading + reloading the ~3.6GB model per conversation was the cause
-                        // of the "connecting…" lag and hangs. It stays resident until the app
-                        // backgrounds or the user switches backend.
-                        break
-                    }
-                }
+                Task { await gemini.disconnect() }
             }
         case .listening, .conversationMode:
-            // Keep the live indicator up in live video mode (don't clobber it back to
-            // plain .listening, which would let the next idle tear the session down).
-            if isLiveVideoMode {
-                agentState = .liveVideo
-            } else if ttsService.isSpeaking || NeuralSpeech.isAnySpeaking {
+            if ttsService.isSpeaking {
                 // The recognizer restarts (→ conversation mode) mid-reply for barge-in; don't
                 // let that flip the UI to "Listening" while the assistant is still speaking.
                 agentState = .speaking
@@ -363,68 +578,18 @@ final class VoiceAgentViewModel: ObservableObject {
     }
 
     func startSession() {
-        // Check configuration
-        guard settingsManager.settings.isCurrentBackendConfigured else {
-            errorMessage = "Please configure \(settingsManager.settings.aiBackend.displayName) in Settings"
-            return
-        }
-
         isSessionActive = true
         agentState = .connecting
-
-        // Model memory follows the History conversation window (5-min inactivity), NOT the wake
-        // session — every "Ok Vision" starts a new session, so clearing here made "what were we
-        // just talking about?" fail seconds after the previous answer. Only reset memory when
-        // enough time has passed that History would start a new conversation anyway.
-        if !ConversationManager.shared.isCurrentConversationFresh {
-            ConversationContext.shared.clear()
-            AppleFoundationService.shared.resetContext()
-        }
 
         // Configure audio routing for glasses if registered
         configureAudioForGlasses()
 
-        // Connect to AI backend
         Task {
             do {
-                switch settingsManager.settings.aiBackend {
-                case .openClaw:
-                    try await OpenClawService.shared.connect()
-                    // Note: Streaming NOT auto-started in OpenClaw mode
-                    // User says "start video stream" → startLiveVideoMode()
-                    // User says "take a photo" → captureAndSendPhoto() starts streaming on-demand
-
-                case .openAI:
-                    try await OpenAIService.shared.connect()
-                    // Stateless HTTP — photos are captured on-demand like OpenClaw.
-
-                case .grok:
-                    try await GrokService.shared.connect()
-                    // Stateless HTTP — photos are captured on-demand like OpenAI.
-
-                case .hermes:
-                    try await HermesService.shared.connect()
-                    // Stateless HTTP to the user's Hermes server — photos on demand like OpenAI.
-
-                case .appleFoundation:
-                    try await AppleFoundationService.shared.connect()
-                    // On-device Apple model — text only; camera commands guide to a cloud backend.
-
-                case .geminiLive:
-                    try await GeminiLiveService.shared.connect()
-                    // Start glasses streaming for Gemini Live mode
-                    if glassesManager.isRegistered && !glassesManager.isStreaming {
-                        print("[VoiceAgent] Starting glasses stream for Gemini Live...")
-                        await glassesManager.startStreaming()
-                    }
-
-                case .localGemma:
-                    // On-device Gemma: load the model (must be downloaded first).
-                    // Text-only in Phase 1 — no glasses streaming needed.
-                    try await GemmaLocalService.shared.connect(
-                        modelId: settingsManager.settings.localGemmaModelId
-                    )
-                }
+                // No camera stream here: the glasses camera only runs for the moment a photo is
+                // taken ("Click & Go"). A stream per session drained the glasses' battery and
+                // heated them for nothing — the REST solver never reads video frames.
+                try await gemini.connect()
 
                 agentState = .listening
                 userTranscript = ""
@@ -438,11 +603,20 @@ final class VoiceAgentViewModel: ObservableObject {
                     // Put in listening mode (not waiting for wake word)
                     voiceCommandService.enterConversationMode()
                 } else {
-                    errorMessage = "Speech recognition not authorized"
+                    errorMessage = "Chưa được cấp quyền nhận dạng giọng nói."
                 }
-
             } catch {
-                errorMessage = "Failed to connect: \(error.localizedDescription)"
+                // No key yet: still listen, so the glasses can SAY what is missing.
+                if case AIBackendError.notConfigured = error {
+                    agentState = .listening
+                    if voiceCommandService.authorizationStatus == .authorized {
+                        if !voiceCommandService.isListening { try? voiceCommandService.startListening() }
+                        voiceCommandService.enterConversationMode()
+                    }
+                    errorMessage = "Chưa có API key Gemini — vào Cài đặt → Gemini để dán key."
+                    return
+                }
+                errorMessage = "Không kết nối được: \(error.localizedDescription)"
                 isSessionActive = false
                 agentState = .idle
             }
@@ -494,35 +668,10 @@ final class VoiceAgentViewModel: ObservableObject {
     }
 
     func stopSession() {
-        cancelPendingAnswer()
-        // If in live video mode, stop it first
-        if isLiveVideoMode {
-            Task {
-                await stopLiveVideoMode()
-            }
-        }
-
         Task {
-            switch settingsManager.settings.aiBackend {
-            case .openClaw:
-                await OpenClawService.shared.disconnect()
-            case .geminiLive:
-                await GeminiLiveService.shared.disconnect()
-            case .openAI, .grok:
-                break   // stateless HTTP — nothing to disconnect
-            case .hermes:
-                // Stop the gateway turn too, or the next request finds it still running.
-                await HermesGatewayClient.shared.interrupt()   // no-op in API-key mode
-            case .appleFoundation:
-                break   // OS-managed — nothing to disconnect
-            case .localGemma:
-                // Keep the on-device model loaded — see note in the .idle handler. Reloading it
-                // per conversation was what made "Ok Vision" slow/flaky.
-                break
-            }
-
-            // Stop glasses streaming (turns off LED)
-            if glassesManager.isStreaming {
+            await gemini.disconnect()
+            // Stop glasses streaming (turns off LED) — e.g. one left running by a capture.
+            if glassesManager.isStreaming && !isRecording {
                 print("[VoiceAgent] Stopping glasses stream...")
                 await glassesManager.stopStreaming()
             }
@@ -530,7 +679,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Stop any ongoing TTS
         ttsService.stop()
-        NeuralSpeech.stopAll()
+        ttsStreaming = false
 
         // Set session inactive FIRST to prevent callbacks from processing
         isSessionActive = false
@@ -547,8 +696,6 @@ final class VoiceAgentViewModel: ObservableObject {
         }
         userTranscript = ""
         aiTranscript = ""
-        currentToolName = nil
-        isLiveVideoMode = false
     }
 
     /// Full stop for "Ok Vision stop": silence all output, cancel any in-flight generation, and go
@@ -556,64 +703,21 @@ final class VoiceAgentViewModel: ObservableObject {
     /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
     private func performFullStop() {
         // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
-        // deterministically before stopping the engines — delivered-then-stopped turns finish
-        // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
-        // to be recorded as failed by the next beginTurn.
+        // deterministically before stopping the engines.
         MetricsCollector.shared.markInterrupted()
         MetricsCollector.shared.markSpokeDone()
-        cancelPendingAnswer()
-        commandTurnActive = false
         ttsService.stop()
-        NeuralSpeech.stopAll()
-        audioPlayback.stop()
         ttsStreaming = false
-
-        Task {
-            switch settingsManager.settings.aiBackend {
-            case .openClaw: await OpenClawService.shared.interrupt()
-            case .geminiLive: await GeminiLiveService.shared.interrupt()
-            case .openAI, .grok: break   // single request/response — nothing to interrupt
-            case .hermes: await HermesGatewayClient.shared.interrupt()   // no-op in API-key mode
-            case .appleFoundation: AppleFoundationService.shared.interrupt()
-            case .localGemma: GemmaLocalService.shared.interrupt()
-            }
-        }
-
-        // In live video mode, a stop means SHUT UP, not "tear down my camera session" — the
-        // same rule as the command-level matcher, applied to the mid-reply stop-phrase route.
-        // (Verified on device: "Ok Vision stop" during a reply used to exit the whole mode.)
-        // "Stop video" remains the exit phrase.
-        if isLiveVideoMode {
-            NSLog("[OV] live: stop phrase — silenced, staying in live mode")
-            voiceCommandService.enterConversationMode()
-            agentState = .liveVideo
-            return
-        }
+        Task { await gemini.interrupt() }
 
         // Go quiet: end the turn, return to wake-word idle. Say "Ok Vision" to start again.
         userTranscript = ""
         aiTranscript = ""
-        currentToolName = nil
         isSessionActive = false
         agentState = .idle
     }
 
     // MARK: - Voice Command Setup
-
-    /// Warm up the on-device model in the background so the FIRST "Ok Vision" is instant
-    /// (no multi-second load on wake). Only when Local Gemma is the selected, downloaded backend.
-    private func preloadLocalModelIfNeeded() {
-        guard settingsManager.settings.aiBackend == .localGemma,
-              settingsManager.settings.localGemmaModelReady else { return }
-        Task {
-            do {
-                try await GemmaLocalService.shared.connect(modelId: settingsManager.settings.localGemmaModelId)
-                print("[VoiceAgent] Local model preloaded — wake word will be instant")
-            } catch {
-                print("[VoiceAgent] Local model preload failed: \(error.localizedDescription)")
-            }
-        }
-    }
 
     /// Request speech recognition authorization
     func requestSpeechAuthorization() async {
@@ -626,7 +730,7 @@ final class VoiceAgentViewModel: ObservableObject {
             startWakeWordListening()
         } else {
             print("[VoiceAgent] Speech recognition not authorized")
-            errorMessage = "Speech recognition not authorized. Please enable in Settings."
+            errorMessage = "Chưa được cấp quyền nhận dạng giọng nói. Hãy bật trong Cài đặt."
         }
     }
 
@@ -636,48 +740,37 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Interruptible whenever the assistant holds the floor. This gate exists to stop the
         // reply's own audio (heard through the mic) from false-triggering the wake word — so it
-        // must be true exactly when the assistant is producing output:
-        //  - a reply speaking on EITHER engine. Checking only Apple TTS left barge-in dead for
-        //    every Kokoro user: "Ok Vision stop" did nothing while Kokoro spoke.
-        //  - generation still thinking: no reply audio exists yet, so a wake word heard then is
-        //    genuinely the user — and it's the only way to cancel a long generation by voice.
+        // must be true exactly when the assistant is producing output, or still thinking (no reply
+        // audio exists yet, so a wake word then is genuinely the user — the only way to cancel a
+        // long generation by voice).
         voiceCommandService.shouldAllowInterrupt = { [weak self] in
             guard let self else { return false }
-            return self.ttsService.isSpeaking
-                || NeuralSpeech.isAnySpeaking
-                || self.agentState == .thinking
+            return self.ttsService.isSpeaking || self.agentState == .thinking
         }
 
         // Wake word detected
         voiceCommandService.onWakeWordDetected = { [weak self] in
             guard let self else { return }
             print("[VoiceAgent] Wake word detected!")
+            self.endSessionAfterSpeaking = false
             HapticFeedback.medium()
             self.soundService.playWakeWordSound()
 
             // If TTS is speaking, stop it immediately (interrupt)
-            if self.ttsService.isSpeaking || NeuralSpeech.isAnySpeaking {
+            if self.ttsService.isSpeaking {
                 print("[VoiceAgent] Stopping TTS due to wake word interrupt")
-                // Also an interruption: the user said the wake word over a reply in progress.
                 MetricsCollector.shared.markInterrupted()
-                // Close the turn NOW, deterministically: delivered-then-cut-off turns finish
-                // here (markSpokeDone is gated on firstAudio); pre-audio ones stay open and are
-                // recorded as failed by the next beginTurn. Leaving this to the engine's async
-                // speaking-changed callback raced the next turn's speechEnd.
+                // Close the turn NOW, deterministically, rather than racing the engine's async
+                // speaking-changed callback against the next turn's speechEnd.
                 MetricsCollector.shared.markSpokeDone()
                 self.ttsService.stop()
                 self.ttsStreaming = false   // keep flag in sync with the cleared stream
-                NeuralSpeech.stopAll()
-                self.audioPlayback.stop()
-                // Cancel any in-flight on-device generation too — otherwise its next streamed
-                // token would immediately restart speech we just stopped.
-                GemmaLocalService.shared.interrupt()
                 self.agentState = .listening
             }
 
             // Auto-start session if not already active (use Task to avoid blocking)
             Task { @MainActor in
-                if !self.isSessionActive && self.settingsManager.settings.isCurrentBackendConfigured {
+                if !self.isSessionActive {
                     print("[VoiceAgent] Starting session from wake word...")
                     self.startSession()
                 }
@@ -689,13 +782,6 @@ final class VoiceAgentViewModel: ObservableObject {
         voiceCommandService.onStopCommand = { [weak self] in
             print("[VoiceAgent] Full stop requested")
             self?.performFullStop()
-        }
-
-        HermesGatewayClient.shared.cancelQuestion = { [weak self] in
-            self?.cancelPendingAnswer()
-        }
-        HermesGatewayClient.shared.askUser = { [weak self] prompt in
-            await self?.askUser(prompt)
         }
 
         // Command captured
@@ -710,47 +796,18 @@ final class VoiceAgentViewModel: ObservableObject {
                 return
             }
 
-            // An answer to a question the agent asked mid-turn, not a new command.
-            if self.pendingAnswer != nil, self.settingsManager.settings.aiBackend != .hermes {
-                self.cancelPendingAnswer()   // backend switched mid-question: this is a new command
-            }
-            if let pending = self.pendingAnswer {
-                self.pendingAnswer = nil
-                self.userTranscript = command
-                self.agentState = .thinking   // Hermes carries on with the answer
-                pending.continuation.resume(returning: command)
-                return
-            }
-
             self.userTranscript = command
-            // Suspend ambient narration for the WHOLE turn (through reply playback).
-            self.commandTurnActive = true
-            // And CANCEL any in-flight ambient inference right now — describeFrame checks
-            // Task.isCancelled per token, so the GPU frees within one decode step instead of
-            // the question queueing ~4s behind a caption nobody asked for.
-            if self.watchTask != nil { self.startWatchLoop() }
+            self.latestSolution = nil
+            self.endSessionAfterSpeaking = false   // a new question: the goodbye no longer stands
 
             // Telemetry: the turn is now the backend's problem — everything after this is
             // think time, and everything before it was endpointing.
-            //
-            // The model must be the one ACTUALLY LOADED, not `settings.localGemmaModelId`:
-            // that setting is the *selected local model* and doesn't change when the active
-            // backend is Apple Intelligence or a cloud service, so turns served by something
-            // else were mislabelled as the local model — which made model comparisons in
-            // Grafana quietly meaningless.
-            let backend = self.settingsManager.settings.aiBackend
-            MetricsCollector.shared.markCommit(
-                backend: backend.rawValue,
-                model: backend == .localGemma ? GemmaLocalService.shared.activeModelId : nil,
-                ttsEngine: self.usingAppleTTS ? "apple" : self.settingsManager.settings.ttsEngine.rawValue
-            )
+            MetricsCollector.shared.markCommit(backend: "gemini", model: GeminiLiveService.modelName, ttsEngine: "apple")
 
-            // History: every captured command is a user message (Meta AI records all glasses
-            // prompts to its History tab; same idea, on-device).
+            // History: every captured command is a user message.
             ConversationManager.shared.addUserMessage(command)
             self.historyAwaitingReply = true
 
-            // Send command to AI backend
             Task {
                 await self.sendCommand(command)
             }
@@ -760,56 +817,17 @@ final class VoiceAgentViewModel: ObservableObject {
         voiceCommandService.onInterruption = { [weak self] in
             guard let self else { return }
             print("[VoiceAgent] Barge-in detected")
+            self.endSessionAfterSpeaking = false
             // Interruption rate is a satisfaction signal: users talk over an agent that is slow,
             // wrong, or too verbose. Recorded on the turn being interrupted.
-            // Talking over a question Hermes asked is answering it early: stop reading it out but
-            // keep the question open (and the turn running) for what they say.
-            if self.pendingAnswer != nil {
-                self.ttsService.stop()
-                NeuralSpeech.stopAll()
-                return
-            }
             MetricsCollector.shared.markInterrupted()
-
-            // Stop TTS immediately
             self.ttsService.stop()
-            NeuralSpeech.stopAll()
-
-            // Stop current AI response
-            Task {
-                switch self.settingsManager.settings.aiBackend {
-                case .openClaw:
-                    await OpenClawService.shared.interrupt()
-                case .geminiLive:
-                    await GeminiLiveService.shared.interrupt()
-                case .openAI, .grok:
-                    break   // single request/response — nothing to interrupt
-                case .hermes:
-                    await HermesGatewayClient.shared.interrupt()   // no-op in API-key mode
-                case .appleFoundation:
-                    AppleFoundationService.shared.interrupt()
-                case .localGemma:
-                    GemmaLocalService.shared.interrupt()
-                }
-            }
+            Task { await self.gemini.interrupt() }
         }
 
         // Conversation timeout (user didn't speak after AI response)
         voiceCommandService.onConversationTimeout = { [weak self] in
             guard let self else { return }
-            // In live video mode, silence must not end the session — the .idle state handler
-            // re-arms conversation mode so the user can keep asking until they say "stop video".
-            if self.isLiveVideoMode {
-                print("[VoiceAgent] Conversation timeout during live video — staying live")
-                return
-            }
-            if self.pendingAnswer != nil {
-                // Silence answers a Hermes question with no, but its turn and the session go on.
-                print("[VoiceAgent] Conversation timeout during a Hermes question - answering no")
-                self.cancelPendingAnswer()
-                self.agentState = .thinking
-                return
-            }
             print("[VoiceAgent] Conversation timeout - returning to idle")
             self.stopSession()
         }
@@ -834,7 +852,7 @@ final class VoiceAgentViewModel: ObservableObject {
         ttsService.onSpeechEnded = { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                try? await Task.sleep(nanoseconds: SolverIntent.ttsEchoSettleNanoseconds)
                 if !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 {
                     self.voiceCommandService.isBargeInPaused = false
                     if self.agentState == .speaking {
@@ -844,145 +862,85 @@ final class VoiceAgentViewModel: ObservableObject {
             }
         }
 
-        // Shared reply/state wiring — every AIBackend reports through the same two callbacks,
-        // so wire them once for all. (Gemini Live is a streaming session and delivers replies
-        // via its own transcription callbacks below; its protocol callbacks are inert.)
-        for backend in AIBackendRegistry.all {
-            backend.onAgentMessage = { [weak self] (message: String) in
-                guard let self else { return }
-                // In local live video mode replies must flow even if the session timer lapsed
-                // while the user was silently looking around.
-                guard self.isSessionActive || self.isLiveVideoMode else { return }
-
-                // Parse dual-channel format (SPOKEN: and DISPLAY:)
-                let (spoken, display) = self.parseDualChannelResponse(message)
-                self.aiTranscript = display
-
-                // Reply text is final. For non-streaming backends this is also the first output
-                // we ever saw, and markFirstToken is first-wins, so it stays accurate either way.
-                MetricsCollector.shared.markFirstToken()
-                MetricsCollector.shared.markGenerationDone()
-                if self.ttsStreaming {
-                    // A streamed utterance is open (local model + Apple TTS pipelining):
-                    // flush the unspoken tail and close the session.
-                    self.feedStreamingSpeech(spoken, isFinal: true)
-                } else {
-                    self.speakResponse(spoken, historyText: display)
-                }
-            }
-            backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
-                guard let self else { return }
-                if isProcessing {
-                    self.agentState = .thinking
-                    // New reply: reset the sentence-streaming cursor for a clean start.
-                    self.ttsStreaming = false
-                    self.ttsStreamSpokenChars = 0
-                } else {
-                    // Generation ended (always fires via defer, even when interrupted/superseded).
-                    // If a streamed utterance is still open, onAgentMessage never fired to close it —
-                    // close it here so streamingActive/isSpeaking don't stick true and freeze the
-                    // wake-word listener (queued sentences still drain and reset isSpeaking).
-                    if self.ttsStreaming {
-                        // Close whichever engine has the open utterance — leaving a neural one open
-                        // would strand isSpeaking true and freeze the wake-word listener.
-                        if let neuralTTS = self.streamingNeuralTTS {
-                            neuralTTS.endStreaming()
-                        } else {
-                            self.ttsService.endStreaming()
-                        }
-                        self.ttsStreaming = false
-                    }
-                    if !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 && !NeuralSpeech.isAnySpeaking {
-                        // Turn produced no speech (error/interrupt) — release the narration hold.
-                        self.commandTurnActive = false
-                    }
-                    if self.agentState == .thinking
-                        && !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 && !NeuralSpeech.isAnySpeaking {
-                        // Return to the live video indicator, not plain listening, while in live mode.
-                        self.agentState = self.isLiveVideoMode ? .liveVideo
-                            : (self.isSessionActive ? .listening : .idle)
-                    }
-                }
-            }
-        }
-
-        // Local Gemma extra: token streaming (pipelines Apple TTS behind generation).
-        GemmaLocalService.shared.onPartialResponse = { [weak self] (partial: String) in
+        // The finished reply (dual channel): SPOKEN to the glasses, DISPLAY to the phone.
+        gemini.agentMessageCallback = { [weak self] (message: String) in
             guard let self else { return }
-            guard self.isSessionActive || self.isLiveVideoMode else { return }
-            // Show tokens as they stream so it doesn't look stuck on "thinking".
-            self.aiTranscript = partial
-            // First streamed token: the boundary between "backend thinking" and "producing".
+            guard self.isSessionActive else { return }
+
+            let (spoken, display) = self.parseDualChannelResponse(message)
+            self.aiTranscript = spoken.isEmpty ? display : spoken
+            let isGoodbye = GeminiLiveService.endsConversation(message)
+            if !spoken.isEmpty, !isGoodbye { self.lastSpokenAnswer = spoken }
+            self.endSessionAfterSpeaking = isGoodbye
+            self.latestSolution = Self.solutionWorthShowing(spoken: spoken, display: display)
+
+            // Reply text is final. markFirstToken is first-wins, so streaming kept it accurate.
             MetricsCollector.shared.markFirstToken()
-            // Apple TTS: start speaking completed sentences as they arrive (pipeline speech
-            // behind generation) instead of waiting for the whole reply. Big perceived speedup,
-            // and Apple TTS isn't on the GPU so it doesn't fight the on-device model.
-            if self.canStreamSpeech { self.feedStreamingSpeech(partial, isFinal: false) }
-        }
-
-        // OpenClaw extras: tool status + device-side tool calls.
-        OpenClawService.shared.onToolStatusChanged = { [weak self] (toolName: String?, isRunning: Bool) in
-            guard let self else { return }
-            print("[VoiceAgent] Tool status: \(toolName ?? "none"), running: \(isRunning)")
-            self.currentToolName = toolName
-            if isRunning {
-                self.agentState = .toolRunning
-            }
-        }
-
-        // Handle tool calls (e.g., take_photo)
-        OpenClawService.shared.onToolCall = { [weak self] (toolName: String, args: [String: Any], completion: @escaping (String) -> Void) in
-            guard let self else { return }
-            print("[VoiceAgent] Tool call: \(toolName) with args: \(args)")
-
-            switch toolName {
-            case "take_photo", "capture_photo", "take_picture":
-                // Capture photo from glasses
-                Task { @MainActor in
-                    await self.handleTakePhotoTool(completion: completion)
-                }
-
-            case "describe_scene", "what_do_you_see", "look":
-                // Query Gemini Vision for scene description
-                Task { @MainActor in
-                    await self.handleDescribeSceneTool(args: args, completion: completion)
-                }
-
-            default:
-                print("[VoiceAgent] Unknown tool: \(toolName)")
-                completion("Tool '\(toolName)' is not available on this device.")
-            }
-        }
-
-        // Gemini Live callbacks (for direct / fallback solver mode)
-        GeminiLiveService.shared.onOutputTranscription = { [weak self] (text: String) in
-            guard let self else { return }
-            // If Gemini is active backend, replies are already delivered through backend.onAgentMessage
-            guard self.settingsManager.settings.aiBackend != .geminiLive else { return }
-            let (spoken, display) = self.parseDualChannelResponse(text)
-            self.aiTranscript = display
-            if !spoken.isEmpty && !self.ttsService.isSpeaking {
+            MetricsCollector.shared.markGenerationDone()
+            if self.ttsStreaming {
+                // A streamed utterance is open: flush the unspoken tail and close it.
+                self.feedStreamingSpeech(spoken, isFinal: true, historyText: display)
+            } else {
                 self.speakResponse(spoken, historyText: display)
             }
         }
 
-        GeminiLiveService.shared.onTurnComplete = { [weak self] in
+        gemini.processingChangedCallback = { [weak self] (isProcessing: Bool) in
             guard let self else { return }
-            guard self.isLiveVideoMode, !self.ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking else { return }
-            // Cloud live turns can only be COUNTED: the server does VAD, so the client never
-            // sees when the user stopped speaking and a perceived-latency figure would be
-            // fabricated. Counting keeps live-mode usage visible without inventing numbers.
-            MetricsCollector.shared.count("live_turn_gemini")
-            self.agentState = self.isSessionActive ? .listening : .idle
-            self.voiceCommandService.enterConversationMode()
-            // History: persist this Gemini Live exchange (transcript only, no frames).
-            self.recordLiveTurn()
+            if isProcessing {
+                self.agentState = .thinking
+                // New reply: reset the sentence-streaming cursor for a clean start.
+                self.ttsStreaming = false
+                self.ttsStreamSpokenChars = 0
+            } else {
+                // Generation ended (always fires via defer, even when interrupted/superseded).
+                // If a streamed utterance is still open, the reply callback never fired to close
+                // it — close it here so isSpeaking can't stick true and freeze the wake word.
+                if self.ttsStreaming {
+                    self.ttsService.endStreaming()
+                    self.ttsStreaming = false
+                }
+                if self.agentState == .thinking
+                    && !self.ttsService.isSpeaking && self.ttsService.pendingUtterances == 0 {
+                    self.agentState = self.isSessionActive ? .listening : .idle
+                }
+            }
         }
+
+        // Agent loop: Gemini asked to SEE and no photo was in the conversation — take one.
+        gemini.onCaptureRequested = { [weak self] (_: String) async -> Data? in
+            guard let self else { return nil }
+            return await self.captureForAgent()
+        }
+
+        // Gemini streams its reply: start speaking the SPOKEN channel at the first finished sentence
+        // instead of waiting for the long step-by-step DISPLAY channel to be generated.
+        gemini.onPartialSpoken = { [weak self] (spoken: String) in
+            guard let self else { return }
+            guard self.isSessionActive else { return }
+            if !self.ttsStreaming {
+                // Blueprint lesson 4: be "speaking" with barge-in paused BEFORE the first sentence is
+                // queued, so the temple speaker's echo can never be taken for a new command.
+                self.agentState = .speaking
+                self.voiceCommandService.isBargeInPaused = true
+            }
+            self.aiTranscript = spoken
+            MetricsCollector.shared.markFirstToken()
+            self.feedStreamingSpeech(spoken, isFinal: false)
+        }
+    }
+
+    /// The DISPLAY text when it adds something to what was spoken (a derivation, formulas, a
+    /// table) — nil for a plain one-liner, so the phone doesn't offer an empty "solution".
+    static func solutionWorthShowing(spoken: String, display: String) -> String? {
+        let trimmed = display.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != spoken.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return trimmed
     }
 
     /// Parse Gemini Solver Dual-Channel Response (SPOKEN: and DISPLAY:)
     private func parseDualChannelResponse(_ text: String) -> (spoken: String, display: String) {
-        return GeminiLiveService.parseDualChannel(text)
+        GeminiLiveService.parseDualChannel(text)
     }
 
     /// Start listening for wake word
@@ -1005,866 +963,68 @@ final class VoiceAgentViewModel: ObservableObject {
 
     // MARK: - Command routing
 
-    /// Send command to AI backend
-    private func sendCommand(_ command: String) async {
-        let lowerCommand = command.lowercased()
-
-        // Check for "stop" command - stops TTS and waits for next command.
-        // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
-        // as a stop command and killed the session mid-question.
-        let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
-        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
-        let stopExact: Set<String> = ["stop", "quiet", "silence", "enough", "dừng", "thôi", "ngừng"]
-        let stopPhrases = [
-            "be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it",
-            "dừng lại", "dừng đi", "thôi đi", "ngừng lại", "ngừng đi"
-        ]
-        let isExactStop = stopExact.contains(lowerCommand.trimmingCharacters(in: .whitespacesAndNewlines))
-        let isStopCommand = (isExactStop
-                             || !commandWords.isDisjoint(with: stopSingleWords)
-                             || stopPhrases.contains { lowerCommand.contains($0) })
-                             && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
-
-        if isStopCommand {
-            // In live video mode, "stop" means SHUT UP, not "tear down my camera session" —
-            // silence everything and stay live. "Stop video" (excluded above) exits the mode.
-            if isLiveVideoMode {
-                NSLog("[OV] live: stop — silencing, staying in live mode")
-                MetricsCollector.shared.markInterrupted()
-                MetricsCollector.shared.markSpokeDone()
-                ttsService.stop()
-                NeuralSpeech.stopAll()
-                ttsStreaming = false
-                commandTurnActive = false
-                GemmaLocalService.shared.interrupt()
-                agentState = .liveVideo
-                return
-            }
+    /// Send the wearer's words — verbatim, any language — to Gemini, with the current glasses
+    /// photo when there is one. Gemini decides whether the photo matters, and asks for one
+    /// ([[CAPTURE]]) when it must see something and has none.
+    private func sendCommand(_ command: String, allowRepeat: Bool = false) async {
+        // "Stop" — stops speech and waits for the next command (word-matched, see SolverIntent).
+        if SolverIntent.isStopCommand(command) {
             print("[VoiceAgent] Stop command detected - full stop")
             performFullStop()
             return
         }
 
-        // Check for live video mode commands
-        let startLiveKeywords = ["start video stream", "start live video", "start video", "start streaming",
-                                 "enable video", "live mode", "go live", "video mode"]
-
-        let isStartLiveCommand = startLiveKeywords.contains { lowerCommand.contains($0) }
-        // Fuzzy stop match: any "video"/"stream" phrase with a stop-like word. Tolerates Apple STT
-        // dropping the leading 's' ("stop video" → "top video"), which previously sailed past the
-        // exact-keyword list and got sent to the model as a question instead of ending the mode.
-        let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream")
-        let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off"]
-        let isStopLiveCommand = mentionsVideo && stopWords.contains { lowerCommand.contains($0) }
-
-        // Handle live video mode commands
-        if isStartLiveCommand {
-            print("[VoiceAgent] Starting live video mode...")
-            await startLiveVideoMode()
-            return
-        }
-
-        // Vision-phrased questions OUTSIDE live mode must never reach the local model text-only:
-        // FastVLM answered "please upload an image", that refusal entered conversation history,
-        // and the model then parroted it on every later vision turn — image attached or not.
-        // Photo-capture phrasings ("take a photo and...") are handled elsewhere and unaffected;
-        // this catches the bare "what do you see" style, which has no image source outside live
-        // mode, and answers with guidance instead of poisoning the session.
-        if !isLiveVideoMode, settingsManager.settings.aiBackend == .localGemma {
-            let visionPhrases = ["what do you see", "what am i looking at", "what are you looking at",
-                                 "what's in front of me", "what is in front of me",
-                                 "describe what you see", "describe the view", "describe the scene"]
-            if visionPhrases.contains(where: { lowerCommand.contains($0) }),
-               !lowerCommand.contains("photo") && !lowerCommand.contains("picture") {
-                NSLog("[OV] vision question outside live mode — guiding instead of imageless model call")
-                speakResponse("I can't see anything right now. Say 'take a photo' for a quick look, or 'start live video' and I'll watch continuously.")
-                return
-            }
-        }
-
-        if isStopLiveCommand {
-            print("[VoiceAgent] Stopping live video mode...")
-            await stopLiveVideoMode()
-            return
-        }
-
-        // If in live video mode, route by which live backend is driving it.
-        if isLiveVideoMode {
-            if activeLiveService == nil {
-                // Local (SmolVLM2) live mode: STT is the input path, so every command lands here.
-                // Answer it against the latest glasses frame.
-                await handleLocalLiveVideoCommand(command)
-            } else if activeLiveService === geminiLive {
-                // Cloud modes stream audio directly, so this shouldn't be reached — but Gemini
-                // can accept a text turn as a fallback. OpenAI Realtime is audio-only here.
-                do {
-                    try await geminiLive.sendText(command)
-                } catch {
-                    print("[VoiceAgent] Failed to send to Gemini Live: \(error)")
-                }
-            }
-            return
-        }
-
-        // Drop only EXACT-duplicate commands fired within a few seconds. The speech
-        // recognizer can emit the same phrase twice (partial + final), which double-fired
-        // photo capture. A *different* follow-up question must still go through, even while
-        // the previous answer is generating/speaking.
+        // Drop only EXACT-duplicate commands fired within a few seconds. The speech recognizer
+        // can emit the same phrase twice (partial + final). A *different* follow-up question must
+        // still go through, even while the previous answer is generating/speaking.
         let now = Date()
-        if command == lastProcessedCommand, now.timeIntervalSince(lastProcessedAt) < 4 {
+        if !allowRepeat, command == lastProcessedCommand, now.timeIntervalSince(lastProcessedAt) < 4 {
             print("[VoiceAgent] Ignoring duplicate command within 4s: \(command)")
             return
         }
         lastProcessedCommand = command
         lastProcessedAt = now
 
-        // Face recognition on CLOUD backends: classify via the on-device model (if loaded) up front.
-        // On the Local backend we DON'T do this — routing is merged into the single generation below
-        // so we never run two Gemma generations per command (memory/jetsam).
-        if settingsManager.settings.aiBackend != .localGemma {
-            if await handleFaceCommandIfNeeded(command) {
-                agentState = isSessionActive ? .listening : .idle
+        agentState = .thinking
+
+        // Visor parity: the photo taken with the glasses just before asking.
+        if activePhotoContext?.isFresh != true {
+            if let recentPhoto = await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow) {
+                print("[VoiceAgent] ✓ Fetched recent glasses photo from library (\(recentPhoto.count) bytes)")
+                activePhotoContext = CapturedPhotoContext(data: recentPhoto)
+            }
+        }
+
+        var photo: Data?
+        if let context = activePhotoContext, context.isFresh {
+            activePhotoContext?.useCount += 1
+            photo = context.data
+            print("[VoiceAgent] ✓ Fusing photo context (\(context.data.count) bytes, use #\(context.useCount + 1)) with: \(command)")
+        }
+
+        do {
+            try await gemini.sendRESTMessage(command, imageData: photo)
+        } catch {
+            handleSendFailure(error, command: command)
+        }
+    }
+
+    /// A turn failed after the service's own retries. Hands-free: the wearer is not looking at
+    /// the phone, so SAY it (in their language) instead of only setting a banner. A cancellation
+    /// (the wearer said "stop" or asked something new) stays silent.
+    private func handleSendFailure(_ error: Error, command: String) {
+        if error is CancellationError { return }
+        print("[VoiceAgent] Send failed: \(error)")
+        errorMessage = "Gửi câu hỏi thất bại: \(error.localizedDescription)"
+        if isSessionActive, !ttsService.isSpeaking {
+            if case AIBackendError.notConfigured = error {
+                speakResponse(SolverIntent.missingKeyMessage(for: command))
                 return
             }
-        }
-
-        agentState = .thinking
-
-        // Visor Parity: Check for pre-captured photo or recent photo synced from Ray-Ban Meta
-        if activePhotoContext?.isFresh != true {
-            if let recentPhoto = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0) {
-                print("[VoiceAgent] ✓ Fetched recent glasses photo from library (\(recentPhoto.count) bytes)")
-                self.activePhotoContext = CapturedPhotoContext(data: recentPhoto)
-            }
-        }
-
-        if let photo = activePhotoContext, photo.isFresh {
-            activePhotoContext?.useCount += 1
-            print("[VoiceAgent] ✓ Fusing photo context (\(photo.data.count) bytes, use #\(photo.useCount)) with command: \(command)")
-            let visionPrompt = visionPromptFromCommand(command)
-            do {
-                try await sendPromptToActiveBackend(visionPrompt, imageData: photo.data)
-            } catch {
-                errorMessage = "Failed to send command with photo: \(error.localizedDescription)"
-                agentState = isSessionActive ? .listening : .idle
-            }
-            return
-        }
-
-        // Comprehensive visual & math keywords (Visor parity: 40+ phrases)
-        let visualKeywords = [
-            "câu này", "câu 1", "câu 2", "câu 3", "câu 4", "câu 5", "câu 6", "câu 7", "câu 8", "câu 9", "câu 10",
-            "bài này", "bài 1", "bài 2", "bài 3", "bài 4", "bài 5", "bài toán", "đáp án", "đề bài",
-            "giải bài", "giải câu", "giải giúp", "giải bài này", "giải đề", "xem bài", "đọc bài",
-            "tính cái này", "tính câu", "tính bài", "tính toán", "phương trình", "hệ phương trình",
-            "tích phân", "đạo hàm", "hình học", "chọn đáp án", "cái này là gì", "dịch cái này",
-            "đọc cái này", "nhìn cái này", "xem cái này", "đây là cái gì", "trong ảnh", "trên bảng",
-            "take a photo", "take photo", "take picture", "capture photo", "snap photo",
-            "what is this", "what do you see", "solve this", "look at this", "read this",
-            "cau nay", "bai nay", "dap an", "de bai", "giai bai", "giai cau", "giai giup", "phuong trinh", "tich phan"
-        ]
-
-        let isVisualCommand = visualKeywords.contains { lowerCommand.contains($0) }
-
-        let backend = AIBackendRegistry.backend(for: settingsManager.settings.aiBackend)
-        do {
-            if let llm = backend.localLLM {
-                await handleLocalCommand(command, llm: llm, isPhotoCommand: isVisualCommand)
-            } else if isVisualCommand && backend.supportsImageInput {
-                print("[VoiceAgent] Visual command on \(backend.backendType.displayName) — capturing...")
-                await captureAndSendPhoto(withPrompt: command)
-            } else {
-                try await backend.sendMessage(command, imageData: nil)
-            }
-            // OpenAI, Grok and Hermes are plain request/response with no session to keep "thinking" alive —
-            // restore the listening state inline. The others restore via their callbacks.
-            // (Not while the reply is playing: speech ending restores it.)
-            if [.openAI, .grok, .hermes].contains(backend.backendType),
-               !ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking {
-                agentState = isSessionActive ? .listening : .idle
-            }
-        } catch {
-            errorMessage = "Failed to send command: \(error.localizedDescription)"
+            speakResponse(SolverIntent.networkFailureMessage(for: command))
+        } else {
             agentState = isSessionActive ? .listening : .idle
         }
-    }
-
-    // MARK: - Live Video Mode
-
-    /// Start live video mode - Gemini handles both audio and video
-    private func startLiveVideoMode() async {
-        guard !isLiveVideoMode else {
-            print("[VoiceAgent] Already in live video mode")
-            return
-        }
-
-        guard glassesManager.isRegistered else {
-            ttsService.speak("Please connect your glasses first")
-            return
-        }
-
-        // Fully on-device live video: with SmolVLM2 loaded as the local backend, keep the glasses
-        // camera streaming and answer each spoken question against the latest frame. No cloud,
-        // no WebSocket — Apple STT keeps listening and the reply is spoken via the selected TTS.
-        if settingsManager.settings.aiBackend == .localGemma && GemmaLocalService.shared.visionReady {
-            await startLocalLiveVideoMode()
-            return
-        }
-
-        // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
-        // otherwise Gemini Live (the default video provider for every other backend).
-        guard let (service, label) = resolveLiveService() else {
-            ttsService.speak("Please configure your Gemini or OpenAI API key in settings")
-            return
-        }
-        activeLiveService = service
-
-        print("[VoiceAgent] Starting live video mode via \(label)...")
-
-        // Stop VoiceCommandService - the live backend will handle audio directly
-        voiceCommandService.stopListening()
-
-        // Stop TTS if speaking
-        ttsService.stop()
-        NeuralSpeech.stopAll()
-
-        // Match the audio pipeline to the backend's sample rates (Gemini 16k in / 24k out,
-        // OpenAI 24k in / 24k out) before starting capture/playback.
-        audioCapture.targetSampleRate = Double(service.inputSampleRate)
-        audioPlayback.inputSampleRate = Double(service.outputSampleRate)
-
-        // Start glasses streaming
-        if !glassesManager.isStreaming {
-            await glassesManager.startStreaming()
-        }
-
-        // Connect to the live backend
-        do {
-            try await service.connect()
-        } catch {
-            errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
-            activeLiveService = nil
-            // Cleanup: stop streaming and restart voice commands
-            if glassesManager.isStreaming {
-                await glassesManager.stopStreaming()
-            }
-            do {
-                try voiceCommandService.startListening()
-                voiceCommandService.enterConversationMode()
-            } catch {
-                print("[VoiceAgent] Failed to restart voice commands: \(error)")
-            }
-            return
-        }
-
-        // Setup live backend callbacks
-        setupLiveVideoCallbacks(service)
-
-        // Setup audio capture → live backend
-        audioCapture.onAudioCaptured = { [weak service] data in
-            service?.sendAudio(data: data)
-        }
-
-        // Setup audio playback
-        do {
-            try audioPlayback.setup()
-        } catch {
-            print("[VoiceAgent] Failed to setup audio playback: \(error)")
-        }
-
-        // Start audio capture
-        do {
-            try audioCapture.startCapture()
-        } catch {
-            errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
-            await service.disconnect()
-            activeLiveService = nil
-            voiceCommandService.enterConversationMode()
-            return
-        }
-
-        // Setup video frame routing to the live backend
-        glassesManager.onVideoFrame = { [weak service] image in
-            if let jpegData = image.jpegData(compressionQuality: 0.6) {
-                service?.sendVideoFrame(imageData: jpegData)
-            }
-        }
-
-        isLiveVideoMode = true
-        agentState = .liveVideo
-
-        print("[VoiceAgent] ✓ Live video mode active - \(label) handling audio + video")
-
-        // Announce to user
-        ttsService.speak("Live video mode active")
-    }
-
-    /// Resolve which live-video backend to use, or nil if none is configured.
-    /// - OpenAI selected + API key → OpenAI Realtime
-    /// - otherwise Gemini if configured (default video provider), else OpenAI if it has an API key.
-    /// A ChatGPT subscription can't drive Realtime, so it falls through to Gemini.
-    private func resolveLiveService() -> (service: any LiveVideoService, label: String)? {
-        let settings = settingsManager.settings
-        if settings.aiBackend == .openAI && settings.isOpenAIAPIAvailable {
-            return (openAIRealtime, "OpenAI Realtime")
-        }
-        if settings.isGeminiConfigured {
-            return (geminiLive, "Gemini Live")
-        }
-        if settings.isOpenAIAPIAvailable {
-            return (openAIRealtime, "OpenAI Realtime")
-        }
-        return nil
-    }
-
-    /// Fully on-device live video (SmolVLM2). Unlike the cloud modes, audio stays on the normal
-    /// Apple STT path — we just keep the glasses camera streaming and mark the mode active, so
-    /// each spoken question is answered against the latest frame (see sendCommand). Replies
-    /// speak through the selected TTS engine as usual.
-    private func startLocalLiveVideoMode() async {
-        print("[VoiceAgent] Starting local live video mode (SmolVLM2)...")
-
-        if !glassesManager.isStreaming {
-            await glassesManager.startStreaming()
-        }
-        guard glassesManager.isStreaming else {
-            ttsService.speak("I couldn't start the glasses camera")
-            return
-        }
-
-        // The glasses' Bluetooth HFP mic can't run while their camera streams (it goes deaf —
-        // the PR #15 lesson; photo mode survives because its stream is momentary). Live mode
-        // streams continuously, so force the phone mic + speaker for the whole session and
-        // rebuild recognition on that route. The preferred route is restored on stop.
-        voiceCommandService.stopListening()
-        try? AudioSessionManager.shared.configureForPhone()
-        do {
-            try voiceCommandService.startListening()
-        } catch {
-            print("[VoiceAgent] Failed to restart STT on phone mic: \(error)")
-        }
-
-        // Stay in conversation mode so follow-ups don't need the wake word.
-        voiceCommandService.enterConversationMode()
-
-        isLiveVideoMode = true
-        agentState = .liveVideo
-
-        // Continuous watch loop: describe the CURRENT view as it changes, instead of only
-        // answering on the frame that was current when a question finished processing — the old
-        // behaviour spoke about whatever it saw last, seconds behind a head turn.
-        startWatchLoop()
-
-        print("[VoiceAgent] ✓ Local live video mode active - watch loop + questions on latest frame")
-        ttsService.speak("Live video mode active, on device")
-    }
-
-    /// Answer a spoken question in local live video mode using a fresh, settled glasses frame.
-    private func handleLocalLiveVideoCommand(_ command: String) async {
-        // Deterministic narration toggle — a code guard, not model routing, per the repo's
-        // standing lesson that small models ignore subtle routing rules.
-        let lower = command.lowercased()
-
-        // Bare stop-words are a command to SHUT UP, never a vision question. The stop-phrase
-        // branch in VoiceCommandService only runs while a reply is actively playing (.processing);
-        // between replies, live mode sits in conversation mode, where "Ok Vision stop" had its
-        // wake word stripped and "stop" arrived HERE — and got sent to the model as a question,
-        // producing another description. Every stop attempt triggered more speech: "it keeps on
-        // describing, it doesn't simply stop". Silence everything, stay in live mode ("stop
-        // video" remains the phrase that exits).
-        let stopWords: Set<String> = ["stop", "stop it", "stop talking", "be quiet", "quiet",
-                                      "shut up", "enough", "cancel", "silence"]
-        if stopWords.contains(lower.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            NSLog("[OV] live: bare stop — silencing, staying in live mode")
-            MetricsCollector.shared.markInterrupted()
-            MetricsCollector.shared.markSpokeDone()
-            ttsService.stop()
-            NeuralSpeech.stopAll()
-            ttsStreaming = false
-            commandTurnActive = false
-            GemmaLocalService.shared.interrupt()
-            agentState = .liveVideo
-            return
-        }
-        if lower.contains("narrat") || lower.contains("describe as i") {
-            let turningOff = lower.contains("stop") || lower.contains("off") || lower.contains("quiet")
-            watchNarrationEnabled = !turningOff
-            watchLastSpoken = nil
-            watchLastSpokenThumb = nil
-            speakResponse(turningOff ? "Okay, I'll watch quietly." : "Okay, I'll describe what I see as you go.")
-            return
-        }
-        // Generic "what do you see"-type questions get an INSTANT answer from the watch loop's
-        // fresh context — no new inference, no frame grab. This is the payoff of continuous
-        // perception: the answer was computed before the question. Specific questions (colors,
-        // text, counting, "is there a…") still run a real vision turn on the current frame.
-        // Deterministic phrase check, per the standing small-model-routing lesson.
-        let genericLook = ["what do you see", "what's in front", "what is in front",
-                           "describe what you see", "what am i looking at", "describe the view",
-                           "describe the scene"]
-        let lowered = command.lowercased()
-        if let latest = watchLatestDescription,
-           Date().timeIntervalSince(latest.at) < 15,
-           genericLook.contains(where: { lowered.contains($0) }),
-           // The gate that matters: the CURRENT frame must still show the scene the cached
-           // description was made from. Age alone lied — after a head-turn the cache stays
-           // temporally fresh while describing the previous scene, which produced instant,
-           // confident answers about a desk while the wearer looked at a wall.
-           Date().timeIntervalSince(glassesManager.lastFrameTime) < 0.5,
-           let currentFrame = glassesManager.lastFrame,
-           !FrameChange.isNewScene(Self.grayThumbnail(currentFrame), latest.thumb) {
-            NSLog("[OV] live: instant answer from watch cache (%.1fs old, scene matched)", Date().timeIntervalSince(latest.at))
-            speakResponse(latest.text)
-            if isLiveVideoMode { agentState = .liveVideo }
-            return
-        }
-
-        agentState = .thinking
-        // Let head motion settle and grab the freshest frame, so we describe the CURRENT view
-        // rather than a stale/motion-blurred one the Bluetooth stream delivered a beat ago.
-        //
-        // Timed for telemetry: this wait sits between commit and first token, so a vision turn's
-        // ttft INCLUDES it (up to ~1.3s). Recording frame_grab_s separately stops that time
-        // being misread as the model thinking.
-        let frameGrabStart = Date()
-        let grabbed = await freshestGlassesFrame(settle: 0.3, maxWait: 1.0)
-        MetricsCollector.shared.markFrameGrab(seconds: Date().timeIntervalSince(frameGrabStart))
-        guard let frame = grabbed,
-              let jpeg = frame.jpegData(compressionQuality: 0.6) else {
-            // Counted so a flaky glasses stream is visible in the events panel; the spoken
-            // apology still counts as a delivered reply (success = delivered, not correct).
-            MetricsCollector.shared.count("live_frame_unavailable")
-            speakResponse("I couldn't get a clear view just now — hold still a second and ask again.")
-            agentState = .liveVideo
-            return
-        }
-        do {
-            // Strip "take a photo"-style wording; the frame is already attached.
-            var prompt = visionPromptFromCommand(command)
-            // Grounding rules, learned the hard way: a 0.5B model weights TEXT hints over
-            // PIXELS. A stale "your view a moment ago: desk with two monitors" made it describe
-            // the desk while the wearer looked at a wall. So:
-            //  - the current-view hint attaches ONLY if the frame we're sending still matches
-            //    the scene that hint describes (thumbnail comparison, not age);
-            //  - past views attach ONLY to past-referent questions ("what was", "did you see",
-            //    "earlier"), where the past is the point — never to present-tense questions.
-            let frameThumb = Self.grayThumbnail(frame)
-            if let latest = watchLatestDescription,
-               Date().timeIntervalSince(latest.at) < 20,
-               !FrameChange.isNewScene(frameThumb, latest.thumb) {
-                prompt += "\n(Your own read of this same view a moment ago: \(latest.text))"
-            }
-            let asksAboutPast = ["what was", "did you see", "earlier", "before", "just saw",
-                                 "a moment ago"].contains(where: { lowered.contains($0) })
-            if asksAboutPast {
-                let past = watchRecentDescriptions.suffix(3)
-                    .filter { Date().timeIntervalSince($0.at) < 90 }
-                if !past.isEmpty {
-                    let lines = past.map { "- \($0.text)" }.joined(separator: "\n")
-                    prompt += "\n(Scenes you saw in the last minute or so:\n\(lines))"
-                }
-            }
-            // Fresh scene => fresh eyes: withhold history when the view has changed since the
-            // last vision exchange, keep it when it's the same scene so follow-ups still work.
-            let sameSceneAsLastExchange = lastVisionExchangeThumb.map {
-                !FrameChange.isNewScene(frameThumb, $0)
-            } ?? false
-            if !sameSceneAsLastExchange {
-                NSLog("[OV] live: scene changed since last exchange — answering without history")
-            }
-            lastVisionExchangeThumb = frameThumb
-            try await GemmaLocalService.shared.sendMessage(prompt, imageData: jpeg,
-                                                           includeHistory: sameSceneAsLastExchange)
-        } catch {
-            print("[VoiceAgent] Local live video inference failed: \(error)")
-            speakResponse("Sorry, that didn't work. \(error.localizedDescription)")
-        }
-        if isLiveVideoMode { agentState = .liveVideo }
-    }
-
-    // MARK: - Continuous watch loop (local live video)
-
-    private var watchTask: Task<Void, Never>?
-    /// Grayscale thumbnail of the last frame we RAN INFERENCE on — the scene-change gate.
-    private var watchLastThumb: [UInt8]?
-    /// The last description actually SPOKEN — the chatter gate.
-    private var watchLastSpoken: String?
-    /// Thumbnail of the frame sent with the last VISION QUESTION. When the next question's frame
-    /// shows a different scene, conversation history is withheld from the model — fresh scene,
-    /// fresh eyes — because history containing the same question about a previous scene made the
-    /// model copy its old answer instead of reading the new image.
-    private var lastVisionExchangeThumb: [UInt8]?
-    /// Thumbnail of the scene the last SPOKEN line described. A stronger repeat-gate than text
-    /// similarity alone: short sentences share few words, so rephrasings of the same scene
-    /// scored as "new" and were re-announced. Same scene = one announcement, full stop.
-    private var watchLastSpokenThumb: [UInt8]?
-    /// Previous polled thumbnail — the DWELL gate compares against this, not the last described
-    /// scene: describe only once the view has stopped moving.
-    private var watchPrevPollThumb: [UInt8]?
-    /// When the last inference finished — enforces a hard duty-cycle floor.
-    private var watchLastDescribeEnd = Date.distantPast
-    /// Freshest description of the current view + when it was made. This is the loop's real
-    /// product: silent visual context, kept warm so questions can be grounded instantly.
-    private(set) var watchLatestDescription: (text: String, at: Date, thumb: [UInt8])?
-    /// Rolling memory of recent scene descriptions (newest last, capped). The streaming-video-LLM
-    /// literature converges on "treat video as a stream with memory, not independent photos" —
-    /// this is the same idea in text space, at ~zero cost: questions get the last minute of what
-    /// the assistant saw, so "what was that thing on the shelf?" can work after a head-turn.
-    private var watchRecentDescriptions: [(text: String, at: Date)] = []
-    private static let watchMemoryLimit = 5
-    /// Whether the loop SPEAKS what it sees. OFF by default — this is how Gemini Live and
-    /// ChatGPT video behave: continuous perception, but the assistant only talks when asked.
-    /// The first cut narrated every scene change and it was noise ("even if I don't ask it's
-    /// speaking by itself"). Toggled by voice: "start narrating" / "stop narrating".
-    private var watchNarrationEnabled = false
-    /// Minimum time between inferences. On-device test: walking made every frame a "new scene",
-    /// chaining back-to-back full-GPU inferences — times ramped 3.3s -> 9.6s and the device hit
-    /// thermal SERIOUS in ninety seconds. The loop must idle even when the world keeps changing.
-    private static let watchMinDescribeInterval: TimeInterval = 4.0
-    /// True from command capture until the reply has FINISHED PLAYING. The watch loop's
-    /// point-in-time "is anything speaking?" checks straddled 1-3s of async inference+synthesis,
-    /// so a reply could begin inside that window and get preempted by the finished watch line —
-    /// cutting the user's answer off mid-sentence. This flag covers the whole turn lifecycle.
-    private var commandTurnActive = false
-
-    /// Describe the current view continuously, spending inference only on scene changes and
-    /// speech only on genuinely new content. Economics per frame (measured): inference ~1-2s of
-    /// GPU; speaking costs contention on top (decode drops ~40% while Kokoro synthesises). Both
-    /// gates are pure logic in FrameChange, with tests.
-    private func startWatchLoop() {
-        stopWatchLoop()
-        // Only vision-trusted local models; the loop silently does nothing on a text model.
-        guard GemmaLocalModel.from(modelId: settingsManager.settings.localGemmaModelId).supportsOnDeviceVision else {
-            print("[VoiceAgent] Watch loop not started — loaded model has no on-device vision")
-            return
-        }
-        watchLastThumb = nil
-        watchLastSpoken = nil
-        watchTask = Task { [weak self] in
-            while let self, !Task.isCancelled, self.isLiveVideoMode {
-                // Yield entirely while a question is being answered or a reply is being spoken —
-                // the loop must never steal GPU from a real turn, and describing while speaking
-                // would talk over the answer.
-                if self.commandTurnActive || self.agentState == .thinking
-                    || self.ttsService.isSpeaking || NeuralSpeech.isAnySpeaking {
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    continue
-                }
-                // Freshness over completeness: only a frame from the last 500ms, no settle wait.
-                guard Date().timeIntervalSince(self.glassesManager.lastFrameTime) < 0.5,
-                      let frame = self.glassesManager.lastFrame else {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    continue
-                }
-                // Duty-cycle floor FIRST: on-device, a walk made every frame a new scene and
-                // the chained inferences thermal-throttled the phone to "serious" (3.3s -> 9.6s
-                // per frame). The loop idles between describes no matter what the world does.
-                guard Date().timeIntervalSince(self.watchLastDescribeEnd) >= Self.watchMinDescribeInterval else {
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    continue
-                }
-                let thumb = Self.grayThumbnail(frame)
-                let prevPoll = self.watchPrevPollThumb
-                self.watchPrevPollThumb = thumb
-                // DWELL gate: describe only once the view has SETTLED — this poll must match the
-                // previous poll. Mid-pan frames are motion-blurred (the model literally said
-                // "a blurry image"), waste full-GPU inferences on views the wearer is already
-                // leaving, and narrate the journey instead of the destination.
-                if let prevPoll, FrameChange.isNewScene(thumb, prevPoll) {
-                    MetricsCollector.shared.count("watch_skipped")
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    continue
-                }
-                // Scene gate: the settled view must differ from the last DESCRIBED scene.
-                if let last = self.watchLastThumb {
-                    let diff = FrameChange.difference(thumb, last)
-                    if diff <= FrameChange.sceneChangeThreshold {
-                        MetricsCollector.shared.count("watch_skipped")
-                        try? await Task.sleep(nanoseconds: 250_000_000)
-                        continue
-                    }
-                    NSLog("[OV] watch: NEW SETTLED SCENE diff=%.3f", diff)
-                }
-                guard let jpeg = frame.jpegData(compressionQuality: 0.6) else {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    continue
-                }
-                self.watchLastThumb = thumb
-                let inferStart = Date()
-                do {
-                    let raw = try await GemmaLocalService.shared.describeFrame(
-                        jpeg, prompt: "What is in view right now?")
-                    self.watchLastDescribeEnd = Date()
-                    // The token cap truncates mid-sentence ("...and a mouse" / "The plant is") —
-                    // trim to the last COMPLETE sentence; a fragment-only output is dropped.
-                    let description: String
-                    if let boundary = TextChunking.lastSentenceBoundary(in: raw) {
-                        description = String(raw[..<boundary]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        description = ""
-                    }
-                    let inferSeconds = Date().timeIntervalSince(inferStart)
-                    MetricsCollector.shared.count("watch_described")
-                    NSLog("[OV] watch: %.2fs \"%@\"", inferSeconds, description.isEmpty ? raw + " [fragment, dropped]" : description)
-                    // Speak gates, all must pass:
-                    //  1. the SCENE moved on since the last spoken line — text similarity alone
-                    //     re-announced rephrasings ("this is a plant" / "a potted plant" share
-                    //     too few words), so same scene = one announcement, full stop;
-                    //  2. the description says something new;
-                    //  3. no command turn began while we were inferring (the async window the
-                    //     old point-checks missed — this is what cut replies mid-sentence).
-                    // speakWatchLine itself is ambient: appends into silence, never preempts.
-                    if !description.isEmpty {
-                        self.watchLatestDescription = (description, Date(), thumb)
-                        self.watchRecentDescriptions.append((description, Date()))
-                        if self.watchRecentDescriptions.count > Self.watchMemoryLimit {
-                            self.watchRecentDescriptions.removeFirst()
-                        }
-                        self.aiTranscript = description   // silent context still shows on screen
-                    }
-                    let sceneMovedOn = self.watchLastSpokenThumb.map {
-                        FrameChange.isNewScene(thumb, $0)
-                    } ?? true
-                    if self.watchNarrationEnabled,
-                       !description.isEmpty, sceneMovedOn,
-                       FrameChange.isWorthSpeaking(description, lastSpoken: self.watchLastSpoken),
-                       !self.commandTurnActive,
-                       !self.ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking,
-                       self.agentState != .thinking, self.isLiveVideoMode {
-                        self.watchLastSpoken = description
-                        self.watchLastSpokenThumb = thumb
-                        MetricsCollector.shared.count("watch_spoke")
-                        self.speakWatchLine(description)
-                    }
-                } catch {
-                    // Model switching/backgrounded mid-loop is normal; back off rather than spin.
-                    self.watchLastDescribeEnd = Date()
-                    NSLog("[OV] watch: describe failed: %@", "\(error)")
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                }
-            }
-        }
-    }
-
-    private func stopWatchLoop() {
-        watchTask?.cancel()
-        watchTask = nil
-        watchLastThumb = nil
-        watchLastSpoken = nil
-        watchLastSpokenThumb = nil
-        watchPrevPollThumb = nil
-        watchLastDescribeEnd = .distantPast
-        watchLatestDescription = nil
-        watchRecentDescriptions.removeAll()
-        watchNarrationEnabled = false
-        lastVisionExchangeThumb = nil
-    }
-
-    /// Speak a watch-loop line OUTSIDE the turn pipeline: no history, no turn metrics — and via
-    /// the AMBIENT engine paths, which append into silence and never preempt. The reply paths
-    /// (speak/beginStreaming) restart the player; a watch line using them cut user replies off
-    /// mid-sentence whenever one landed during the line's synthesis window.
-    private func speakWatchLine(_ text: String) {
-        if let neuralTTS {
-            Task { await neuralTTS.speakAmbient(text) }
-        } else {
-            ttsService.speakAmbient(text)
-        }
-    }
-
-    /// Downscale to a 16×16 grayscale thumbnail for the scene-change gate. Cheap enough to run
-    /// on every polled frame; the comparison math lives (tested) in FrameChange.
-    private static func grayThumbnail(_ image: UIImage) -> [UInt8] {
-        let side = 16
-        var pixels = [UInt8](repeating: 0, count: side * side)
-        guard let cg = image.cgImage else { return pixels }
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        pixels.withUnsafeMutableBytes { buffer in
-            guard let context = CGContext(
-                data: buffer.baseAddress, width: side, height: side,
-                bitsPerComponent: 8, bytesPerRow: side, space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
-            context.interpolationQuality = .low
-            context.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
-        }
-        return pixels
-    }
-
-    /// Wait a brief `settle` for head motion to stop, then return the freshest camera frame that's
-    /// genuinely recent (stream not stalled). Falls back to whatever frame we have after `maxWait`.
-    /// This is the "current view, not a stale glimpse" grab for live video.
-    private func freshestGlassesFrame(settle: TimeInterval, maxWait: TimeInterval) async -> UIImage? {
-        try? await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
-        let deadline = Date().addingTimeInterval(maxWait)
-        while Date() < deadline {
-            // Accept only a frame received within the last 500ms — under heavy motion the BT stream
-            // throttles and lastFrame goes stale; wait for a fresh one instead of describing it.
-            if Date().timeIntervalSince(glassesManager.lastFrameTime) < 0.5,
-               let f = glassesManager.lastFrame {
-                return f
-            }
-            try? await Task.sleep(nanoseconds: 80_000_000)   // 80ms poll
-        }
-        return glassesManager.lastFrame   // fallback: better an old frame than nothing
-    }
-
-    /// Stop live video mode
-    private func stopLiveVideoMode() async {
-        guard isLiveVideoMode else {
-            print("[VoiceAgent] Not in live video mode")
-            return
-        }
-        stopWatchLoop()
-
-        print("[VoiceAgent] Stopping live video mode...")
-
-        // Stop audio capture
-        audioCapture.stopCapture()
-        audioCapture.onAudioCaptured = nil
-
-        // Stop audio playback
-        audioPlayback.teardown()
-
-        // Disconnect the active live backend (Gemini or OpenAI Realtime)
-        await activeLiveService?.disconnect()
-        activeLiveService = nil
-
-        // Stop glasses streaming
-        if glassesManager.isStreaming {
-            await glassesManager.stopStreaming()
-        }
-
-        // Restore video frame callback to Gemini Vision
-        glassesManager.onVideoFrame = { [weak self] image in
-            self?.geminiVision.sendVideoFrame(image)
-        }
-
-        isLiveVideoMode = false
-        agentState = isSessionActive ? .listening : .idle
-
-        // Local live mode forced the phone mic (HFP dies during camera streaming) and its STT
-        // may still be running — stop it so the restart below picks up the preferred route.
-        if voiceCommandService.isListening { voiceCommandService.stopListening() }
-        applyPreferredAudioRoute()
-
-        // Always restart VoiceCommandService for wake word detection
-        do {
-            try voiceCommandService.startListening()
-            if isSessionActive {
-                // Continue conversation mode if session was active
-                voiceCommandService.enterConversationMode()
-                print("[VoiceAgent] Restarted voice commands in conversation mode")
-            } else {
-                // Just listen for wake word
-                print("[VoiceAgent] Restarted voice commands for wake word detection")
-            }
-        } catch {
-            print("[VoiceAgent] Failed to restart voice commands: \(error)")
-        }
-
-        print("[VoiceAgent] Live video mode stopped")
-        ttsService.speak("Live video mode ended")
-    }
-
-    /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
-    private func setupLiveVideoCallbacks(_ service: any LiveVideoService) {
-        // Audio from the model → playback
-        service.onAudioReceived = { [weak self] data in
-            self?.audioPlayback.playAudio(data: data)
-        }
-
-        // Transcription updates - also check for stop commands
-        service.onInputTranscription = { [weak self] text in
-            Task { @MainActor in
-                guard let self else { return }
-                self.userTranscript = text
-
-                // Check for stop video commands in what the user said
-                let lowerText = text.lowercased()
-                let stopKeywords = ["stop video", "stop streaming", "stop live", "end video",
-                                   "exit video", "disable video", "stop the video", "end live",
-                                   // Hindi fallbacks (models sometimes transcribe English as Hindi)
-                                   "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
-
-                let isStopCommand = stopKeywords.contains { lowerText.contains($0) }
-
-                if isStopCommand && self.isLiveVideoMode {
-                    print("[VoiceAgent] Stop command detected in transcription: \(text)")
-                    await self.stopLiveVideoMode()
-                }
-            }
-        }
-
-        service.onOutputTranscription = { [weak self] text in
-            Task { @MainActor in
-                self?.aiTranscript = text
-            }
-        }
-
-        // Turn complete
-        let liveTurnEvent = service === geminiLive ? "live_turn_gemini" : "live_turn_openai"
-        service.onTurnComplete = { [weak self] in
-            Task { @MainActor in
-                // Cloud live turns are COUNTED, not timed: the server does the VAD, so the
-                // client never sees when the user stopped speaking — any perceived-latency
-                // number here would be fabricated. The count keeps live usage visible.
-                MetricsCollector.shared.count(liveTurnEvent)
-                // History: persist this live-video exchange (transcript only, no frames).
-                self?.recordLiveTurn()
-            }
-        }
-
-        // Disconnection - handle reconnection or mode exit
-        service.onDisconnected = { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                if self.isLiveVideoMode {
-                    print("[VoiceAgent] Live backend disconnected unexpectedly")
-                    await self.stopLiveVideoMode()
-                }
-            }
-        }
-    }
-
-    /// Turn a spoken photo command into a clean vision question for a model that already has
-    /// the image attached. Removes "take a picture / photo" trigger wording so the model
-    /// describes the image instead of protesting that it can't take photos.
-    private func visionPromptFromCommand(_ command: String) -> String {
-        var s = command.lowercased()
-        // Only strip explicit photo-capture wording — that's what makes a VLM refuse ("I can't
-        // take photos"). Do NOT strip politeness/filler ("would you", "right now", "of this"):
-        // removing those mid-sentence mangled real questions ("what am I looking at right now"
-        // → "what am I looking at"; "would you tell me which plant" → "tell me which plant").
-        let triggers = [
-            "take a picture of this", "take a photo of this", "take a picture", "take a photo",
-            "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
-            "snap a picture", "go ahead and take",
-            "chụp ảnh", "chụp hình", "chụp tấm ảnh", "chụp giùm"
-        ]
-        for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
-        s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        // Trim leftover connective prefixes left after removing the trigger ("...and tell me…").
-        for prefix in ["and ", "of this ", "of ", "please ", "và ", "với ", "giúp ", "hộ "] {
-            while s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
-        }
-        s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
-        // Hermes is a full agent: the coaching below is for small vision models and would just
-        // show up in the user's Hermes chat, so send the user's own question.
-        if settingsManager.settings.aiBackend == .hermes {
-            return s.count < 3 ? "What is this?" : s.prefix(1).uppercased() + s.dropFirst()
-        }
-        let isVietnamese = TTSService.containsVietnamese(command)
-        if s.count < 3 {
-            if isVietnamese {
-                return "Giải chi tiết bài toán hoặc câu hỏi trong ảnh này từng bước một bằng tiếng Việt. Trình bày rõ ràng theo định dạng SPOKEN và DISPLAY."
-            } else {
-                return "Solve or explain the problem shown in this image clearly step-by-step. Present your response strictly in SPOKEN and DISPLAY format."
-            }
-        }
-        if isVietnamese {
-            return "Giải bài toán hoặc trả lời câu hỏi trong ảnh theo yêu cầu: \(s). Trình bày rõ ràng theo định dạng SPOKEN và DISPLAY."
-        }
-        return "Look closely at the image and answer specifically and concretely: \(s)"
     }
 
     // MARK: - POV Recording
@@ -1882,20 +1042,18 @@ final class VoiceAgentViewModel: ObservableObject {
 
     private func startRecording() async {
         guard glassesManager.isRegistered else {
-            errorMessage = "Connect your glasses first to record."
+            errorMessage = "Hãy kết nối kính trước khi ghi hình."
             return
         }
-        // Recording needs a live frame stream; start it if the user isn't already in live video.
+        // Recording needs a live frame stream.
         if !glassesManager.isStreaming {
             await glassesManager.startStreaming()
         }
         guard glassesManager.isStreaming else {
-            errorMessage = "Couldn't start the glasses camera to record."
+            errorMessage = "Không bật được camera kính để ghi hình."
             return
         }
 
-        // Route the raw glasses frames into the recorder. This is separate from `onVideoFrame`
-        // (which feeds the AI in live mode), so recording and live vision can run together.
         glassesManager.onVideoSampleBuffer = { [weak self] sampleBuffer in
             self?.sessionRecorder.appendVideoSampleBuffer(sampleBuffer)
         }
@@ -1904,7 +1062,10 @@ final class VoiceAgentViewModel: ObservableObject {
             guard let self else { return }
             self.isRecording = false
             self.glassesManager.onVideoSampleBuffer = nil
-            self.showRecordingStatus(url != nil ? "Saved to Photos" : "Couldn't save recording")
+            self.showRecordingStatus(url != nil ? "Đã lưu vào Ảnh" : "Không lưu được bản ghi")
+            if self.glassesManager.isStreaming {
+                Task { await self.glassesManager.stopStreaming() }
+            }
         }
 
         if !voiceCommandService.isListening {
@@ -1915,7 +1076,7 @@ final class VoiceAgentViewModel: ObservableObject {
             isRecording = true
         } catch {
             glassesManager.onVideoSampleBuffer = nil
-            errorMessage = "Recording failed to start: \(error.localizedDescription)"
+            errorMessage = "Không bắt đầu ghi được: \(error.localizedDescription)"
         }
     }
 
@@ -1928,212 +1089,7 @@ final class VoiceAgentViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Face recognition
-
-    /// Route face-recognition commands using the on-device model as an intent classifier
-    /// (agentic — no keyword matching, like OpenGlasses' face_recognition tool). Returns true
-    /// if the command was a face command and was handled.
-    private func handleFaceCommandIfNeeded(_ command: String) async -> Bool {
-        guard let intent = await GemmaLocalService.shared.classifyFaceIntent(command) else {
-            return false   // model not loaded, or not a face command
-        }
-        await handleFaceIntent(intent)
-        return true
-    }
-
-    /// Shared handling for the on-device text models (Gemma / Apple Foundation): one agentic
-    /// generation that routes a face action, a web search, or a direct spoken answer.
-    private func handleLocalCommand(_ command: String, llm: LocalTextLLM, isPhotoCommand: Bool) async {
-        if isPhotoCommand {
-            // SmolVLM2 handles photos fully on-device; other local models are text-only
-            // (Gemma E2B's vision hit the jetsam limit — see GemmaLocalModel.supportsOnDeviceVision).
-            if settingsManager.settings.aiBackend == .localGemma && GemmaLocalService.shared.visionReady {
-                print("[VoiceAgent] Photo command on local SmolVLM2 — capturing...")
-                await captureAndSendPhoto(withPrompt: command)
-                return
-            }
-            agentState = isSessionActive ? .listening : .idle
-            speakResponse("This on-device model is text only. For camera questions, select SmolVLM2 as your local model, or switch to Gemini or OpenClaw in Settings.")
-            return
-        }
-        // Route the command. With Apple TTS, stream the answer: speak sentences as they generate.
-        // Backends that can't stream (Apple FM) fall back to a plain route via the protocol's
-        // default implementation — onPartial simply never fires. Face/tool routes emit JSON
-        // starting with "{", so we only begin speaking once the streamed output's first non-space
-        // char proves it's a plain answer — never for a structured route.
-        let result: LocalAgent.RouteResult
-        if canStreamSpeech {
-            ttsStreaming = false
-            ttsStreamSpokenChars = 0
-            result = await llm.routeCommandStreaming(command) { [weak self] cumulative in
-                guard let self else { return }
-                // Telemetry: the model has started producing. Marked before the JSON-route guard
-                // below so a structured route still records its think time.
-                MetricsCollector.shared.markFirstToken()
-                let lead = cumulative.trimmingCharacters(in: .whitespacesAndNewlines).first
-                guard let lead, lead != "{" else { return }   // JSON route → don't speak
-                self.feedStreamingSpeech(cumulative, isFinal: false)
-            }
-        } else {
-            // Non-streaming: no visibility into decode, so first-token is backfilled by
-            // markGenerationDone and `ttft` legitimately covers the whole generation.
-            result = await llm.routeCommand(command)
-        }
-        // The local route is not delivered through AIBackend.onAgentMessage (it returns a
-        // RouteResult instead), so generation-done has to be marked here or the whole stage
-        // breakdown after commit goes missing.
-        MetricsCollector.shared.markGenerationDone()
-
-        switch result {
-        case .face(let intent):
-            // Safety: if we mis-started streaming (answer contained a stray "{"), cancel it.
-            if ttsStreaming { ttsService.stop(); ttsStreaming = false }
-            await handleFaceIntent(intent)
-        case .webSearch(let query):
-            if ttsStreaming { ttsService.stop(); ttsStreaming = false }
-            NSLog("[OV] web search: \"%@\"", query)
-            var result = await WebSearchService.search(query)
-            // Agentic retry: if the first query found nothing, let the model reformulate once.
-            if result.isEmpty, let better = await llm.reformulateSearchQuery(question: command, triedQuery: query) {
-                NSLog("[OV] web search retry: \"%@\"", better)
-                result = await WebSearchService.search(better)
-            }
-            let answer = await llm.answerWithSearchResult(question: command, result: result)
-            speakResponse(answer)   // separate generation — not streamed here
-            ConversationContext.shared.record(user: command, assistant: answer)
-        case .answer(let text):
-            if ttsStreaming {
-                feedStreamingSpeech(text, isFinal: true)   // flush the tail, close the session
-            } else {
-                speakResponse(text)   // Kokoro, or non-streaming backend
-            }
-            ConversationContext.shared.record(user: command, assistant: text)
-        }
-        // Generation finishes well before the voice does (several sentences stay queued in TTS).
-        // Don't stomp the state back to .listening while the reply is still being spoken — the
-        // TTS-finished observers handle that transition at the right moment.
-        if !ttsService.isSpeaking && !NeuralSpeech.isAnySpeaking {
-            agentState = isSessionActive ? .listening : .idle
-        }
-    }
-
-    /// Carry out a face action (camera capture + Apple Vision), shared by the cloud-backend
-    /// classifier path and the Local-backend single-pass router.
-    private func handleFaceIntent(_ intent: GemmaLocalService.FaceIntent) async {
-        let face = FaceRecognitionService.shared
-        switch intent.action {
-        case "identify":
-            agentState = .thinking
-            guard let image = await currentGlassesImage() else {
-                speakResponse("I couldn't get a picture from the glasses. Make sure they're connected.")
-                return
-            }
-            speakResponse(await face.identify(in: image))
-        case "remember":
-            agentState = .thinking
-            guard !intent.name.isEmpty else {
-                speakResponse("Sure — what's their name?")
-                return
-            }
-            guard let image = await currentGlassesImage() else {
-                speakResponse("I couldn't get a picture from the glasses. Make sure they're connected.")
-                return
-            }
-            speakResponse(await face.rememberFace(name: intent.name, from: image))
-        case "forget":
-            speakResponse(face.forgetFace(name: intent.name))
-        case "list":
-            speakResponse(face.listKnownFaces())
-        default:
-            break
-        }
-    }
-
     // MARK: - Photo capture
-
-    /// Get a fresh UIImage frame from the glasses camera, then turn the camera off
-    /// ("click and go") — unless we're in live video mode.
-    private func currentGlassesImage() async -> UIImage? {
-        guard glassesManager.isRegistered else { return nil }
-        if !glassesManager.isStreaming { await glassesManager.startStreaming() }
-        var frame: UIImage?
-        for _ in 0..<40 {   // up to ~4s for a fresh frame
-            if let f = glassesManager.lastFrame { frame = f; break }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        if frame == nil { frame = glassesManager.lastFrame }
-        if glassesManager.isStreaming && !isLiveVideoMode {
-            await glassesManager.stopStreaming()
-        }
-        // Do NOT touch the audio stack here. Tearing down / rebuilding the recognizer around the
-        // camera is what broke the HFP mic: every rebuild forces a fresh Bluetooth SCO negotiation,
-        // which the glasses can't service right after streaming (mic stays deaf for tens of seconds,
-        // with an audible reconnect chirp per attempt). OpenGlasses keeps its wake-word engine + mic
-        // tap alive straight through photo capture — audio just gaps during the stream and resumes
-        // into the same running engine. We now do the same; see restartRecognition()'s engine check.
-        return frame
-    }
-
-    /// Send a prompt (optionally with a photo) to whichever backend is currently selected.
-    private func sendPromptToActiveBackend(_ prompt: String, imageData: Data?) async throws {
-        let backend = AIBackendRegistry.backend(for: settingsManager.settings.aiBackend)
-        // Backends that can't take an image (Apple FM text-only, Gemini streams video live)
-        // receive just the prompt.
-        try await backend.sendMessage(prompt, imageData: backend.supportsImageInput ? imageData : nil)
-    }
-
-    private func captureAndSendPhoto(withPrompt prompt: String) async {
-        var imageData: Data?
-        var startedStreamingForPhoto = false
-
-        // 1. Try glasses direct capture if registered
-        if glassesManager.isRegistered {
-            if !glassesManager.isStreaming {
-                print("[VoiceAgent] Starting glasses camera stream for photo...")
-                await glassesManager.startStreaming()
-                startedStreamingForPhoto = true
-            }
-            imageData = await capturePhotoFromGlasses()
-            if imageData == nil {
-                imageData = await freshLiveFrame()
-            }
-            if glassesManager.isStreaming && !isLiveVideoMode {
-                await glassesManager.stopStreaming()
-            }
-        }
-
-        // 2. Fall back to RecentPhotoScanner (photos synced to Camera Roll from temple capture button)
-        if imageData == nil {
-            NSLog("[OV] Glasses direct capture nil; checking recent photo from library")
-            imageData = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
-        }
-
-        NSLog("[OV] captureAndSendPhoto result: %@", imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes")
-
-        do {
-            if let imageData = imageData {
-                self.activePhotoContext = CapturedPhotoContext(data: imageData)
-                let visionPrompt = visionPromptFromCommand(prompt)
-                NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
-                try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
-            } else {
-                NSLog("[OV] No image available from glasses or library for visual command")
-                let errMsg = TTSService.containsVietnamese(prompt)
-                    ? "Không tìm thấy ảnh chụp bài tập từ kính Ray-Ban. Bạn hãy bấm nút chụp trên gọng kính rồi hỏi lại nhé."
-                    : "No photo found from Ray-Ban glasses. Please press the temple capture button and ask again."
-                errorMessage = errMsg
-                speakResponse(errMsg)
-            }
-        } catch {
-            print("[VoiceAgent] Failed to send: \(error)")
-            errorMessage = "Failed to send: \(error.localizedDescription)"
-            agentState = isSessionActive ? .listening : .idle
-
-            if startedStreamingForPhoto && glassesManager.isStreaming {
-                await glassesManager.stopStreaming()
-            }
-        }
-    }
 
     /// Capture photo from glasses and return the data
     private func capturePhotoFromGlasses() async -> Data? {
@@ -2150,7 +1106,7 @@ final class VoiceAgentViewModel: ObservableObject {
         for _ in 0..<15 {
             if let photoData = glassesManager.lastPhotoData {
                 glassesManager.lastPhotoData = nil
-                NSLog("[OV] Photo captured: %d bytes", photoData.count)
+                NSLog("[OV] Photo captured: %ld bytes", photoData.count)
                 return photoData
             }
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -2193,119 +1149,199 @@ final class VoiceAgentViewModel: ObservableObject {
         return nil
     }
 
+    /// One photo from the glasses camera, "Click & Go": the camera stream runs only for the
+    /// capture and is stopped right after (unless a recording is using it).
+    private func takeGlassesPhoto() async -> Data? {
+        guard glassesManager.isRegistered else { return nil }
+        let startedStreaming = !glassesManager.isStreaming
+        if startedStreaming { await glassesManager.startStreaming() }
+        var data = await capturePhotoFromGlasses()
+        if data == nil { data = await freshLiveFrame() }
+        if startedStreaming && glassesManager.isStreaming && !isRecording {
+            await glassesManager.stopStreaming()
+        }
+        return data
+    }
+
+    /// The best photo the glasses can give right now, straight to the app — never waiting for the
+    /// Meta AI app's Camera Roll import: (1) a standalone still at full sensor resolution
+    /// (DAT 1.0 Camera.photo), (2) a 720p still from the video stream, (3) a glasses photo that
+    /// already reached Camera Roll.
+    private func acquireGlassesPhoto() async -> Data? {
+        // Another capture (button press, the agent, Settings' test) is already crossing: wait for
+        // it and share its photo instead of starting the stream under it.
+        if glassesManager.isTakingPhoto {
+            let requestedAt = Date()
+            while glassesManager.isTakingPhoto, Date().timeIntervalSince(requestedAt) < 45 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if let context = activePhotoContext, context.timestamp >= requestedAt.addingTimeInterval(-45) {
+                return context.data
+            }
+        }
+        if glassesManager.isRegistered, !isRecording,
+           let full = await glassesManager.captureFullResolutionPhoto(
+               fullResolution: settingsManager.settings.fullResolutionPhotos) {
+            return full
+        }
+        if let streamStill = await takeGlassesPhoto() { return streamStill }
+        return await RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: SolverIntent.recentPhotoWindow)
+    }
+
+    /// The model needs to see and no photo is in the conversation: take one. The new photo also
+    /// becomes the context for follow-up questions.
+    private func captureForAgent() async -> Data? {
+        HapticFeedback.light()
+        let data = await acquireGlassesPhoto()
+        if let data {
+            activePhotoContext = CapturedPhotoContext(data: data)
+            HapticFeedback.success()
+            NSLog("[OV] Agent capture: got photo (%ld bytes)", data.count)
+        } else {
+            HapticFeedback.error()
+            NSLog("[OV] Agent capture: no photo available")
+        }
+        return data
+    }
+
     /// Manually trigger a photo capture from glasses to cache in activePhotoContext (Capture First, Ask Later)
     func snapPhotoFromGlasses() async {
         HapticFeedback.light()
         print("[VoiceAgent] Manual photo snap requested from glasses...")
-        var startedStreaming = false
-        if glassesManager.isRegistered && !glassesManager.isStreaming {
-            await glassesManager.startStreaming()
-            startedStreaming = true
-        }
+        let data = await acquireGlassesPhoto()
 
-        var data = await capturePhotoFromGlasses()
-        if data == nil {
-            data = await freshLiveFrame()
-        }
-        if data == nil {
-            data = RecentPhotoScanner.shared.fetchMostRecentPhoto(withinSeconds: 120.0)
-        }
-
-        if let data = data {
-            self.activePhotoContext = CapturedPhotoContext(data: data)
+        if let data {
+            activePhotoContext = CapturedPhotoContext(data: data)
             HapticFeedback.success()
             print("[VoiceAgent] ✓ Manual photo context cached (\(data.count) bytes)")
         } else {
             HapticFeedback.error()
-            let errMsg = TTSService.containsVietnamese(lastProcessedCommand)
-                ? "Không tìm thấy ảnh từ kính Ray-Ban. Vui lòng bấm nút chụp trên gọng kính."
-                : "Could not capture image from Ray-Ban glasses. Please press the temple button."
-            errorMessage = errMsg
-            speakResponse(errMsg)
-        }
-
-        if startedStreaming && glassesManager.isStreaming && !isLiveVideoMode {
-            await glassesManager.stopStreaming()
+            let message = SolverIntent.missingPhotoMessage(for: lastProcessedCommand.isEmpty ? "chụp ảnh" : lastProcessedCommand)
+            errorMessage = message
+            speakResponse(message)
         }
     }
 
-    // MARK: - Glasses Video Integration
+    // MARK: - Glasses callbacks
 
-    /// Setup glasses callbacks to stream video to Gemini Vision
     private func setupGlassesCallbacks() {
-        print("[VoiceAgent] Setting up glasses video callbacks...")
-
-        // Connect video frames from glasses to Gemini Vision (for live feed)
-        // Note: GeminiVisionService.sendVideoFrame already throttles to 1fps
-        glassesManager.onVideoFrame = { [weak self] image in
-            guard let self else { return }
-            // Send frame to Gemini Vision for live analysis
-            self.geminiVision.sendVideoFrame(image)
-
-            // Log periodically (every 30 frames = ~1 second at 30fps)
-            Task { @MainActor in
-                self.videoFrameCount += 1
-                if self.videoFrameCount % 30 == 0 {
-                    print("[VoiceAgent] Video frames processed: \(self.videoFrameCount)")
-                }
-            }
-        }
-
-        // Photo captured callback (Capture First, Ask Later workflow)
+        // A photo delivered by the glasses SDK becomes the context for the next questions.
         glassesManager.onPhotoCaptured = { [weak self] data in
             Task { @MainActor in
                 self?.activePhotoContext = CapturedPhotoContext(data: data)
-                print("[VoiceAgent] ✓ Active photo context cached (60s TTL, \(data.count) bytes)")
+                print("[VoiceAgent] ✓ Active photo context cached (\(data.count) bytes)")
             }
         }
-
-        print("[VoiceAgent] Glasses callbacks configured")
+        // The glasses' own capture button, routed to the app (DAT 1.0 Inputs).
+        glassesManager.onCaptureButton = { [weak self] press in
+            self?.handleCaptureButton(press)
+        }
     }
 
-    // MARK: - TTS Integration
-
-    /// The selected neural voice (Kokoro, Grok, OpenAI) when it can speak, else nil → Apple system voice.
-    private var neuralTTS: NeuralSpeechEngine? { NeuralSpeech.active(settingsManager.settings) }
-
-    /// True when the active speech engine is Apple's system voice (not a neural engine).
-    ///
-    /// This used to also gate whether the reply was STREAMED, because Kokoro runs on the Metal GPU
-    /// alongside the on-device model and interleaving them risked contention. But waiting for the
-    /// whole reply before speaking measured at ~1.2s of extra perceived latency per turn — Kokoro
-    /// turns showed `tts_lead_in` of +0.01s (perfectly serialised) against Apple TTS's -1.4s
-    /// (speech overlapping generation). Both engines now stream; if contention is real it shows up
-    /// as `tokens_per_second` dropping, which is instrumented.
-    private var usingAppleTTS: Bool {
-        neuralTTS == nil
+    /// Route (or release) the glasses' capture button according to Settings.
+    func applyButtonLinkSetting() {
+        let settings = settingsManager.settings
+        Task { await glassesManager.applySettings(settings) }
     }
 
-    /// True when a streamed reply should be spoken sentence-by-sentence — now every engine.
-    private var canStreamSpeech: Bool {
-        usingAppleTTS || neuralTTS != nil
+    // MARK: - Capture button
+
+    private func handleCaptureButton(_ press: GlassesButtonPress) {
+        let settings = settingsManager.settings
+        let action: GlassesButtonAction
+        switch press {
+        case .shortPress: action = settings.shortPressAction
+        case .hold: action = settings.holdAction
+        case .doublePress: action = settings.doublePressAction
+        }
+        print("[VoiceAgent] Capture button \(press.rawValue) → \(action.rawValue)")
+        switch action {
+        case .capture:
+            Task { await takeButtonPhoto(thenSolve: false) }
+        case .captureAndSolve:
+            Task { await takeButtonPhoto(thenSolve: true) }
+        case .repeatAnswer:
+            repeatLastAnswer()
+        case .none:
+            break
+        }
     }
 
-    /// Feed the streamed reply to Apple TTS sentence-by-sentence. `cumulative` is the full text so
-    /// far (the local model emits a growing snapshot each token). On non-final calls we speak only
-    /// the sentences that have fully completed; on the final call we flush whatever remains.
-    private func feedStreamingSpeech(_ cumulative: String, isFinal: Bool) {
+    /// Shutter pressed on the glasses: the photo goes straight to the app at full resolution and
+    /// becomes the context for the next question — or, for "capture and solve", is solved at once.
+    private func takeButtonPhoto(thenSolve: Bool) async {
+        guard !isCapturingFromButton else { return }
+        isCapturingFromButton = true
+        defer { isCapturingFromButton = false }
+        HapticFeedback.light()
+
+        if thenSolve {
+            // A new problem replaces whatever is being said or generated.
+            if ttsService.isSpeaking {
+                ttsService.stop()
+                ttsStreaming = false
+            }
+            await gemini.interrupt()
+        }
+
+        guard let data = await acquireGlassesPhoto() else {
+            HapticFeedback.error()
+            errorMessage = SolverIntent.photoFailedMessage
+            speakNotice(SolverIntent.photoFailedMessage)
+            return
+        }
+        activePhotoContext = CapturedPhotoContext(data: data)
+        HapticFeedback.success()
+        print("[VoiceAgent] ✓ Capture-button photo ready (\(data.count) bytes)")
+
+        if !isSessionActive {
+            startSession()
+            // Let the session finish its (instant) connect before the question is shown/sent,
+            // so its start-up reset of the transcript can't wipe it.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        if thenSolve {
+            let question = SolverIntent.solvePhotoQuestion
+            userTranscript = question
+            latestSolution = nil
+            ConversationManager.shared.addUserMessage(question)
+            historyAwaitingReply = true
+            await sendCommand(question, allowRepeat: true)
+        } else if !ttsService.isSpeaking && agentState != .thinking {
+            speakNotice(SolverIntent.photoReadyMessage)
+        }
+    }
+
+    /// Double press: read the last answer again.
+    private func repeatLastAnswer() {
+        if ttsService.isSpeaking {
+            ttsService.stop()
+            ttsStreaming = false
+        }
+        speakNotice(lastSpokenAnswer.isEmpty ? SolverIntent.nothingToRepeatMessage : lastSpokenAnswer)
+    }
+
+    /// Say something that is not an answer (kept out of History).
+    private func speakNotice(_ text: String) {
+        let awaiting = historyAwaitingReply
+        historyAwaitingReply = false
+        speakResponse(text)
+        historyAwaitingReply = awaiting
+    }
+
+    // MARK: - Speech output (Apple voices; the language is picked per sentence by TTSService)
+
+    /// Feed the streamed reply to the speech queue sentence-by-sentence. `cumulative` is the full
+    /// SPOKEN text so far. On non-final calls we speak only the sentences that have fully completed;
+    /// on the final call we flush whatever remains.
+    private func feedStreamingSpeech(_ cumulative: String, isFinal: Bool, historyText: String? = nil) {
         // Open a streamed utterance session on first content.
         if !ttsStreaming {
             guard !cumulative.isEmpty else { return }
             ttsStreaming = true
             ttsStreamSpokenChars = 0
-            // Streamed replies never reach speakResponse, so this is where perceived latency ends
-            // on the Apple-TTS path — and it lands EARLIER than on the Kokoro path, which is
-            // exactly the difference `tts_lead_in_s` is meant to expose.
-            // No metric marks here: opening the stream session hands NOTHING to an engine —
-            // the first sentence may only complete a boundary seconds later. markTTSRequested
-            // fires in speakStreamedChunk at the actual hand-off; markFirstAudio fires inside
-            // the engines when sound actually starts.
-            streamingNeuralTTS = neuralTTS
-            if let neuralTTS = streamingNeuralTTS {
-                neuralTTS.beginStreaming()
-            } else {
-                ttsService.beginStreaming()
-            }
+            ttsService.beginStreaming()
         }
 
         // The portion not yet handed to the speech queue.
@@ -2317,13 +1353,9 @@ final class VoiceAgentViewModel: ObservableObject {
             let tail = pending.trimmingCharacters(in: .whitespacesAndNewlines)
             if !tail.isEmpty { speakStreamedChunk(tail) }
             ttsStreamSpokenChars = cumulative.count
-            if let neuralTTS = streamingNeuralTTS {
-                neuralTTS.endStreaming()
-            } else {
-                ttsService.endStreaming()
-            }
+            ttsService.endStreaming()
             ttsStreaming = false
-            recordAssistantReply(cumulative)   // history: streamed reply is complete
+            recordAssistantReply(historyText ?? cumulative)   // history: streamed reply is complete
             return
         }
 
@@ -2336,194 +1368,34 @@ final class VoiceAgentViewModel: ObservableObject {
         ttsStreamSpokenChars += pendingStr.distance(from: pendingStr.startIndex, to: boundary)
     }
 
-    /// Speak one completed sentence on whichever engine is active.
-    ///
-    /// Both calls are synchronous enqueues now. The previous version wrapped Kokoro in a fresh
-    /// `Task` per sentence — independent tasks are UNORDERED, so sentence 2 could synthesise and
-    /// play before sentence 1 (the comment claiming order was preserved was wrong). Kokoro now
-    /// owns a FIFO drained by a single task, making ordering structural.
+    /// Speak one completed sentence.
     private func speakStreamedChunk(_ sentence: String) {
         // First-wins: the first sentence handed over starts the TTS TTFB clock.
         MetricsCollector.shared.markTTSRequested()
-        if let neuralTTS = streamingNeuralTTS {
-            neuralTTS.speakChunk(sentence)
-        } else {
-            ttsService.speakChunk(sentence)
-        }
+        ttsService.speakChunk(sentence)
     }
 
     /// Speak AI response via TTS (optionally recording different text like LaTeX DISPLAY into History)
     private func speakResponse(_ text: String, historyText: String? = nil) {
         guard !text.isEmpty else { return }
         recordAssistantReply(historyText ?? text)
+        // Blueprint lesson 4: speaking + barge-in paused BEFORE the OS starts the audio.
         agentState = .speaking
         voiceCommandService.isBargeInPaused = true
-        // Perceived latency ends here: the gap between this and speechEnd is the wearer's wait.
-        // (An approximation — synthesis still has to start — but it is the moment we hand off,
-        // and the difference between Kokoro and Apple TTS shows up in `ttsLeadIn`.)
-        // Text is handed to an engine on the next line — TTFB clock starts now. The firstAudio
-        // mark comes from the engine itself when sound actually starts; marking it here excluded
-        // synthesis time, making TTS TTFB structurally zero and perceived latency optimistic.
         MetricsCollector.shared.markTTSRequested()
-        // A neural voice (Kokoro on-device; Grok, OpenAI cloud) when selected + ready; otherwise Apple's.
-        if let neuralTTS {
-            Task { await neuralTTS.speak(text) }
-        } else {
-            ttsService.speak(text)
-        }
-    }
-
-    // MARK: - Mid-turn questions
-
-    /// Put a question to the user while a turn is still running (Hermes approvals and clarifying
-    /// questions): speak it, then return the next thing they say, or nil after a minute. Spoken
-    /// directly rather than through speakResponse, so it isn't recorded as the turn's answer.
-    func askUser(_ prompt: String) async -> String? {
-        cancelPendingAnswer()
-        if let neuralTTS {
-            questionPrompt = Task {
-                guard !Task.isCancelled else { return }
-                await neuralTTS.speak(prompt)
-            }
-        } else {
-            ttsService.speak(prompt)
-        }
-        let id = UUID()
-        return await withCheckedContinuation { continuation in
-            pendingAnswer = (id, continuation)
-            Task {
-                try? await Task.sleep(for: .seconds(60))
-                if let pending = self.pendingAnswer, pending.id == id {
-                    self.pendingAnswer = nil
-                    pending.continuation.resume(returning: nil)
-                }
-            }
-        }
-    }
-
-    /// Drop the open question with no answer (a stop, a barge-in, or Hermes withdrew it), so a
-    /// later command can't answer it: to an approval, no answer is a no.
-    private func cancelPendingAnswer() {
-        guard let pending = pendingAnswer else { return }
-        pendingAnswer = nil
-        // Stop reading the question out, too: it no longer takes an answer.
-        questionPrompt?.cancel()
-        questionPrompt = nil
-        ttsService.stop()
-        NeuralSpeech.stopAll()
-        pending.continuation.resume(returning: nil)
+        ttsService.speak(text)
     }
 
     // MARK: - History
 
     /// History: persist the assistant's reply, but only when it answers a recorded user command —
-    /// system utterances ("Live video mode active", connection errors) stay out of History.
+    /// system utterances (connection errors) stay out of History.
     private func recordAssistantReply(_ text: String) {
         guard historyAwaitingReply else { return }
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         ConversationManager.shared.addAssistantMessage(clean)
         historyAwaitingReply = false
-    }
-
-    /// History (live video / realtime modes): commands don't pass through onCommandCaptured there,
-    /// so record the user+assistant pair at each turn boundary. Transcript only — video frames are
-    /// never stored (same policy as Meta's live AI history).
-    private func recordLiveTurn() {
-        let user = userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let reply = aiTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reply.isEmpty, reply != historyLastLiveReply else { return }
-        if !user.isEmpty { ConversationManager.shared.addUserMessage(user) }
-        ConversationManager.shared.addAssistantMessage(reply)
-        historyLastLiveReply = reply
-        historyAwaitingReply = false
-    }
-
-    // MARK: - Tool Handlers (OpenClaw device-side tools)
-
-    /// Handle take_photo tool call
-    private func handleTakePhotoTool(completion: @escaping (String) -> Void) async {
-        print("[VoiceAgent] Handling take_photo tool")
-
-        if glassesManager.isStreaming {
-            // Capture from glasses
-            await glassesManager.capturePhoto()
-
-            // Wait for photo to be captured (via callback)
-            // Set up one-time handler for the photo
-            let originalHandler = glassesManager.onPhotoCaptured
-            glassesManager.onPhotoCaptured = { [weak self] data in
-                // Restore original handler
-                self?.glassesManager.onPhotoCaptured = originalHandler
-
-                // Send photo to OpenClaw as attachment in next message
-                Task {
-                    do {
-                        try await OpenClawService.shared.sendMessage("Here's the photo I just captured.", imageData: data)
-                        completion("Photo captured and sent for analysis.")
-                    } catch {
-                        completion("Photo captured but failed to send: \(error.localizedDescription)")
-                    }
-                }
-            }
-
-            // Timeout after 5 seconds
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                guard let self else { return }
-                if self.glassesManager.onPhotoCaptured != nil {
-                    self.glassesManager.onPhotoCaptured = originalHandler
-                    completion("Photo capture timed out.")
-                }
-            }
-        } else if let lastFrame = glassesManager.lastFrame,
-                  let jpegData = lastFrame.jpegData(compressionQuality: 0.8) {
-            // Use last frame if available
-            do {
-                try await OpenClawService.shared.sendMessage("Here's what I can see.", imageData: jpegData)
-                completion("Captured current view and sent for analysis.")
-            } catch {
-                completion("Failed to send image: \(error.localizedDescription)")
-            }
-        } else {
-            completion("Camera is not available. Please connect glasses and start streaming first.")
-        }
-    }
-
-    /// Handle describe_scene tool call (uses Gemini Vision)
-    private func handleDescribeSceneTool(args: [String: Any], completion: @escaping (String) -> Void) async {
-        print("[VoiceAgent] Handling describe_scene tool")
-
-        let prompt = args["prompt"] as? String ?? "Please describe what you see in this image."
-
-        // Capture photo and send to OpenClaw for analysis
-        if let lastFrame = glassesManager.lastFrame,
-           let jpegData = lastFrame.jpegData(compressionQuality: 0.8) {
-            do {
-                try await OpenClawService.shared.sendMessage(prompt, imageData: jpegData)
-                completion("Image captured and sent for analysis.")
-            } catch {
-                completion("Failed to analyze scene: \(error.localizedDescription)")
-            }
-        } else if glassesManager.isStreaming {
-            // Try to capture a photo
-            await glassesManager.capturePhoto()
-            // Wait briefly for photo
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            if let photoData = glassesManager.lastPhotoData {
-                glassesManager.lastPhotoData = nil
-                do {
-                    try await OpenClawService.shared.sendMessage(prompt, imageData: photoData)
-                    completion("Photo captured and sent for analysis.")
-                } catch {
-                    completion("Failed to send photo: \(error.localizedDescription)")
-                }
-            } else {
-                completion("Failed to capture photo.")
-            }
-        } else {
-            completion("Camera is not available. Please connect glasses and start streaming first, or say 'start video stream' for live mode.")
-        }
     }
 }
 
@@ -2555,8 +1427,7 @@ enum TextChunking {
     /// Split `s` into speakable sentence chunks using the same boundary rules as
     /// `lastSentenceBoundary` (terminator followed by a break, or newline). Chunks are trimmed;
     /// empties dropped; text after the last terminator is included as a final chunk.
-    /// Used by Kokoro TTS to synthesize per-sentence — one long reply in a single MLX pass
-    /// spikes memory proportional to its length (jetsam risk next to SmolVLM2).
+    /// Used to queue a reply one sentence at a time, each in its own language's voice.
     static func sentences(_ s: String) -> [String] {
         let terminators: Set<Character> = [".", "!", "?"]
         var result: [String] = []

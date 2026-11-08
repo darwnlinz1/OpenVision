@@ -1,54 +1,61 @@
 // OpenVision - SettingsSecretsTests.swift
-// API keys move from settings.json to the Keychain without being lost on the way.
+// The Gemini API key lives in the Keychain, never in settings.json — and is not lost on the way.
 
 import XCTest
 @testable import OpenVision
 
 final class SettingsSecretsTests: XCTestCase {
 
-    func testEverySecretFieldIsCovered() {
+    func testTheGeminiKeyIsTheSecretField() {
         let accounts = SettingsSecrets.fields.map(\.account)
         XCTAssertEqual(Set(accounts).count, accounts.count, "one Keychain account per field")
-        XCTAssertTrue(accounts.contains("hermesAPIKey"))
-        XCTAssertTrue(accounts.contains("telemetryPassword"))
+        XCTAssertEqual(accounts, ["geminiAPIKey"])
     }
 
-    func testFileIsWrittenWithoutSecrets() throws {
+    func testFileIsWrittenWithoutTheKey() throws {
         var settings = AppSettings()
-        settings.hermesAPIKey = "hermes-key"
-        settings.openAIAPIKey = "sk-test"
-        settings.openClawGatewayURL = "wss://gateway.example"
+        settings.geminiAPIKey = "AQ.secret-key"
+        settings.wakeWord = "Ok Vision test"
         let json = String(decoding: try JSONEncoder().encode(SettingsSecrets.forFile(settings, keepInFile: [])), as: UTF8.self)
-        XCTAssertFalse(json.contains("hermes-key") || json.contains("sk-test"))
-        XCTAssertTrue(json.contains("gateway.example"), "other settings stay in the file")
+        XCTAssertFalse(json.contains("AQ.secret-key"))
+        XCTAssertTrue(json.contains("Ok Vision test"), "other settings stay in the file")
     }
 
     func testAFailedKeychainWriteKeepsTheKeyInTheFile() {
         var settings = AppSettings()
-        settings.grokAPIKey = "xai-key"
-        settings.geminiAPIKey = "gemini-key"
-        let file = SettingsSecrets.forFile(settings, keepInFile: ["grokAPIKey"])
-        XCTAssertEqual(file.grokAPIKey, "xai-key")
-        XCTAssertEqual(file.geminiAPIKey, "")
+        settings.geminiAPIKey = "AQ.secret-key"
+        let file = SettingsSecrets.forFile(settings, keepInFile: ["geminiAPIKey"])
+        XCTAssertEqual(file.geminiAPIKey, "AQ.secret-key")
     }
 
-    func testLoadingTakesKeysFromTheKeychain() {
-        let merged = SettingsSecrets.merge(file: AppSettings(), keychain: ["hermesAPIKey": .value("from-keychain")])
-        XCTAssertEqual(merged.settings.hermesAPIKey, "from-keychain")
+    func testLoadingTakesTheKeyFromTheKeychain() {
+        let merged = SettingsSecrets.merge(file: AppSettings(), keychain: ["geminiAPIKey": .value("from-keychain")])
+        XCTAssertEqual(merged.settings.geminiAPIKey, "from-keychain")
         XCTAssertTrue(merged.unreadable.isEmpty)
     }
 
     func testAnOlderFilesKeyWinsSoItCanBeMoved() {
         var file = AppSettings()
-        file.tavilyAPIKey = "from-old-file"
-        let merged = SettingsSecrets.merge(file: file, keychain: ["tavilyAPIKey": .value("stale")])
-        XCTAssertEqual(merged.settings.tavilyAPIKey, "from-old-file")
+        file.geminiAPIKey = "from-old-file"
+        let merged = SettingsSecrets.merge(file: file, keychain: ["geminiAPIKey": .value("stale")])
+        XCTAssertEqual(merged.settings.geminiAPIKey, "from-old-file")
     }
 
     func testAnUnreadableKeychainIsRememberedNotTreatedAsEmpty() {
-        let merged = SettingsSecrets.merge(file: AppSettings(), keychain: ["openAIAPIKey": .unreadable])
-        XCTAssertEqual(merged.settings.openAIAPIKey, "")
-        XCTAssertEqual(merged.unreadable, ["openAIAPIKey"], "so a save can't delete the stored key")
+        let merged = SettingsSecrets.merge(file: AppSettings(), keychain: ["geminiAPIKey": .unreadable])
+        XCTAssertEqual(merged.settings.geminiAPIKey, "")
+        XCTAssertEqual(merged.unreadable, ["geminiAPIKey"], "so a save can't delete the stored key")
+    }
+
+    /// A settings.json from before the clean-up (other backends, Kokoro, telemetry) still loads.
+    func testOlderSettingsFilesStillDecode() throws {
+        let old = #"{"aiBackend":"local_gemma","ttsEngine":"kokoro","telemetryURL":"http://x","wakeWord":"Hey Vision","showTranscripts":false}"#
+        let defaults = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AppSettings())) as? [String: Any] ?? [:]
+        let onDisk = try JSONSerialization.jsonObject(with: Data(old.utf8)) as? [String: Any] ?? [:]
+        let merged = defaults.merging(onDisk) { _, disk in disk }
+        let settings = try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: merged))
+        XCTAssertEqual(settings.wakeWord, "Hey Vision")
+        XCTAssertFalse(settings.showTranscripts)
     }
 
     func testKeychainRoundTrip() {

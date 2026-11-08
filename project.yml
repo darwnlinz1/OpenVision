@@ -1,8 +1,7 @@
 name: OpenVision
 options:
   bundleIdPrefix: com.openvision
-  # Bumped 16 → 18 for the on-device Gemma 4 (MLX) backend, which needs iOS 18 at runtime.
-  # Revert to 16 + gate GemmaLocalService behind `if #available(iOS 18)` to keep older support.
+  # iOS 18+: the target devices (iPhone 15 Pro / Pro Max) and Meta DAT (needs 17.2+).
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "15.0"
@@ -57,6 +56,11 @@ targets:
       - path: OpenVision/Resources
         excludes:
           - "**/*.plist"
+          - "SolutionRenderer/**"
+      # Offline KaTeX + marked for the DISPLAY channel. A FOLDER reference keeps fonts/ next to
+      # katex.min.css (a flattened copy would break the relative font URLs).
+      - path: OpenVision/Resources/SolutionRenderer
+        type: folder
     settings:
       base:
         INFOPLIST_FILE: OpenVision/Resources/Info.plist
@@ -72,28 +76,11 @@ targets:
         products:
           - MWDATCore
           - MWDATCamera
+          - MWDATInputs   # capture-button events (experimental, 1.0.0+)
       # Acoustic voice-activity detection for end-of-turn (see SpeechActivityDetector).
       - package: FluidAudio
         products:
           - FluidAudio
-      # On-device Gemma 4 (Local backend). MLX/MLXNN resolve transitively via these products.
-      - package: mlx-swift-lm
-        products:
-          - MLXLLM           # text LLMs (Qwen 2.5, Gemma 2) via LLMModelFactory
-          - MLXVLM           # vision models (Gemma 4, SmolVLM2) via VLMModelFactory
-          - MLXLMCommon
-          - MLXHuggingFace   # #hubDownloader() / #huggingFaceTokenizerLoader()
-      # The macros above expand to HuggingFace.HubClient + Tokenizers.AutoTokenizer; mlx-swift-lm
-      # deliberately doesn't depend on these, so the consumer supplies them (same as OpenGlasses).
-      - package: swift-huggingface
-        products:
-          - HuggingFace
-      - package: swift-transformers
-        products:
-          - Tokenizers
-      # On-device neural TTS (Kokoro).
-      - package: KokoroSwift
-        product: KokoroSwift
     preBuildScripts:
       - name: "Check Config Files"
         script: |
@@ -114,49 +101,17 @@ packages:
     # camera-consolidation API: DeviceSession.addCamera(config:) -> Camera -> camera.stream
     # (StreamSession/addStream are gone). Requires iOS 17.2+.
     # MUST be regression-tested on Gen 1/2 glasses (register + stream + HFP mic) before merge.
-    exactVersion: "0.9.0"
-  # PrismML fork of mlx-swift, adding 1-bit quantized Metal kernels (upstream PR pending).
-  # Needed to load Bonsai-8B (Qwen3-8B at 1-bit g128, 1.28 GB vs E2B's 3.6 GB). Declared at the
-  # ROOT so every consumer (mlx-swift-lm + the three vendored packages) resolves the same identity.
-  # Pinned to v0.31.6_prism, NOT the fork's default `prism` branch: `prism` is 10 commits behind and
-  # misses "gate NAX to gen-18+ (M5/gen-17 miscompute)" — a correctness fix for current Apple GPUs.
-  # Upstream base is 0.31.6 (we were on 0.31.4); Kokoro asks for >= 0.29.1, so it satisfies both.
-  mlx-swift:
-    url: https://github.com/PrismML-Eng/mlx-swift.git
-    branch: v0.31.6_prism
-  mlx-swift-lm:
-    url: https://github.com/ml-explore/mlx-swift-lm.git
-    # Pinned to a main commit PAST the 3.31.4 tag that fixes Gemma 4 E2B loading. 3.31.4's VLM backbone
-    # built k_proj/v_proj/k_norm for ALL layers (never passed kvSharedOnly), so E2B's shared-KV layers
-    # 15-34 demanded weights the checkpoint omits → keyNotFound. This commit ("Fix MLXVLM Gemma4 loader
-    # to honor num_kv_shared_layers") passes kvSharedOnly per layer + guards attention on isKVSharedLayer.
-    # The previous pin stopped just before #369, which needed a newer mlx-swift API
-    # (greatestFiniteMagnitudeArray) than the 0.31.4 we had then.
-    #
-    # Bumped to 14414441 ("Fix MLXFoundationModels compilation against the Xcode 27 beta 5 SDK", #544):
-    # the commit above was written against an earlier iOS 27 beta FoundationModels API, so on the
-    # Xcode 27 release SDK MLXFoundationModels fails with "extraneous argument label 'capabilities:'"
-    # and "'_' can only appear in a pattern". It descends from the commit above (keeps the Gemma 4
-    # kvSharedOnly fix) and includes #369, which now builds since mlx-swift moved to 0.31.6 (PrismML fork).
-    revision: "14414441fa44f45eee35a61e9fa0bab577cf9734"
+    # 0.9.0 -> 1.0.1: adds MWDATInputs (capture-button events) and camera.photo (standalone
+    # full-resolution stills). Breaking renames (StreamError thermal/power cases, removed
+    # Wearables.deviceStateStream) don't touch this app. Both new features are experimental.
+    exactVersion: "1.0.1"
   # CoreML Silero VAD (Apache 2.0). Gives us ACOUSTIC end-of-speech detection: the endpoint
   # countdown can start when the mic actually goes quiet instead of when SFSpeechRecognizer stops
   # emitting partials (which it does in bursts with ~1s gaps mid-sentence, so transcript timing
-  # can't distinguish "still talking" from "done"). Runs on the Neural Engine — neither the GPU
-  # our MLX models use nor the CPU — so it doesn't contend with on-device inference.
+  # can't distinguish "still talking" from "done"). Runs on the Neural Engine, off the CPU.
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
     from: "0.15.5"
-  swift-huggingface:
-    url: https://github.com/huggingface/swift-huggingface.git
-    from: "0.1.0"
-  swift-transformers:
-    url: https://github.com/huggingface/swift-transformers.git
-    from: "1.0.0"
-  # On-device neural TTS (Kokoro-82M) via MLX Swift — VENDORED under Vendor/ for full visibility
-  # and reproducibility (source frozen in-repo, not pulled live). Shares mlx-swift with mlx-swift-lm.
-  KokoroSwift:
-    path: Vendor/kokoro-ios
 
 schemes:
   OpenVision:
