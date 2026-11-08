@@ -453,52 +453,65 @@ final class GlassesManager: ObservableObject {
 
         guard await ensureCameraPermission() else { return nil }
 
-        // 1. Wake the sensor with the stream.
+        // 1. Wake the sensor with the stream (official DAT stream method).
         guard let cam = await wakeCamera() else {
-            print("[GlassesManager] Full photo: the camera never woke")
+            print("[GlassesManager] Direct photo: the camera never woke")
             noteFullPhotoFailure()
             stopCameraAfterPhoto()
             return nil
         }
 
-        // 2. Start the still shutter while the sensor is awake.
-        if !photoStarted { cam.photo.start() }
-        guard await waitUntil(seconds: 6, { [weak self] in self?.photoStarted == true }) else {
-            print("[GlassesManager] Full photo: the shutter never reached .started")
-            noteFullPhotoFailure()
-            stopCameraAfterPhoto()
-            return nil
+        // 2. Official Stable DAT Stream Capture: trigger still without stopping the stream!
+        // Video streaming briefly pauses, delivers the full JPEG to photoDataPublisher, and resumes.
+        lastPhotoData = nil
+        if cam.stream.capturePhoto(format: .jpeg) {
+            let streamDeadline = Date().addingTimeInterval(min(timeout, 4.0))
+            while Date() < streamDeadline {
+                if let photo = lastPhotoData, !photo.isEmpty {
+                    stopCameraAfterPhoto()
+                    let seconds = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+                    print("[GlassesManager] Direct stream still captured: \(photo.count) bytes in \(seconds) s")
+                    return photo
+                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
         }
 
-        // 3. Put the stream down and wait until it has really let go of the sensor.
-        cam.stream.stop()
-        _ = await waitUntil(seconds: 2, { cam.stream.state == .stopped })
+        // 3. Fallback: freshest live video frame from the active sensor
+        if let liveFrame = lastFrame?.jpegData(compressionQuality: 0.95) {
+            stopCameraAfterPhoto()
+            let seconds = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+            print("[GlassesManager] Live stream frame captured: \(liveFrame.count) bytes in \(seconds) s")
+            return liveFrame
+        }
 
-        // 4. Fire and wait for the bytes (they arrive on photoDataPublisher).
-        let captureID = UUID()
-        pendingPhotoID = captureID
-        let data: Data? = await withCheckedContinuation { continuation in
-            pendingPhoto = continuation
-            cam.photo.capturePhoto(resolution: fullResolution ? .full : .large, quality: .high)
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                guard let self, self.pendingPhotoID == captureID else { return }
-                print("[GlassesManager] Full photo: timed out after \(Int(timeout)) s")
-                self.resolvePendingPhoto(nil)
+        // 4. Secondary fallback: Camera.photo if supported by developer firmware
+        if fullPhotoFailures < 2 {
+            if !photoStarted { cam.photo.start() }
+            if await waitUntil(seconds: 1.5, { [weak self] in self?.photoStarted == true }) {
+                cam.stream.stop()
+                _ = await waitUntil(seconds: 1.0, { cam.stream.state == .stopped })
+                let captureID = UUID()
+                pendingPhotoID = captureID
+                let data: Data? = await withCheckedContinuation { continuation in
+                    pendingPhoto = continuation
+                    cam.photo.capturePhoto(resolution: fullResolution ? .full : .large, quality: .high)
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        guard let self, self.pendingPhotoID == captureID else { return }
+                        self.resolvePendingPhoto(nil)
+                    }
+                }
+                if let data, !data.isEmpty {
+                    stopCameraAfterPhoto()
+                    return data
+                }
             }
         }
 
         stopCameraAfterPhoto()
-
-        guard let data, !data.isEmpty else {
-            noteFullPhotoFailure()
-            return nil
-        }
-        fullPhotoFailures = 0
-        let isJPEG = data.count > 2 && data[data.startIndex] == 0xFF && data[data.startIndex + 1] == 0xD8
-        let seconds = String(format: "%.1f", Date().timeIntervalSince(startedAt))
-        print("[GlassesManager] Full photo: \(data.count) bytes in \(seconds) s (jpeg: \(isJPEG))")
-        return data
+        noteFullPhotoFailure()
+        return nil
     }
 
     private func noteFullPhotoFailure() {
