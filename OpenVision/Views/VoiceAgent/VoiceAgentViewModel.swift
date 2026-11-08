@@ -1294,22 +1294,22 @@ final class VoiceAgentViewModel: ObservableObject {
         HapticFeedback.success()
         print("[VoiceAgent] ✓ Capture-button photo ready (\(data.count) bytes)")
 
-        if !isSessionActive {
-            startSession()
-            // Let the session finish its (instant) connect before the question is shown/sent,
-            // so its start-up reset of the transcript can't wipe it.
-            try? await Task.sleep(nanoseconds: 300_000_000)
-        }
-
         if thenSolve {
+            if !isSessionActive {
+                startSession()
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
             let question = SolverIntent.solvePhotoQuestion
             userTranscript = question
             latestSolution = nil
             ConversationManager.shared.addUserMessage(question)
             historyAwaitingReply = true
             await sendCommand(question, allowRepeat: true)
-        } else if !ttsService.isSpeaking && agentState != .thinking {
-            speakNotice(SolverIntent.photoReadyMessage)
+        } else {
+            // Physical capture: photo is safely cached in RAM (activePhotoContext).
+            // Do NOT start session or interrupt the wearer with unprompted speech.
+            // When the wearer calls the agent ("Ok Vision" + question), it will be used immediately!
+            print("[VoiceAgent] Photo cached in RAM silently for upcoming agent call")
         }
     }
 
